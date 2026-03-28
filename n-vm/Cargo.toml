@@ -5,6 +5,9 @@ license.workspace = true
 publish.workspace = true
 version.workspace = true
 
+[lib]
+name = "n_vm"
+
 [dependencies]
 # internal
 n-vm-macros = { workspace = true }

@@ -6,7 +6,7 @@
 //! # Architecture
 //!
 //! The `#[in_vm]` macro implements a three-tier dispatch based on environment
-//! variables (defined in [`n_vm_protocol`]):
+//! variables (defined in `n_vm_protocol` and re-exported from `n_vm`):
 //!
 //! 1. **Host** (no env vars set) — the default when `cargo test` is invoked.
 //!    Launches a Docker container via [`n_vm::run_test_in_vm`] with the
@@ -68,16 +68,16 @@ pub fn in_vm(
     quote! {
         #(#attrs)*
         #vis #sig {
-            match ::std::env::var(::n_vm_protocol::ENV_IN_VM) {
-                Ok(var) if var == ::n_vm_protocol::ENV_MARKER_VALUE => {
+            match ::std::env::var(::n_vm::ENV_IN_VM) {
+                Ok(var) if var == ::n_vm::ENV_MARKER_VALUE => {
                     {
                         #block
                     }
                     return;
                 }
                 _ => {
-                    if let Ok(val) = ::std::env::var(::n_vm_protocol::ENV_IN_TEST_CONTAINER)
-                        && val == ::n_vm_protocol::ENV_MARKER_VALUE
+                    if let Ok(val) = ::std::env::var(::n_vm::ENV_IN_TEST_CONTAINER)
+                        && val == ::n_vm::ENV_MARKER_VALUE
                     {
                         let runtime = ::tokio::runtime::Builder::new_current_thread()
                             .enable_io()
