@@ -1648,6 +1648,7 @@ name = "dataplane-n-it"
 version = "0.18.0"
 dependencies = [
  "capctl",
+ "dataplane-n-vm-protocol",
  "nix 0.31.2",
  "tokio",
  "tokio-vsock",
@@ -1665,9 +1666,11 @@ dependencies = [
  "cloud-hypervisor-client",
  "command-fds",
  "dataplane-n-vm-macros",
+ "dataplane-n-vm-protocol",
  "nix 0.31.2",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-serde",
  "tokio-stream",
@@ -1685,6 +1688,10 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "dataplane-n-vm-protocol"
+version = "0.16.1"
 
 [[package]]
 name = "dataplane-nat"
