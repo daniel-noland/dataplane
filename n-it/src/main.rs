@@ -47,12 +47,18 @@ fn main() -> Infallible {
         })
         .max_blocking_threads(1)
         .build()
-        .unwrap();
+        .unwrap_or_else(|e| {
+            eprintln!("FATAL: failed to build tokio runtime for init system: {e}");
+            std::process::abort();
+        });
     runtime.block_on(async {
         eprintln!("init system runtime started: connecting to tracing vsock");
         let tracing_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, INIT_SYSTEM_VSOCK_PORT);
         let tracing_vsock = VsockWriter::new(
-            vsock::VsockStream::connect(&tracing_addr).unwrap(),
+            vsock::VsockStream::connect(&tracing_addr).unwrap_or_else(|e| {
+                eprintln!("FATAL: failed to connect tracing vsock to host: {e}");
+                std::process::abort();
+            }),
         );
         tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)

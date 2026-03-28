@@ -135,24 +135,32 @@ impl InitSystem {
             .create_new(false)
             .open("/dev/hvc0")
             .await
-            .unwrap();
+            .unwrap_or_else(|e| fatal!("failed to open hypervisor console /dev/hvc0: {e}"));
         console.set_max_buf_size(8_192);
 
-        args.next().unwrap(); // skip self
+        args.next().expect("argv[0] missing"); // skip self
 
         // TODO: convert from using hvc0 to using a vsock
-        let child = Command::new(args.next().unwrap())
+        let stderr_console = console
+            .try_clone()
+            .await
+            .unwrap_or_else(|e| fatal!("failed to clone console for stderr: {e}"));
+        let stdout_console = console
+            .try_clone()
+            .await
+            .unwrap_or_else(|e| fatal!("failed to clone console for stdout: {e}"));
+        let child = Command::new(args.next().expect("argv[1] missing: no test binary specified"))
             .args(args)
             .kill_on_drop(true)
             .stdin(Stdio::inherit())
-            .stderr(console.try_clone().await.unwrap().into_std().await)
-            .stdout(console.try_clone().await.unwrap().into_std().await)
+            .stderr(stderr_console.into_std().await)
+            .stdout(stdout_console.into_std().await)
             .env(ENV_IN_VM, ENV_MARKER_VALUE)
             .env("PATH", "/bin")
             .env("LD_LIBRARY_PATH", "/lib")
             .env("RUST_BACKTRACE", "1")
             .spawn()
-            .unwrap();
+            .unwrap_or_else(|e| fatal!("failed to spawn test process: {e}"));
 
         if let Some(pid) = child.id() {
             debug!("main process spawned with PID: {pid}");
@@ -227,6 +235,26 @@ impl InitSystem {
             }
             Err(e) => {
                 fatal!("failed to send signal to all processes: {e}");
+            }
+        }
+    }
+
+    /// Forwards a signal to a specific process, handling the case where the
+    /// process has already exited.
+    ///
+    /// Unlike [`send_signal_to_all_processes`](Self::send_signal_to_all_processes),
+    /// this targets a single PID and treats `ESRCH` (no such process) as a
+    /// non-fatal condition — the child may have exited between the time the
+    /// signal was received and the time we attempt to forward it.
+    fn forward_signal(pid: Pid, sig: Signal) {
+        if let Err(e) = kill(pid, sig) {
+            match e {
+                Errno::ESRCH => {
+                    debug!("cannot forward {sig:?}: process {pid} already exited");
+                }
+                other => {
+                    error!("failed to forward {sig:?} to process {pid}: {other}");
+                }
             }
         }
     }
@@ -367,38 +395,51 @@ impl InitSystem {
     /// This function never returns (its return type is [`Infallible`]).
     #[tracing::instrument(level = "info")]
     pub async fn run() -> Infallible {
+        /// Registers a Unix signal handler, aborting via [`fatal!`] on failure.
+        ///
+        /// An init system that cannot register signal handlers is in an
+        /// unrecoverable state, so failure here is fatal.
+        fn must_register_signal(kind: SignalKind) -> tokio::signal::unix::Signal {
+            signal(kind)
+                .unwrap_or_else(|e| fatal!("failed to register signal handler: {e}"))
+        }
+
         info!("starting init system");
         debug!("registering signal handlers");
 
         // signals to handle in init system
-        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        let mut sigterm = must_register_signal(SignalKind::terminate());
 
         // benign signals to forward to main process
         // NOTE: we intentionally do not handle SIGCHLD yet.
         // If the test is leaking processes that is a failure criteria we will catch after the main process exits.
-        let mut sighup = signal(SignalKind::hangup()).unwrap();
-        let mut siguser1 = signal(SignalKind::user_defined1()).unwrap();
-        let mut siguser2 = signal(SignalKind::user_defined2()).unwrap();
-        let mut sigwindow = signal(SignalKind::window_change()).unwrap();
+        let mut sighup = must_register_signal(SignalKind::hangup());
+        let mut siguser1 = must_register_signal(SignalKind::user_defined1());
+        let mut siguser2 = must_register_signal(SignalKind::user_defined2());
+        let mut sigwindow = must_register_signal(SignalKind::window_change());
 
         // signals which represent failure if received, but which should still be forwarded to main process
-        let mut sigint = signal(SignalKind::interrupt()).unwrap();
-        let mut sigalarm = signal(SignalKind::alarm()).unwrap();
-        let mut sigpipe = signal(SignalKind::pipe()).unwrap();
-        let mut sigquit = signal(SignalKind::quit()).unwrap();
+        let mut sigint = must_register_signal(SignalKind::interrupt());
+        let mut sigalarm = must_register_signal(SignalKind::alarm());
+        let mut sigpipe = must_register_signal(SignalKind::pipe());
+        let mut sigquit = must_register_signal(SignalKind::quit());
 
         debug!("signal handlers registered");
 
         // Mount essential filesystems
-        tokio::task::spawn_blocking(Self::mount_essential_filesystems)
-            .await
-            .unwrap()
-            .unwrap();
+        match tokio::task::spawn_blocking(Self::mount_essential_filesystems).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => fatal!("failed to mount essential filesystems: {e}"),
+            Err(e) => fatal!("mount filesystem task panicked: {e}"),
+        }
 
         // Spawn the main process
         let (mut console, mut child) = InitSystem::spawn_main_process().await;
 
-        let pid = Pid::from_raw(child.id().unwrap() as i32);
+        let pid = match child.id() {
+            Some(id) => Pid::from_raw(id as i32),
+            None => fatal!("unable to determine PID of spawned test process"),
+        };
 
         let mut success = true;
 
@@ -434,43 +475,43 @@ impl InitSystem {
                 _ = sigterm.recv() => {
                     debug!("received SIGTERM");
                     success = false;
-                    nix::sys::signal::kill(pid, nix::sys::signal::SIGTERM).unwrap();
+                    Self::forward_signal(pid, Signal::SIGTERM);
                 }
                 _ = sigint.recv() => {
                     warn!("forwarding SIGINT");
                     success = false;
-                    nix::sys::signal::kill(pid, nix::sys::signal::SIGINT).unwrap();
+                    Self::forward_signal(pid, Signal::SIGINT);
                 }
                 _ = sigalarm.recv() => {
                     warn!("forwarding ALARM");
                     success = false;
-                    nix::sys::signal::kill(pid, nix::sys::signal::SIGUSR2).unwrap();
+                    Self::forward_signal(pid, Signal::SIGUSR2);
                 }
                 _ = sigpipe.recv() => {
                     warn!("forwarding PIPE");
                     success = false;
-                    nix::sys::signal::kill(pid, nix::sys::signal::SIGPIPE).unwrap();
+                    Self::forward_signal(pid, Signal::SIGPIPE);
                 }
                 _ = sigquit.recv() => {
                     warn!("forwarding QUIT");
                     success = false;
-                    nix::sys::signal::kill(pid, nix::sys::signal::SIGQUIT).unwrap();
+                    Self::forward_signal(pid, Signal::SIGQUIT);
                 }
                 _ = sighup.recv() => {
                     debug!("forwarding SIGHUP");
-                    nix::sys::signal::kill(pid, nix::sys::signal::SIGHUP).unwrap();
+                    Self::forward_signal(pid, Signal::SIGHUP);
                 }
                 _ = siguser1.recv() => {
                     debug!("forwarding SIGUSR1");
-                    nix::sys::signal::kill(pid, nix::sys::signal::SIGUSR1).unwrap();
+                    Self::forward_signal(pid, Signal::SIGUSR1);
                 }
                 _ = siguser2.recv() => {
                     debug!("forwarding SIGUSR2");
-                    nix::sys::signal::kill(pid, nix::sys::signal::SIGUSR2).unwrap();
+                    Self::forward_signal(pid, Signal::SIGUSR2);
                 }
                 _ = sigwindow.recv() => {
                     trace!("forwarding WINDOW");
-                    nix::sys::signal::kill(pid, nix::sys::signal::SIGWINCH).unwrap();
+                    Self::forward_signal(pid, Signal::SIGWINCH);
                 }
             }
         }
@@ -479,9 +520,15 @@ impl InitSystem {
 
     /// Lists all direct child processes of init (PPID == 1) by scanning `/proc`.
     pub async fn list_child_processes() -> Vec<Pid> {
-        let mut child_pids = tokio::fs::read_dir("/proc").await.unwrap();
+        let mut child_pids = tokio::fs::read_dir("/proc")
+            .await
+            .unwrap_or_else(|e| fatal!("failed to read /proc: {e}"));
         let mut children = vec![];
-        while let Some(process) = child_pids.next_entry().await.unwrap() {
+        while let Some(process) = child_pids
+            .next_entry()
+            .await
+            .unwrap_or_else(|e| fatal!("failed to read /proc entry: {e}"))
+        {
             let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
                 continue;
             };
