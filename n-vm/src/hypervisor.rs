@@ -88,31 +88,20 @@ where
 // ── Async JSON stream decoder ────────────────────────────────────────
 
 /// A [`tokio_util::codec::Decoder`] that incrementally deserializes
-/// newline-delimited JSON values from a byte stream.
+/// concatenated JSON [`Event`] values from a byte stream.
 ///
 /// This is used to parse the cloud-hypervisor event monitor output, which
 /// consists of concatenated JSON objects written to a pipe.
-pub struct AsyncJsonStreamDecoder<'a, T: Deserialize<'a>> {
-    _phantom: std::marker::PhantomData<&'a T>,
-}
+///
+/// The previous implementation carried a phantom lifetime and generic type
+/// parameter that were never used — the `Decoder` impl was always
+/// monomorphised for [`Event`].  This version is a simple unit struct.
+#[derive(Debug, Default)]
+pub struct AsyncJsonStreamDecoder;
 
-impl<'a, T> AsyncJsonStreamDecoder<'a, T>
-where
-    T: Deserialize<'a>,
-{
+impl AsyncJsonStreamDecoder {
     pub fn new() -> Self {
-        Self {
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<'a, T> Default for AsyncJsonStreamDecoder<'a, T>
-where
-    T: Deserialize<'a>,
-{
-    fn default() -> Self {
-        Self::new()
+        Self
     }
 }
 
@@ -127,19 +116,16 @@ pub enum AsyncJsonStreamError {
     Io(#[from] std::io::Error),
 }
 
-impl<'a> tokio_util::codec::Decoder for AsyncJsonStreamDecoder<'a, Event>
-where
-    Self: 'a,
-{
+impl tokio_util::codec::Decoder for AsyncJsonStreamDecoder {
     type Item = Event;
     type Error = AsyncJsonStreamError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let x = src.as_ref().to_vec();
-        let mut des: StreamDeserializer<'_, serde_json::de::SliceRead<'_>, Event> =
-            serde_json::Deserializer::from_slice(&x).into_iter::<Event>();
-        let next = des.next();
-        let bytes_consumed = des.byte_offset();
+        let buf = src.as_ref().to_vec();
+        let mut stream: StreamDeserializer<'_, serde_json::de::SliceRead<'_>, Event> =
+            serde_json::Deserializer::from_slice(&buf).into_iter::<Event>();
+        let next = stream.next();
+        let bytes_consumed = stream.byte_offset();
         match next {
             Some(Ok(value)) => {
                 src.advance(bytes_consumed);

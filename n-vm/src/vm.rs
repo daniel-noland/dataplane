@@ -477,7 +477,7 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
             && hypervisor_output.status.success(),
         stdout: String::from_utf8_lossy(&hypervisor_output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&hypervisor_output.stderr).to_string(),
-        console: kernel_log.clone(),
+        console: kernel_log,
         init_trace,
         virtiofsd_stdout: String::from_utf8_lossy(virtiofsd.stdout.as_slice()).to_string(),
         virtiofsd_stderr: String::from_utf8_lossy(virtiofsd.stderr.as_slice()).to_string(),
