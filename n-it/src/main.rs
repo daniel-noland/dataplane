@@ -4,7 +4,7 @@ use nix::sys::reboot::{RebootMode, reboot};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, sync};
-use std::cell::{RefCell, RefMut};
+use std::sync::{Mutex, MutexGuard};
 use std::convert::Infallible;
 use std::io::Write;
 use std::process::{self, Stdio};
@@ -454,9 +454,9 @@ impl InitSystem {
     }
 }
 
-pub struct VsockWriter(RefCell<vsock::VsockStream>);
+pub struct VsockWriter(Mutex<vsock::VsockStream>);
 
-pub struct VsockWriterGuard<'a>(RefMut<'a, vsock::VsockStream>);
+pub struct VsockWriterGuard<'a>(MutexGuard<'a, vsock::VsockStream>);
 
 impl std::io::Write for VsockWriterGuard<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -472,12 +472,9 @@ impl<'a> MakeWriter<'a> for VsockWriter {
     type Writer = VsockWriterGuard<'a>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        VsockWriterGuard(self.0.borrow_mut())
+        VsockWriterGuard(self.0.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
-
-unsafe impl Send for VsockWriter {}
-unsafe impl Sync for VsockWriter {}
 
 // arbitrary port for tracing vsock connection
 const INIT_SYSTEM_VSOCK_PORT: u32 = 123_456;
@@ -497,7 +494,7 @@ fn main() -> Infallible {
     runtime.block_on(async {
         eprintln!("init system runtime started: connecting to tracing vsock");
         let tracing_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, INIT_SYSTEM_VSOCK_PORT);
-        let tracing_vsock = VsockWriter(RefCell::new(
+        let tracing_vsock = VsockWriter(Mutex::new(
             vsock::VsockStream::connect(&tracing_addr).unwrap(),
         ));
         tracing_subscriber::fmt()
