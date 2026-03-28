@@ -406,13 +406,14 @@ pub mod test {
     }
 
     #[ignore = "temporarily disabled during vm test runner refactor"]
-    // TODO: #[in_vm] does not support async functions (it creates its own tokio
-    // runtime at the container tier).  Convert this to a sync `#[test] fn` that
-    // builds its own runtime, or restructure so the async body runs inside the
-    // VM tier only.
-    // #[n_vm::in_vm]
-    #[tokio::test]
-    async fn test_sample_config() {
+    #[n_vm::in_vm]
+    #[test]
+    fn test_sample_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime for test_sample_config");
+        rt.block_on(async {
         get_trace_ctl()
             .setup_from_string("cpi=debug,mgmt=debug,routing=debug")
             .unwrap();
@@ -498,5 +499,6 @@ pub mod test {
         /* stop the router */
         debug!("Stopping the router...");
         router.stop();
+        }); // rt.block_on
     }
 }
