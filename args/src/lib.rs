@@ -3,117 +3,120 @@
 
 //! Argument parsing and configuration management for the dataplane.
 //!
-//! This crate provides the infrastructure for safely passing configuration from the
-//! `dataplane-init` process to the `dataplane` worker process using Linux memory file
-//! descriptors (memfd). This approach enables zero-copy deserialization while maintaining
-//! strong security guarantees through file sealing mechanisms.
+//! This crate provides command-line argument parsing ([`CmdArgs`]) and the
+//! complete [`LaunchConfiguration`] type that describes how to start a dataplane
+//! worker process.
 //!
 //! # Architecture
 //!
-//! The configuration flow follows this pattern:
+//! 1. **Parent process (`dataplane-init`)**: parses [`CmdArgs`], converts to
+//!    [`LaunchConfiguration`], serializes via `rkyv` into a sealed memfd
+//!    (see [`ipc`]), and passes the file descriptor to the child.
+//! 2. **Child process (`dataplane`)**: calls [`LaunchConfiguration::inherit()`]
+//!    to receive, validate, memory-map, and deserialize the configuration.
 //!
-//! 1. **Parent Process (dataplane-init)**:
-//!    - Parses command-line arguments using [`CmdArgs`]
-//!    - Converts arguments into a [`LaunchConfiguration`]
-//!    - Serializes the configuration using `rkyv` for zero-copy deserialization
-//!    - Writes serialized data to a [`MemFile`] and finalizes it into a [`FinalizedMemFile`]
-//!    - Computes an [`IntegrityCheck`] (SHA-384 hash) of the configuration
-//!    - Passes both file descriptors to the child process at known FD numbers
-//!
-//! 2. **Child Process (dataplane)**:
-//!    - Inherits the configuration via [`LaunchConfiguration::inherit()`]
-//!    - Validates the integrity check matches the configuration
-//!    - Memory-maps the sealed memfd for zero-copy access
-//!    - Accesses the configuration through the rkyv archive format
-//!
-//! # Key Types
-//!
-//! - [`CmdArgs`]: Command-line argument parser using clap
-//! - [`LaunchConfiguration`]: Complete dataplane configuration (driver, routing, metrics, etc.)
-//! - [`MemFile`]: Mutable memfd wrapper for building configuration
-//! - [`FinalizedMemFile`]: Immutable, sealed memfd for safe inter-process sharing
-//! - [`IntegrityCheck`]: SHA-384 hash for validating configuration integrity
-//!
-//! # `FinalizedMemFile` Integrity
-//!
-//! [`FinalizedMemFile`] provides multiple layers of protection:
-//!
-//! - **Read-only mode**: File permissions are set to 0o400 (owner read-only)
-//! - **Sealed against modification**: `F_SEAL_WRITE`, `F_SEAL_GROW`, `F_SEAL_SHRINK` prevent changes
-//! - **Sealed seals**: `F_SEAL_SEAL` prevents removing the seals
-//! - **Integrity checking**: SHA-384 hash validates the configuration hasn't been tampered with or corrupted.
-//! - (optional) **Close-on-exec**: we have the ability to mark `MemFile` as close-on-exec to prevent accidental leaking
-//!   to subprocesses.
-//!   This can't be done in the parent process, but should be done by the child process as soon as the file descriptor
-//!   is identified.
+//! Sealed memfd primitives ([`MemFile`], [`FinalizedMemFile`], [`IntegrityCheck`])
+//! are provided by the [`ipc`] crate and re-exported here for convenience.
 
 #![deny(unsafe_code, clippy::pedantic)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub use clap::Parser;
+pub use ipc::{
+    AsFinalizedMemFile, FinalizedMemFile, IntegrityCheck, IntegrityCheckBytes, MemFile,
+    INTEGRITY_CHECK_BYTE_LEN,
+};
+
 use hardware::pci::address::InvalidPciAddress;
 use hardware::pci::address::PciAddress;
 use miette::{Context, IntoDiagnostic};
 use net::interface::IllegalInterfaceName;
 use net::interface::InterfaceName;
-use sha2::Digest;
-use std::borrow::Borrow;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::net::SocketAddr;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::str::FromStr;
-
 use std::time::Duration;
 
 #[derive(
-    Debug, PartialEq, Eq, Clone, serde::Serialize, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive,
+    Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive,
 )]
 #[rkyv(attr(derive(PartialEq, Eq, Debug)))]
 pub enum PortArg {
-    PCI(PciAddress),       // DPDK driver
-    KERNEL(InterfaceName), // kernel driver
+    Pci(PciAddress),       // DPDK driver
+    Kernel(InterfaceName), // kernel driver
 }
 
 #[derive(
-    Debug, PartialEq, Eq, Clone, serde::Serialize, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive,
+    Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive,
 )]
 #[rkyv(attr(derive(PartialEq, Eq, Debug)))]
-#[allow(unused)]
 pub struct InterfaceArg {
     pub interface: InterfaceName,
     pub port: Option<PortArg>,
 }
 
+/// Errors that can occur when parsing a [`PortArg`] from a string.
+///
+/// Port arguments follow the syntax `DISCRIMINANT@VALUE`, where the discriminant
+/// is either `pci` (followed by a PCI address) or `kernel` (followed by a kernel
+/// interface name).
+#[derive(Debug, thiserror::Error)]
+pub enum PortArgParseError {
+    /// The input string is missing the `@` separator between discriminant and value.
+    #[error("bad syntax: expected DISCRIMINANT@VALUE, missing '@' separator")]
+    MissingSeparator,
+    /// The PCI address following `pci@` could not be parsed.
+    #[error("invalid PCI address: {0}")]
+    InvalidPciAddress(#[from] InvalidPciAddress),
+    /// The kernel interface name following `kernel@` is not a valid interface name.
+    #[error("invalid kernel interface name: {0}")]
+    InvalidInterfaceName(#[from] IllegalInterfaceName),
+    /// The discriminant is not one of the recognized values (`pci` or `kernel`).
+    #[error("unknown port type '{0}': expected 'pci' or 'kernel'")]
+    UnknownDiscriminant(String),
+}
+
+/// Errors that can occur when parsing an [`InterfaceArg`] from a string.
+///
+/// Interface arguments follow the syntax `INTERFACE=DISCRIMINANT@VALUE` or simply
+/// `INTERFACE` when no port mapping is provided.
+#[derive(Debug, thiserror::Error)]
+pub enum InterfaceArgParseError {
+    /// The interface name portion of the argument is not a valid interface name.
+    #[error("invalid interface name: {0}")]
+    InvalidInterfaceName(#[from] IllegalInterfaceName),
+    /// The port specifier following the `=` could not be parsed.
+    #[error("invalid port specifier: {0}")]
+    InvalidPort(#[from] PortArgParseError),
+}
+
 impl FromStr for PortArg {
-    type Err = String;
+    type Err = PortArgParseError;
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let (disc, value) = input
             .split_once('@')
-            .ok_or("Bad syntax: missing @".to_string())?;
+            .ok_or(PortArgParseError::MissingSeparator)?;
 
         match disc {
             "pci" => {
-                let pciaddr = PciAddress::try_from(value).map_err(|e| e.to_string())?;
-                Ok(PortArg::PCI(pciaddr))
+                let pciaddr = PciAddress::try_from(value)?;
+                Ok(PortArg::Pci(pciaddr))
             }
             "kernel" => {
-                let kernelif = InterfaceName::try_from(value)
-                    .map_err(|e| format!("Bad kernel interface name: {e}"))?;
-                Ok(PortArg::KERNEL(kernelif))
+                let kernelif = InterfaceName::try_from(value)?;
+                Ok(PortArg::Kernel(kernelif))
             }
-            _ => Err(format!(
-                "Unknown discriminant '{disc}': allowed values are pci|kernel"
-            )),
+            _ => Err(PortArgParseError::UnknownDiscriminant(disc.to_string())),
         }
     }
 }
 
 impl FromStr for InterfaceArg {
-    type Err = String;
+    type Err = InterfaceArgParseError;
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         if let Some((first, second)) = input.split_once('=') {
-            let interface =
-                InterfaceName::try_from(first).map_err(|e| format!("Bad interface name: {e}"))?;
+            let interface = InterfaceName::try_from(first)?;
 
             let port = PortArg::from_str(second)?;
             Ok(InterfaceArg {
@@ -121,8 +124,7 @@ impl FromStr for InterfaceArg {
                 port: Some(port),
             })
         } else {
-            let interface =
-                InterfaceName::try_from(input).map_err(|e| format!("Bad interface name: {e}"))?;
+            let interface = InterfaceName::try_from(input)?;
             Ok(InterfaceArg {
                 interface,
                 port: None,
@@ -131,11 +133,25 @@ impl FromStr for InterfaceArg {
     }
 }
 
-use tracing::instrument;
+impl std::fmt::Display for PortArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PortArg::Pci(addr) => write!(f, "pci@{addr}"),
+            PortArg::Kernel(name) => write!(f, "kernel@{name}"),
+        }
+    }
+}
+
+impl std::fmt::Display for InterfaceArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.port {
+            Some(port) => write!(f, "{}={port}", self.interface),
+            None => write!(f, "{}", self.interface),
+        }
+    }
+}
 
 use bytecheck::CheckBytes;
-use nix::fcntl::{FcntlArg, FdFlag};
-use nix::{fcntl::SealFlag, sys::memfd::MFdFlags};
 
 /// Default path to the dataplane's control plane unix socket.
 ///
@@ -154,165 +170,6 @@ pub const DEFAULT_DP_UX_PATH_CLI: &str = "/var/run/dataplane/cli.sock";
 /// configuration reloads.
 pub const DEFAULT_FRR_AGENT_PATH: &str = "/var/run/frr/frr-agent.sock";
 
-/// A type wrapper around [`std::fs::File`] which is reserved to describe linux [memfd] files.
-///
-/// Memory file descriptors are anonymous, file-like objects that exist only in memory
-/// and are not backed by any filesystem. They are particularly useful for passing
-/// ephemeral configuration data between processes.
-///
-/// # Mutability
-///
-/// [`MemFile`] is intended for mutation during construction. Once you've written your
-/// data, use [`MemFile::finalize`] to create a [`FinalizedMemFile`] which provides
-/// strong immutability guarantees suitable for inter-process sharing.
-///
-/// [memfd]: https://man7.org/linux/man-pages/man2/memfd_create.2.html
-#[derive(Debug)]
-pub struct MemFile(std::fs::File);
-
-/// An immutable, sealed memory file descriptor that cannot be modified.
-///
-/// Multiple protections are in place to deny all attempts to mutate the memory contents of these files.
-/// These protections make this type of file suitable for as-safe-as-practical zero-copy deserialization of data
-/// structure serialized by one process and given to a different process.
-///
-/// # Integrity Properties
-///
-/// Multiple protections are enforced to prevent any data mutation:
-///
-/// If these files contain secrets (or even if they don't), it is usually best to mark the file as close-on-exec to
-/// further mitigate opportunities for the data to be corrupted / mutated.
-/// This task, by its nature, can not be done by the parent process (or the child would not get the file descriptor).
-/// As a consequence, this marking step should be taken as soon as the file is received by the child process.
-/// The (unsafe) method [`FinalizedMemFile::from_fd`] takes this action automatically, and is the recommended way to
-/// receive and read the file from child processes.
-pub struct FinalizedMemFile(MemFile);
-
-impl MemFile {
-    /// Create a new, blank [`MemFile`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the operating system is unable to allocate an in-memory file descriptor.
-    #[must_use]
-    pub fn new() -> MemFile {
-        let id: id::Id<MemFile> = id::Id::new();
-        let descriptor =
-            nix::sys::memfd::memfd_create(id.to_string().as_bytes(), MFdFlags::MFD_ALLOW_SEALING)
-                .into_diagnostic()
-                .wrap_err("failed to create memfd")
-                .unwrap();
-        MemFile(std::fs::File::from(descriptor))
-    }
-
-    /// Finalize and seal this [`MemFile`]
-    ///
-    /// # Note
-    ///
-    /// This method does its very best to protect the memory region against any future mutation.
-    /// This sealing operation is not reversible.
-    ///
-    /// Although this operation consumes `self`, any memory maps to this file will become immutable or be invalidated
-    /// immediately after this operation.
-    /// You should make sure no memory maps to this file are open when this finalize operation is invoked.
-    ///
-    /// # Panics
-    ///
-    /// This method is intended for use only during early process initialization and makes no attempt to recover from
-    /// errors.
-    ///
-    /// This method will panic if
-    ///
-    /// 1. The file can not be modified to exclude write operations (basically chmod 400)
-    /// 2. if the file can not be sealed against extension, truncation, mutation, and any attempt to remove the seals.
-    #[must_use]
-    pub fn finalize(self) -> FinalizedMemFile {
-        let mut this = self;
-        // mark the file as read only
-        nix::sys::stat::fchmod(&this, nix::sys::stat::Mode::S_IRUSR)
-            .into_diagnostic()
-            .wrap_err("failed to set dataplane configuration memfd to readonly mode")
-            .unwrap();
-        this.seal(
-            SealFlag::F_SEAL_WRITE
-                | SealFlag::F_SEAL_GROW
-                | SealFlag::F_SEAL_SHRINK
-                | SealFlag::F_SEAL_SEAL,
-        );
-        this.0
-            .seek(SeekFrom::Start(0))
-            .into_diagnostic()
-            .wrap_err("unable to seek finalized file to start")
-            .unwrap();
-        FinalizedMemFile(this)
-    }
-
-    /// Seal the file with the provided seal flags.
-    #[tracing::instrument(level = "info")]
-    fn seal(&mut self, seals: SealFlag) {
-        nix::fcntl::fcntl(self, FcntlArg::F_ADD_SEALS(seals))
-            .into_diagnostic()
-            .wrap_err(format!(
-                "failed to add seals to mfd; attempted to add seals {seals:?}"
-            ))
-            .unwrap();
-    }
-}
-
-impl Default for MemFile {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AsFd for MemFile {
-    fn as_fd(&self) -> std::os::unix::prelude::BorrowedFd<'_> {
-        self.0.as_fd()
-    }
-}
-
-impl Borrow<std::fs::File> for MemFile {
-    fn borrow(&self) -> &std::fs::File {
-        &self.0
-    }
-}
-
-impl AsRef<std::fs::File> for MemFile {
-    fn as_ref(&self) -> &std::fs::File {
-        &self.0
-    }
-}
-
-impl AsMut<std::fs::File> for MemFile {
-    fn as_mut(&mut self) -> &mut std::fs::File {
-        &mut self.0
-    }
-}
-
-impl From<MemFile> for std::fs::File {
-    fn from(value: MemFile) -> Self {
-        value.0
-    }
-}
-
-impl AsRef<std::fs::File> for FinalizedMemFile {
-    fn as_ref(&self) -> &std::fs::File {
-        &self.0.0
-    }
-}
-
-impl Read for FinalizedMemFile {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.0.read(buf)
-    }
-}
-
-impl From<MemFile> for FinalizedMemFile {
-    fn from(value: MemFile) -> Self {
-        value.finalize()
-    }
-}
-
 /// General configuration section for the dataplane.
 ///
 #[derive(
@@ -320,6 +177,7 @@ impl From<MemFile> for FinalizedMemFile {
     PartialEq,
     Eq,
     serde::Serialize,
+    serde::Deserialize,
     rkyv::Serialize,
     rkyv::Deserialize,
     rkyv::Archive,
@@ -328,7 +186,7 @@ impl From<MemFile> for FinalizedMemFile {
 #[rkyv(attr(derive(Debug, PartialEq, Eq)))]
 pub struct GeneralConfigSection {
     /// Name to give to this dataplane/gateway
-    name: Option<String>,
+    pub name: Option<String>,
 }
 
 /// Configuration for the packet processing driver used by the dataplane.
@@ -348,8 +206,14 @@ pub struct GeneralConfigSection {
 ///   environments with dedicated NICs.
 /// - Use **Kernel** for development, testing, or environments without DPDK-compatible
 ///   hardware.
+///
+/// # Note
+///
+/// This type does not derive `CheckBytes` because its inner types contain
+/// [`InterfaceName`] which does not yet implement `CheckBytes`.
+/// Adding that derive to `InterfaceName` in the `net` crate would unblock this.
 #[derive(
-    Debug, PartialEq, Eq, serde::Serialize, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive,
+    Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive,
 )]
 #[serde(tag = "driver")]
 #[serde(rename_all = "snake_case")]
@@ -371,6 +235,7 @@ pub enum DriverConfigSection {
     PartialEq,
     Eq,
     serde::Serialize,
+    serde::Deserialize,
     rkyv::Serialize,
     rkyv::Deserialize,
     rkyv::Archive,
@@ -394,6 +259,7 @@ pub struct DpdkDriverConfigSection {
     PartialEq,
     Eq,
     serde::Serialize,
+    serde::Deserialize,
     rkyv::Serialize,
     rkyv::Deserialize,
     rkyv::Archive,
@@ -414,6 +280,7 @@ pub struct KernelDriverConfigSection {
     PartialEq,
     Eq,
     serde::Serialize,
+    serde::Deserialize,
     rkyv::Serialize,
     rkyv::Deserialize,
     rkyv::Archive,
@@ -435,6 +302,7 @@ pub struct CliConfigSection {
     PartialEq,
     Eq,
     serde::Serialize,
+    serde::Deserialize,
     rkyv::Serialize,
     rkyv::Deserialize,
     rkyv::Archive,
@@ -452,6 +320,7 @@ pub struct MetricsConfigSection {
     PartialEq,
     Eq,
     serde::Serialize,
+    serde::Deserialize,
     rkyv::Serialize,
     rkyv::Deserialize,
     rkyv::Archive,
@@ -474,6 +343,7 @@ pub struct TracingConfigSection {
     PartialEq,
     Eq,
     serde::Serialize,
+    serde::Deserialize,
     rkyv::Serialize,
     rkyv::Deserialize,
     rkyv::Archive,
@@ -499,6 +369,7 @@ pub enum TracingDisplayOption {
     PartialEq,
     Eq,
     serde::Serialize,
+    serde::Deserialize,
     rkyv::Serialize,
     rkyv::Deserialize,
     rkyv::Archive,
@@ -517,7 +388,15 @@ pub struct TracingShowSection {
 /// Defines how the dataplane communicates with FRR (Free Range Routing) and
 /// related routing components.
 #[derive(
-    Debug, PartialEq, Eq, serde::Serialize, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    rkyv::Archive,
+    CheckBytes,
 )]
 #[rkyv(attr(derive(PartialEq, Eq, Debug)))]
 pub struct RoutingConfigSection {
@@ -536,6 +415,7 @@ pub struct RoutingConfigSection {
     PartialEq,
     Eq,
     serde::Serialize,
+    serde::Deserialize,
     rkyv::Serialize,
     rkyv::Deserialize,
     rkyv::Archive,
@@ -552,6 +432,7 @@ pub struct ConfigServerSection {
     PartialEq,
     Eq,
     serde::Serialize,
+    serde::Deserialize,
     rkyv::Serialize,
     rkyv::Deserialize,
     rkyv::Archive,
@@ -587,6 +468,7 @@ pub struct BmpConfigSection {
     PartialEq,
     Eq,
     serde::Serialize,
+    serde::Deserialize,
     rkyv::Serialize,
     rkyv::Deserialize,
     rkyv::Archive,
@@ -620,6 +502,7 @@ pub struct LaunchConfiguration {
     PartialEq,
     Eq,
     serde::Serialize,
+    serde::Deserialize,
     rkyv::Serialize,
     rkyv::Deserialize,
     rkyv::Archive,
@@ -690,11 +573,11 @@ impl LaunchConfiguration {
     pub fn inherit() -> LaunchConfiguration {
         let integrity_check_fd = unsafe { OwnedFd::from_raw_fd(Self::STANDARD_INTEGRITY_CHECK_FD) };
         let launch_configuration_fd = unsafe { OwnedFd::from_raw_fd(Self::STANDARD_CONFIG_FD) };
-        let integrity_check_file = unsafe { FinalizedMemFile::from_fd(integrity_check_fd) };
+        let mut integrity_check_file = unsafe { FinalizedMemFile::from_fd(integrity_check_fd) };
         let mut launch_configuration_file =
             unsafe { FinalizedMemFile::from_fd(launch_configuration_fd) };
         launch_configuration_file
-            .validate(integrity_check_file)
+            .validate(&mut integrity_check_file)
             .wrap_err("checksum validation failed for launch configuration")
             .unwrap();
 
@@ -723,17 +606,8 @@ impl LaunchConfiguration {
             "invalid size for inherited memfd"
         );
 
-        // we slightly abuse the access method here just to get byte level validation.
-        // The actual objective here is to ensure all enums are valid and that all pointers point within the
-        // archive.
-        rkyv::access::<ArchivedLaunchConfiguration, rkyv::rancor::Failure>(
-            launch_config_memmap.as_ref(),
-        )
-        .into_diagnostic()
-        .wrap_err("failed to validate ArchivedLaunchConfiguration")
-        .unwrap();
-
-        // here we actually deserialize the data
+        // from_bytes internally calls access(), which performs CheckBytes validation
+        // (alignment, bounds, enum discriminants) before deserializing.
         rkyv::from_bytes::<LaunchConfiguration, rkyv::rancor::Error>(launch_config_memmap.as_ref())
             .into_diagnostic()
             .wrap_err("failed to deserialize launch configuration")
@@ -760,285 +634,6 @@ impl AsFinalizedMemFile for LaunchConfiguration {
     }
 }
 
-/// Trait for data that can be serialized into a sealed memory file descriptor.
-///
-/// Types implementing this trait can be converted into a [`FinalizedMemFile`],
-/// which provides strong immutability guarantees suitable for inter-process
-/// communication.
-pub trait AsFinalizedMemFile {
-    /// Serialize and seal this data into a [`FinalizedMemFile`].
-    ///
-    /// The returned file is immutable and suitable for zero-copy deserialization
-    /// in other processes.
-    fn finalize(self) -> FinalizedMemFile;
-}
-
-impl FinalizedMemFile {
-    /// Compute an integrity check of the contents of this file.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the backing memfd file can not be `seek`ed to the start.
-    pub fn integrity_check(&mut self) -> IntegrityCheck {
-        self.0
-            .0
-            .seek(SeekFrom::Start(0))
-            .into_diagnostic()
-            .wrap_err("failed to seek to start of memfd when computing integrity check")
-            .unwrap();
-        IntegrityCheck::from_reader(&mut self.as_ref())
-    }
-
-    /// Consume the memfd and return an owned file descriptor.
-    ///
-    /// # Note
-    ///
-    /// This step is needed in order to hand the file descriptor to the child process.
-    ///
-    /// That said, it also obscures the fact that this file is a sealed memfd, which is potentially very confusing if
-    /// given to any system not expecting those mechanics.
-    ///
-    /// You should generally only call this method as when you are about to hand the file to a child process which is
-    /// expecting such a file descriptor.
-    #[must_use]
-    pub fn to_owned_fd(self) -> OwnedFd {
-        OwnedFd::from(self.0.0)
-    }
-
-    /// Construct a [`FinalizedMemFile`] from a file descriptor
-    ///
-    /// # Safety
-    ///
-    /// This function _attempts_ to check that it has been given a real [`FinalizedMemFile`] (typically from another
-    /// process).
-    /// This check is on a best effort basis, and is not infallible.
-    /// Additional checks (e.g., checksums or cryptographic signatures) should be used to ensure that this file contains
-    /// the expected bits.
-    /// That said, these checks are not and can't really be infallible.
-    ///
-    /// # Panics
-    ///
-    /// 1. panics if the provided file descriptor does not exist
-    /// 2. panics if the name of the detected file is not valid unicode
-    /// 3. panics if the provided file descriptor does not refer to a memfd file
-    /// 4. panics if the provided file descriptor can not be `stat`ed.
-    /// 5. panics if the provided memfd is not strictly read only
-    /// 6. panics if the provided memfd is not sealed (against writes, truncation, extension, and seal modifications)
-    /// 7. panics if the provided memfd can not be `seek`ed to the start of the file (very unlikely)
-    /// 8. panics if the provided memfd can not be marked as close-on-exec (very unlikely)
-    #[instrument(level = "debug", skip(fd))]
-    #[allow(unsafe_code)] // external contract documented and checked as well as I can for now
-    pub unsafe fn from_fd(fd: OwnedFd) -> FinalizedMemFile {
-        // TODO: is procfs actually mounted at /proc?  Are we reading the correct file.  Annoying to fix this properly.
-        let os_str =
-            nix::fcntl::readlink(format!("/proc/self/fd/{fd}", fd = fd.as_raw_fd()).as_str())
-                .into_diagnostic()
-                .wrap_err("failed to read memfd link in /proc")
-                .unwrap();
-        let readlink_result = os_str
-            .into_string()
-            .map_err(|_| std::io::Error::other("file descriptor readlink returned invalid unicode"))
-            .into_diagnostic()
-            .unwrap();
-        assert!(
-            readlink_result.starts_with("/memfd:"),
-            "supplied file descriptor is not a memfd: {readlink_result}"
-        );
-        let stat = nix::sys::stat::fstat(fd.as_fd())
-            .into_diagnostic()
-            .wrap_err("failed to stat memfd")
-            .unwrap();
-        const EXPECTED_PERMISSIONS: u32 = nix::libc::S_IFREG | nix::libc::S_IRUSR; // regular file | owner read-only
-        assert!(
-            stat.st_mode == EXPECTED_PERMISSIONS,
-            "finalized memfd not in read only mode: given mode is {:o}, expected {EXPECTED_PERMISSIONS:o}",
-            stat.st_mode
-        );
-
-        let Some(seals) = SealFlag::from_bits(
-            nix::fcntl::fcntl(fd.as_fd(), FcntlArg::F_GET_SEALS)
-                .into_diagnostic()
-                .wrap_err("failed to get seals on file descriptor")
-                .unwrap(),
-        ) else {
-            panic!("seal bits on memfd are set but are unknown to the system");
-        };
-        let expected_bits: SealFlag = SealFlag::F_SEAL_GROW
-            | SealFlag::F_SEAL_SHRINK
-            | SealFlag::F_SEAL_WRITE
-            | SealFlag::F_SEAL_SEAL;
-        assert!(
-            seals.contains(expected_bits),
-            "missing seal bits on finalized memfd: bits set {seals:?}, bits expected: {expected_bits:?}"
-        );
-        let mut file = std::fs::File::from(fd);
-        file.seek(SeekFrom::Start(0))
-            .into_diagnostic()
-            .wrap_err("failed to seek to start of memfd")
-            .unwrap();
-        // mark file close on exec so we are less likely to accidentally leak it
-        nix::fcntl::fcntl(file.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
-            .into_diagnostic()
-            .wrap_err("unable to mark memfd as close-on-exec")
-            .unwrap();
-        FinalizedMemFile(MemFile(file))
-    }
-
-    /// Validate this file using an [`IntegrityCheck`] serialized into the provided `check_file`
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if
-    ///
-    /// 1. unable to read the integrity check file
-    /// 2. invalid file (checksum mismatch)
-    pub fn validate(&mut self, check_file: FinalizedMemFile) -> Result<(), miette::Report> {
-        let mut check_file = check_file;
-        check_file
-            .0
-            .0
-            .seek(SeekFrom::Start(0))
-            .into_diagnostic()
-            .wrap_err("failed to seek to start of check_file")?;
-        let mut given_bytes: IntegrityCheckBytes = [0; _];
-        check_file
-            .as_ref()
-            .read_exact(&mut given_bytes)
-            .into_diagnostic()
-            .wrap_err("unable to read check file")?;
-        let given = IntegrityCheck::deserialize(given_bytes);
-        let calculated = self.integrity_check();
-        if given == calculated {
-            Ok(())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid checksum",
-            ))
-            .into_diagnostic()
-        }
-    }
-}
-
-/// Errors that can occur during integrity check validation.
-#[derive(Debug, thiserror::Error, miette::Diagnostic)]
-pub enum IntegrityCheckError {
-    /// The integrity check file has an incorrect size.
-    ///
-    /// This typically indicates file corruption or an attempt to use an incompatible
-    /// hash algorithm. The expected size is [`INTEGRITY_CHECK_BYTE_LEN`].
-    #[error(
-        "wrong check file length for hash type; received {0} bytes, expected {SHA384_BYTE_LEN} bytes"
-    )]
-    WrongCheckFileLength(u64),
-}
-
-/// Size of SHA-384 hash in bytes (384 bits / 8 = 48 bytes).
-const SHA384_BYTE_LEN: usize = 384 / 8;
-
-/// Current size of integrity check in bytes (currently SHA-384).
-pub const INTEGRITY_CHECK_BYTE_LEN: usize = SHA384_BYTE_LEN;
-
-/// Internal representation of SHA-384 hash bytes.
-#[repr(transparent)]
-#[derive(Debug, PartialEq, Eq)]
-struct Sha384Bytes([u8; SHA384_BYTE_LEN]);
-
-/// Cryptographic integrity check for validating file contents.
-///
-/// Currently implemented using SHA-384, providing a cryptographically secure hash
-/// that can detect any tampering or corruption of the file contents. The hash
-/// implementation may change in future versions without API changes.
-///
-/// # Use Cases
-///
-/// - Validating configuration files passed between processes
-/// - Detecting corruption in sealed memory file descriptors
-/// - Ensuring data integrity during process handoff
-///
-/// # Security Properties
-///
-/// SHA-384 is a member of the SHA-2 family and provides:
-///
-/// - 384-bit (48-byte) hash output
-/// - Cryptographic collision resistance
-/// - Pre-image resistance (cannot reverse the hash to find the original data)
-#[must_use]
-#[derive(Debug, PartialEq, Eq)]
-pub struct IntegrityCheck {
-    sha384: Sha384Bytes,
-}
-
-/// Byte array representation of an [`IntegrityCheck`].
-///
-/// This type can hold the serialized form of an integrity check (currently 48 bytes
-/// for SHA-384).
-pub type IntegrityCheckBytes = [u8; INTEGRITY_CHECK_BYTE_LEN];
-
-impl IntegrityCheck {
-    /// Serialize this integrity check into bytes
-    fn serialize(&self) -> IntegrityCheckBytes {
-        let mut output: IntegrityCheckBytes = [0; _];
-        output.copy_from_slice(&self.sha384.0);
-        output
-    }
-
-    /// Deserialize this integrity check as bytes
-    fn deserialize(input: IntegrityCheckBytes) -> IntegrityCheck {
-        IntegrityCheck {
-            sha384: Sha384Bytes(input),
-        }
-    }
-
-    /// Hash a file / reader.
-    ///
-    /// # Note:
-    ///
-    /// If providing this method with a file, make sure that the file has been `seek`ed to the start or you will
-    /// end up only hashing from the seek position to the end of the file.
-    fn from_reader(r: &mut impl Read) -> Self {
-        const CHUNK_SIZE: usize = 128;
-        let mut hasher = sha2::Sha384::new();
-        loop {
-            let mut chunk = [0_u8; CHUNK_SIZE];
-            let amount = r
-                .read(&mut chunk)
-                .into_diagnostic()
-                .wrap_err("failed to read integrity check")
-                .unwrap();
-            hasher.update(&chunk[..amount]);
-            if amount == 0 {
-                break;
-            }
-        }
-        let mut hash = [0; INTEGRITY_CHECK_BYTE_LEN];
-        hash.copy_from_slice(&hasher.finalize()[..]);
-        let sha384 = Sha384Bytes(hash);
-        IntegrityCheck { sha384 }
-    }
-}
-
-impl AsFinalizedMemFile for IntegrityCheck {
-    #[tracing::instrument(level = "info")]
-    fn finalize(self) -> FinalizedMemFile {
-        let bytes = self.serialize();
-        let mut memfd = MemFile::new();
-        memfd
-            .as_mut()
-            .set_len(bytes.len() as u64)
-            .into_diagnostic()
-            .wrap_err("failed to set length of integrity check memfd")
-            .unwrap();
-        memfd
-            .as_mut()
-            .write_all(bytes.as_slice())
-            .into_diagnostic()
-            .wrap_err("failed to write integrity check to memfd")
-            .unwrap();
-        memfd.finalize()
-    }
-}
-
 /// Errors that can occur when parsing or validating command-line arguments.
 ///
 /// These errors occur during the conversion from [`CmdArgs`] to [`LaunchConfiguration`]
@@ -1058,12 +653,14 @@ pub enum InvalidCmdArguments {
     /// (e.g., `eth0`, `ens3`)
     #[error(transparent)]
     InvalidInterfaceName(#[from] IllegalInterfaceName),
-    #[error("\"{0}\" is not a valid driver.  Must be dpdk or kernel")]
-    InvalidDriver(String),
-    #[error("Must specify driver as dpdk or kernel")]
-    NoDriverSpecified,
     #[error("No network interfaces specified")]
     NoInterfacesSpecified,
+    /// A DPDK interface was specified without a port (PCI address) mapping.
+    ///
+    /// DPDK requires each interface to have an explicit PCI address binding
+    /// via the `pci@ADDR` syntax.
+    #[error("DPDK interface '{0}' is missing a port specifier (expected pci@ADDR)")]
+    MissingPortSpecifier(InterfaceName),
     #[error(transparent)]
     UnsupportedByDriver(#[from] UnsupportedByDriver),
 }
@@ -1085,84 +682,56 @@ impl TryFrom<CmdArgs> for LaunchConfiguration {
     type Error = InvalidCmdArguments;
 
     fn try_from(value: CmdArgs) -> Result<Self, InvalidCmdArguments> {
+        if value.interface.is_empty() {
+            return Err(InvalidCmdArguments::NoInterfacesSpecified);
+        }
         Ok(LaunchConfiguration {
             general: GeneralConfigSection {
-                name: value.get_name().cloned(),
+                name: value.name().map(str::to_owned),
             },
             config_server: Some(ConfigServerSection {
                 config_dir: value.config_dir().cloned(),
             }),
-            driver: match &value.driver {
-                Some(driver) if driver == "dpdk" => {
-                    // TODO: adjust command line to specify lcore usage more flexibly in next PR
-                    let eal_args = value
-                        .interfaces()
-                        .map(|nic| match nic.port {
-                            Some(PortArg::PCI(pci_address)) => {
-                                Ok(["--allow".to_string(), format!("{pci_address}")])
-                            }
-                            Some(PortArg::KERNEL(interface_name)) => {
-                                Err(InvalidCmdArguments::UnsupportedByDriver(
-                                    UnsupportedByDriver::Dpdk(interface_name.clone()),
-                                ))
-                            }
-                            None => Err(InvalidCmdArguments::NoInterfacesSpecified),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .flatten()
-                        .collect();
-                    DriverConfigSection::Dpdk(DpdkDriverConfigSection {
-                        interfaces: value.interfaces().collect(),
-                        eal_args,
-                    })
-                }
-                Some(driver) if driver == "kernel" => {
-                    DriverConfigSection::Kernel(KernelDriverConfigSection {
-                        interfaces: value.interfaces().collect(),
-                    })
-                }
-                Some(other) => Err(InvalidCmdArguments::InvalidDriver(other.clone()))?,
-                None => Err(InvalidCmdArguments::NoDriverSpecified)?,
-            },
+            driver: value.build_driver_config()?,
             cli: CliConfigSection {
-                cli_sock_path: value.cli_sock_path(),
+                cli_sock_path: value.cli_sock_path().to_owned(),
             },
             routing: RoutingConfigSection {
-                control_plane_socket: value.cpi_sock_path(),
-                frr_agent_socket: value.frr_agent_path(),
+                control_plane_socket: value.cpi_sock_path().to_owned(),
+                frr_agent_socket: value.frr_agent_path().to_owned(),
             },
-            tracing: TracingConfigSection {
-                show: TracingShowSection {
-                    tags: if value.show_tracing_tags() {
-                        TracingDisplayOption::Show
-                    } else {
-                        TracingDisplayOption::Hide
-                    },
-                    targets: if value.show_tracing_targets() {
-                        TracingDisplayOption::Show
-                    } else {
-                        TracingDisplayOption::Hide
-                    },
-                },
-                config: value.tracing.clone(),
-            },
+            tracing: value.build_tracing_config(),
             metrics: MetricsConfigSection {
                 address: value.metrics_address(),
             },
-            bmp: if value.bmp_enabled() {
-                Some(BmpConfigSection {
-                    address: value.bmp_address(),
-                    interval: value.bmp_interval(),
-                })
-            } else {
-                None
-            },
+            bmp: value.build_bmp_config(),
             profiling: ProfilingConfigSection {
                 pyroscope_url: value.pyroscope_url().map(std::string::ToString::to_string),
                 frequency: ProfilingConfigSection::DEFAULT_FREQUENCY,
             },
         })
+    }
+}
+
+/// Packet processing driver backend.
+///
+/// Selects which networking stack the dataplane uses for packet processing.
+/// Invalid values are rejected at parse time by clap's [`ValueEnum`](clap::ValueEnum),
+/// eliminating the need for runtime string validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum)]
+pub enum DriverKind {
+    /// DPDK userspace driver for kernel-bypass networking
+    Dpdk,
+    /// Standard Linux kernel networking stack
+    Kernel,
+}
+
+impl std::fmt::Display for DriverKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriverKind::Dpdk => write!(f, "dpdk"),
+            DriverKind::Kernel => write!(f, "kernel"),
+        }
     }
 }
 
@@ -1172,8 +741,8 @@ impl TryFrom<CmdArgs> for LaunchConfiguration {
 #[command(about = "A dataplane for hedgehog's fabric gateway", long_about = None)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct CmdArgs {
-    #[arg(long, value_name = "packet driver to use: kernel or dpdk")]
-    driver: Option<String>,
+    #[arg(long, value_enum)]
+    driver: DriverKind,
     #[arg(
         long,
         value_name = "interface name",
@@ -1301,16 +870,91 @@ elsewhere and copy it in the configuration directory. This mode is meant mostly 
 }
 
 impl CmdArgs {
-    /// Get the configured driver name.
+    /// Build the [`DriverConfigSection`] from the parsed command-line arguments.
     ///
-    /// Returns `"dpdk"` if no driver was explicitly specified (the default),
-    /// otherwise returns the specified driver name (`"dpdk"` or `"kernel"`).
-    #[must_use]
-    pub fn driver_name(&self) -> &str {
-        match &self.driver {
-            None => "dpdk",
-            Some(name) => name,
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A DPDK interface is missing a PCI address binding.
+    /// - A kernel interface name was given to the DPDK driver (or vice-versa).
+    fn build_driver_config(&self) -> Result<DriverConfigSection, InvalidCmdArguments> {
+        match self.driver {
+            DriverKind::Dpdk => {
+                // TODO: adjust command line to specify lcore usage more flexibly in next PR
+                let mut interfaces = Vec::with_capacity(self.interface.len());
+                let mut eal_args = Vec::with_capacity(self.interface.len() * 2);
+                for nic in self.interfaces() {
+                    match &nic.port {
+                        Some(PortArg::Pci(pci_address)) => {
+                            eal_args.push("--allow".to_string());
+                            eal_args.push(format!("{pci_address}"));
+                        }
+                        Some(PortArg::Kernel(interface_name)) => {
+                            return Err(InvalidCmdArguments::UnsupportedByDriver(
+                                UnsupportedByDriver::Dpdk(interface_name.clone()),
+                            ));
+                        }
+                        None => {
+                            return Err(InvalidCmdArguments::MissingPortSpecifier(
+                                nic.interface.clone(),
+                            ));
+                        }
+                    }
+                    interfaces.push(nic.clone());
+                }
+                Ok(DriverConfigSection::Dpdk(DpdkDriverConfigSection {
+                    interfaces,
+                    eal_args,
+                }))
+            }
+            DriverKind::Kernel => {
+                Ok(DriverConfigSection::Kernel(KernelDriverConfigSection {
+                    interfaces: self.interfaces().cloned().collect(),
+                }))
+            }
         }
+    }
+
+    /// Build the [`TracingConfigSection`] from the parsed command-line arguments.
+    fn build_tracing_config(&self) -> TracingConfigSection {
+        TracingConfigSection {
+            show: TracingShowSection {
+                tags: if self.show_tracing_tags() {
+                    TracingDisplayOption::Show
+                } else {
+                    TracingDisplayOption::Hide
+                },
+                targets: if self.show_tracing_targets() {
+                    TracingDisplayOption::Show
+                } else {
+                    TracingDisplayOption::Hide
+                },
+            },
+            config: self.tracing.clone(),
+        }
+    }
+
+    /// Build the optional [`BmpConfigSection`] from the parsed command-line
+    /// arguments.
+    ///
+    /// Returns `None` when BMP is not enabled.
+    fn build_bmp_config(&self) -> Option<BmpConfigSection> {
+        if self.bmp_enabled() {
+            Some(BmpConfigSection {
+                address: self.bmp_address(),
+                interval: self.bmp_interval(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Get the configured driver kind.
+    ///
+    /// Returns the [`DriverKind`] selected via the `--driver` command-line argument.
+    #[must_use]
+    pub fn driver(&self) -> DriverKind {
+        self.driver
     }
 
     /// Check if the `--show-tracing-tags` flag was set.
@@ -1386,46 +1030,46 @@ impl CmdArgs {
     ///
     /// # Returns
     ///
-    /// A vector of interface name strings (e.g., `vec!["eth0", "eth1"]`).
+    /// An iterator of [`InterfaceName`] references.
     ///
     /// # Note
     ///
     /// This is only used with the kernel driver.
     #[must_use]
-    pub fn kernel_interfaces(&self) -> Vec<String> {
-        self.interface
-            .iter()
-            .map(|spec| spec.interface.to_string())
-            .collect()
+    pub fn kernel_interfaces(&self) -> impl Iterator<Item = &InterfaceName> {
+        self.interface.iter().map(|spec| &spec.interface)
     }
 
-    // interface getter. This should be used by all drivers
-    pub fn interfaces(&self) -> impl Iterator<Item = InterfaceArg> {
-        self.interface.iter().cloned()
+    /// Get all configured network interfaces.
+    ///
+    /// This is the primary interface getter and should be used by all drivers.
+    #[must_use]
+    pub fn interfaces(&self) -> impl Iterator<Item = &InterfaceArg> {
+        self.interface.iter()
     }
 
     /// Get the control plane interface socket path.
     ///
     /// Returns the path where FRR (Free Range Routing) sends route updates to the dataplane.
     #[must_use]
-    pub fn cpi_sock_path(&self) -> String {
-        self.cpi_sock_path.clone()
+    pub fn cpi_sock_path(&self) -> &str {
+        &self.cpi_sock_path
     }
 
     /// Get the CLI socket path.
     ///
     /// Returns the path where the dataplane CLI server listens for client connections.
     #[must_use]
-    pub fn cli_sock_path(&self) -> String {
-        self.cli_sock_path.clone()
+    pub fn cli_sock_path(&self) -> &str {
+        &self.cli_sock_path
     }
 
     /// Get the FRR agent socket path.
     ///
     /// Returns the path to connect to the FRR agent that controls FRR configuration reloads.
     #[must_use]
-    pub fn frr_agent_path(&self) -> String {
-        self.frr_agent_path.clone()
+    pub fn frr_agent_path(&self) -> &str {
+        &self.frr_agent_path
     }
 
     /// Get the Prometheus metrics HTTP endpoint address.
@@ -1444,8 +1088,8 @@ impl CmdArgs {
 
     /// Get the name to configure this gateway with.
     #[must_use]
-    pub fn get_name(&self) -> Option<&String> {
-        self.name.as_ref()
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
     #[must_use]
     pub fn bmp_enabled(&self) -> bool {
@@ -1469,6 +1113,35 @@ impl CmdArgs {
     }
 }
 
+#[cfg(any(test, feature = "bolero"))]
+mod contract {
+    use super::{InterfaceArg, PortArg};
+    use bolero::{Driver, TypeGenerator};
+    use net::interface::InterfaceName;
+
+    impl TypeGenerator for PortArg {
+        fn generate<D: Driver>(driver: &mut D) -> Option<Self> {
+            if driver.produce::<bool>()? {
+                Some(PortArg::Pci(driver.produce()?))
+            } else {
+                Some(PortArg::Kernel(driver.produce()?))
+            }
+        }
+    }
+
+    impl TypeGenerator for InterfaceArg {
+        fn generate<D: Driver>(driver: &mut D) -> Option<Self> {
+            let interface: InterfaceName = driver.produce()?;
+            let port = if driver.produce::<bool>()? {
+                Some(driver.produce::<PortArg>()?)
+            } else {
+                None
+            };
+            Some(InterfaceArg { interface, port })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use hardware::pci::address::PciAddress;
@@ -1478,7 +1151,11 @@ mod tests {
     use hardware::pci::function::Function;
     use net::interface::InterfaceName;
 
-    use crate::{InterfaceArg, PortArg};
+    use crate::{
+        CmdArgs, DriverConfigSection, InterfaceArg, InvalidCmdArguments, LaunchConfiguration,
+        PortArg, TracingDisplayOption, UnsupportedByDriver,
+    };
+    use clap::Parser;
     use std::str::FromStr;
 
     #[test]
@@ -1488,7 +1165,7 @@ mod tests {
         assert_eq!(spec.interface.as_ref(), "GbEth1.9000");
         assert_eq!(
             spec.port,
-            Some(PortArg::PCI(PciAddress::new(
+            Some(PortArg::Pci(PciAddress::new(
                 Domain::from(0),
                 Bus::new(2),
                 Device::try_from(1).unwrap(),
@@ -1501,7 +1178,7 @@ mod tests {
         assert_eq!(spec.interface.as_ref(), "GbEth1.9000");
         assert_eq!(
             spec.port,
-            Some(PortArg::KERNEL(
+            Some(PortArg::Kernel(
                 InterfaceName::try_from("enp2s1.100").unwrap()
             ))
         );
@@ -1519,5 +1196,336 @@ mod tests {
 
         // bad discriminant
         assert!(InterfaceArg::from_str("GbEth1.9000=foo@0000:02:01.7").is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // Property-based tests (bolero)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn port_arg_display_parse_roundtrip_pci() {
+        bolero::check!()
+            .with_type::<PciAddress>()
+            .for_each(|pci| {
+                let original = PortArg::Pci(pci.clone());
+                let serialized = original.to_string();
+                let parsed = PortArg::from_str(&serialized).unwrap();
+                assert_eq!(original, parsed);
+            });
+    }
+
+    #[test]
+    fn port_arg_display_parse_roundtrip_kernel() {
+        bolero::check!()
+            .with_type::<InterfaceName>()
+            .for_each(|name| {
+                let original = PortArg::Kernel(name.clone());
+                let serialized = original.to_string();
+                let parsed = PortArg::from_str(&serialized).unwrap();
+                assert_eq!(original, parsed);
+            });
+    }
+
+    #[test]
+    fn interface_arg_parse_roundtrip_with_pci_port() {
+        bolero::check!()
+            .with_type::<(InterfaceName, PciAddress)>()
+            .for_each(|(iface, pci)| {
+                let original = InterfaceArg {
+                    interface: iface.clone(),
+                    port: Some(PortArg::Pci(pci.clone())),
+                };
+                let serialized = original.to_string();
+                let parsed = InterfaceArg::from_str(&serialized).unwrap();
+                assert_eq!(original, parsed);
+            });
+    }
+
+    #[test]
+    fn interface_arg_parse_roundtrip_with_kernel_port() {
+        bolero::check!()
+            .with_type::<(InterfaceName, InterfaceName)>()
+            .for_each(|(iface, port_name)| {
+                let original = InterfaceArg {
+                    interface: iface.clone(),
+                    port: Some(PortArg::Kernel(port_name.clone())),
+                };
+                let serialized = original.to_string();
+                let parsed = InterfaceArg::from_str(&serialized).unwrap();
+                assert_eq!(original, parsed);
+            });
+    }
+
+    #[test]
+    fn interface_arg_parse_roundtrip_no_port() {
+        bolero::check!()
+            .with_type::<InterfaceName>()
+            .for_each(|name| {
+                let original = InterfaceArg {
+                    interface: name.clone(),
+                    port: None,
+                };
+                let serialized = original.to_string();
+                // Skip names that happen to contain '=' (not generated, but be safe).
+                if !serialized.contains('=') {
+                    let parsed = InterfaceArg::from_str(&serialized).unwrap();
+                    assert_eq!(original, parsed);
+                }
+            });
+    }
+
+    #[test]
+    fn port_arg_rejects_missing_separator() {
+        bolero::check!()
+            .with_type::<InterfaceName>()
+            .for_each(|name| {
+                let input = format!("pci{name}");
+                // No '@' separator, so this should fail.
+                assert!(PortArg::from_str(&input).is_err());
+            });
+    }
+
+    #[test]
+    fn port_arg_rejects_unknown_discriminant() {
+        bolero::check!()
+            .with_type::<PciAddress>()
+            .for_each(|pci| {
+                let input = format!("unknown@{pci}");
+                let err = PortArg::from_str(&input).unwrap_err();
+                assert!(
+                    matches!(err, crate::PortArgParseError::UnknownDiscriminant(_)),
+                    "expected UnknownDiscriminant, got {err:?}"
+                );
+            });
+    }
+
+    // -------------------------------------------------------------------
+    // CmdArgs → LaunchConfiguration conversion tests
+    // -------------------------------------------------------------------
+
+    /// Helper to parse a command line into [`CmdArgs`] without process exit on
+    /// error.
+    fn parse_args(args: &[&str]) -> CmdArgs {
+        let mut full_args = vec!["dataplane"];
+        full_args.extend_from_slice(args);
+        CmdArgs::parse_from(full_args)
+    }
+
+    #[test]
+    fn try_from_kernel_driver_with_interface() {
+        let args = parse_args(&[
+            "--driver",
+            "kernel",
+            "--interface",
+            "eth0=kernel@enp2s1",
+        ]);
+        let config = LaunchConfiguration::try_from(args).unwrap();
+        assert!(matches!(config.driver, DriverConfigSection::Kernel(_)));
+        if let DriverConfigSection::Kernel(ref k) = config.driver {
+            assert_eq!(k.interfaces.len(), 1);
+            assert_eq!(k.interfaces[0].interface.as_ref(), "eth0");
+        }
+    }
+
+    #[test]
+    fn try_from_kernel_driver_multiple_interfaces() {
+        let args = parse_args(&[
+            "--driver",
+            "kernel",
+            "--interface",
+            "eth0=kernel@enp2s1,eth1=kernel@enp3s0",
+        ]);
+        let config = LaunchConfiguration::try_from(args).unwrap();
+        if let DriverConfigSection::Kernel(ref k) = config.driver {
+            assert_eq!(k.interfaces.len(), 2);
+        } else {
+            panic!("expected kernel driver config");
+        }
+    }
+
+    #[test]
+    fn try_from_dpdk_driver_with_pci_interface() {
+        let args = parse_args(&[
+            "--driver",
+            "dpdk",
+            "--interface",
+            "eth0=pci@0000:02:01.0",
+        ]);
+        let config = LaunchConfiguration::try_from(args).unwrap();
+        assert!(matches!(config.driver, DriverConfigSection::Dpdk(_)));
+        if let DriverConfigSection::Dpdk(ref d) = config.driver {
+            assert_eq!(d.interfaces.len(), 1);
+            // Two EAL args per interface: "--allow" and the PCI address.
+            assert_eq!(d.eal_args.len(), 2);
+            assert_eq!(d.eal_args[0], "--allow");
+            assert_eq!(d.eal_args[1], "0000:02:01.0");
+        }
+    }
+
+    #[test]
+    fn try_from_no_interfaces_is_error() {
+        let args = parse_args(&["--driver", "kernel"]);
+        let err = LaunchConfiguration::try_from(args).unwrap_err();
+        assert!(
+            matches!(err, InvalidCmdArguments::NoInterfacesSpecified),
+            "expected NoInterfacesSpecified, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_from_dpdk_with_kernel_port_is_error() {
+        let args = parse_args(&[
+            "--driver",
+            "dpdk",
+            "--interface",
+            "eth0=kernel@enp2s1",
+        ]);
+        let err = LaunchConfiguration::try_from(args).unwrap_err();
+        assert!(
+            matches!(err, InvalidCmdArguments::UnsupportedByDriver(UnsupportedByDriver::Dpdk(_))),
+            "expected UnsupportedByDriver::Dpdk, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_from_dpdk_with_missing_port_is_error() {
+        let args = parse_args(&["--driver", "dpdk", "--interface", "eth0"]);
+        let err = LaunchConfiguration::try_from(args).unwrap_err();
+        assert!(
+            matches!(err, InvalidCmdArguments::MissingPortSpecifier(_)),
+            "expected MissingPortSpecifier, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_from_bmp_disabled_by_default() {
+        let args = parse_args(&[
+            "--driver",
+            "kernel",
+            "--interface",
+            "eth0=kernel@enp2s1",
+        ]);
+        let config = LaunchConfiguration::try_from(args).unwrap();
+        assert!(config.bmp.is_none());
+    }
+
+    #[test]
+    fn try_from_bmp_enabled() {
+        let args = parse_args(&[
+            "--driver",
+            "kernel",
+            "--interface",
+            "eth0=kernel@enp2s1",
+            "--bmp-enable",
+            "--bmp-address",
+            "127.0.0.1:5555",
+            "--bmp-interval",
+            "2000",
+        ]);
+        let config = LaunchConfiguration::try_from(args).unwrap();
+        let bmp = config.bmp.unwrap();
+        assert_eq!(bmp.address.port(), 5555);
+        assert_eq!(bmp.interval, std::time::Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn try_from_tracing_show_flags() {
+        let args = parse_args(&[
+            "--driver",
+            "kernel",
+            "--interface",
+            "eth0=kernel@enp2s1",
+            "--show-tracing-tags",
+            "--show-tracing-targets",
+            "--tracing",
+            "default=info,nat=debug",
+        ]);
+        let config = LaunchConfiguration::try_from(args).unwrap();
+        assert_eq!(config.tracing.show.tags, TracingDisplayOption::Show);
+        assert_eq!(config.tracing.show.targets, TracingDisplayOption::Show);
+        assert_eq!(
+            config.tracing.config.as_deref(),
+            Some("default=info,nat=debug")
+        );
+    }
+
+    #[test]
+    fn try_from_tracing_defaults_to_hide() {
+        let args = parse_args(&[
+            "--driver",
+            "kernel",
+            "--interface",
+            "eth0=kernel@enp2s1",
+        ]);
+        let config = LaunchConfiguration::try_from(args).unwrap();
+        assert_eq!(config.tracing.show.tags, TracingDisplayOption::Hide);
+        assert_eq!(config.tracing.show.targets, TracingDisplayOption::Hide);
+        assert!(config.tracing.config.is_none());
+    }
+
+    #[test]
+    fn try_from_socket_path_defaults() {
+        let args = parse_args(&[
+            "--driver",
+            "kernel",
+            "--interface",
+            "eth0=kernel@enp2s1",
+        ]);
+        let config = LaunchConfiguration::try_from(args).unwrap();
+        assert_eq!(
+            config.routing.control_plane_socket,
+            crate::DEFAULT_DP_UX_PATH
+        );
+        assert_eq!(config.cli.cli_sock_path, crate::DEFAULT_DP_UX_PATH_CLI);
+        assert_eq!(
+            config.routing.frr_agent_socket,
+            crate::DEFAULT_FRR_AGENT_PATH
+        );
+    }
+
+    #[test]
+    fn try_from_custom_socket_paths() {
+        let args = parse_args(&[
+            "--driver",
+            "kernel",
+            "--interface",
+            "eth0=kernel@enp2s1",
+            "--cpi-sock-path",
+            "/tmp/cpi.sock",
+            "--cli-sock-path",
+            "/tmp/cli.sock",
+            "--frr-agent-path",
+            "/tmp/frr.sock",
+        ]);
+        let config = LaunchConfiguration::try_from(args).unwrap();
+        assert_eq!(config.routing.control_plane_socket, "/tmp/cpi.sock");
+        assert_eq!(config.cli.cli_sock_path, "/tmp/cli.sock");
+        assert_eq!(config.routing.frr_agent_socket, "/tmp/frr.sock");
+    }
+
+    #[test]
+    fn try_from_gateway_name() {
+        let args = parse_args(&[
+            "--driver",
+            "kernel",
+            "--interface",
+            "eth0=kernel@enp2s1",
+            "--name",
+            "my-gateway",
+        ]);
+        let config = LaunchConfiguration::try_from(args).unwrap();
+        assert_eq!(config.general.name.as_deref(), Some("my-gateway"));
+    }
+
+    #[test]
+    fn try_from_no_name_is_none() {
+        let args = parse_args(&[
+            "--driver",
+            "kernel",
+            "--interface",
+            "eth0=kernel@enp2s1",
+        ]);
+        let config = LaunchConfiguration::try_from(args).unwrap();
+        assert!(config.general.name.is_none());
     }
 }

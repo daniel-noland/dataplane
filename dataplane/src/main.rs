@@ -11,7 +11,7 @@ mod statistics;
 
 use crate::packet_processor::start_router;
 use crate::statistics::MetricsServer;
-use args::{CmdArgs, Parser};
+use args::{CmdArgs, DriverKind, Parser};
 
 use drivers::kernel::DriverKernel;
 use mgmt::{ConfigProcessorParams, MgmtParams, start_mgmt};
@@ -39,8 +39,8 @@ custom_target!("hyper", LevelFilter::WARN, &["third-party"]);
 custom_target!("tower", LevelFilter::WARN, &["third-party"]);
 
 fn init_name(args: &CmdArgs) -> Result<String, String> {
-    if let Some(name) = args.get_name() {
-        Ok(name.clone())
+    if let Some(name) = args.name() {
+        Ok(name.to_owned())
     } else {
         let hostname =
             gethostname().map_err(|errno| format!("Failed to get hostname: {}", errno.desc()))?;
@@ -228,12 +228,12 @@ fn main() {
     info!("Management is running now");
 
     /* start driver with the provided pipeline builder */
-    let e = match args.driver_name() {
-        "dpdk" => {
+    let e = match args.driver() {
+        DriverKind::Dpdk => {
             info!("Using driver DPDK...");
             todo!();
         }
-        "kernel" => {
+        DriverKind::Kernel => {
             info!("Using driver kernel...");
             DriverKernel::start(
                 stop_tx.clone(),
@@ -241,10 +241,6 @@ fn main() {
                 args.kernel_num_workers(),
                 &pipeline_factory,
             )
-        }
-        other => {
-            error!("Unknown driver '{other}'. Aborting...");
-            panic!("Packet processing pipeline failed to start. Aborting...");
         }
     };
 
