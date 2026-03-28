@@ -21,7 +21,7 @@ use crate::hypervisor;
 
 async fn launch_virtiofsd(path: impl AsRef<str>) -> tokio::process::Child {
     let uid = nix::unistd::getuid().as_raw();
-    let gid = nix::unistd::getuid().as_raw();
+    let gid = nix::unistd::getgid().as_raw();
     // capctl::ambient::raise(capctl::Cap::NET_ADMIN).unwrap();
     tokio::process::Command::new("/bin/virtiofsd")
         .args([
@@ -243,7 +243,7 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
         iommu: Some(false),
         watchdog: Some(true),
         platform: Some(PlatformConfig {
-            serial_number: Some("datataplane-test".into()),
+            serial_number: Some("dataplane-test".into()),
             uuid: Some("dff9c8dd-492d-4148-a007-7931f94db852".into()), // arbitrary uuid4
             oem_strings: Some(vec![format!("exe={bin_name}"), format!("test={test_name}")]),
             num_pci_segments: Some(2),
