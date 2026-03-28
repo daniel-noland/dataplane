@@ -3,9 +3,36 @@
 
 #![deny(clippy::all)]
 
-//! Flow rules for DPDK
+//! Flow rules for DPDK.
 //!
 //! Basically everything that starts with `rte_flow_` in DPDK.
+//!
+//! # Type design
+//!
+//! This module deliberately uses a mix of validated types from the [`net`] crate and raw primitive
+//! types.  The choice depends on whether a value appears in a **match criterion** or an **action**.
+//!
+//! ## Match criteria: raw types
+//!
+//! Flow match patterns (see [`FlowMatch`]) use raw header structs ([`RawEthHeader`],
+//! [`RawUdpHeader`], etc.) whose fields are plain primitives (`u16` for ports, `u32` for VNI, and
+//! so on).  This is intentional: a flow rule may need to match on values that are *invalid* at the
+//! protocol level.  For example, hardware-offloaded rejection of malformed traffic requires
+//! matching on zero TCP/UDP ports, zero VNI, or multicast source MACs — all of which are illegal
+//! in well-formed packets but perfectly legal as `rte_flow` match criteria.
+//!
+//! Where a match field has no protocol-level validity constraint, the validated [`net`] type is used
+//! directly.  [`Mac`] (any `[u8; 6]`), [`EthType`] (any `u16`), [`Dscp`] (any 6-bit value), and
+//! [`Ecn`] (any 2-bit value) fall into this category — they enforce bit-width correctness without
+//! restricting the representable value set in a way that would preclude matching on malformed
+//! traffic.
+//!
+//! ## Actions: validated types
+//!
+//! Flow actions (see [`FlowAction`], [`SetFlowField`]) use the validated types from [`net`]
+//! wherever one exists (e.g. [`Vid`], [`net::vxlan::Vni`], [`Dscp`], [`Ecn`]).  Actions *produce*
+//! header values that will appear on the wire, so protocol-level validity is appropriate here.
+//! Crafting deliberately invalid outbound packets is expressly out of scope.
 
 use crate::dev::DevIndex;
 use crate::queue::tx::TxQueueIndex;
@@ -17,7 +44,11 @@ use core::ffi::c_void;
 use core::fmt::Debug;
 use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
-use net;
+use net::eth::ethtype::EthType;
+use net::eth::mac::Mac;
+use net::ip::dscp::Dscp;
+use net::ip::ecn::Ecn;
+use net::vlan::Vid;
 use tracing::error;
 
 /// Flow manager
@@ -146,10 +177,22 @@ pub enum FlowError {
     /// A flow action type is not yet supported by this wrapper.
     #[error("unsupported flow action type")]
     UnsupportedActionType,
+    /// A `RawEncap` action was supplied with a mask whose length differs from the data.
+    #[error("RawEncap mask length ({mask_len}) does not match data length ({data_len})")]
+    RawEncapMaskLengthMismatch {
+        /// Length of the data buffer.
+        data_len: usize,
+        /// Length of the mask buffer.
+        mask_len: usize,
+    },
 }
 
-/// TODO: convert numbers to constant references to `rte_flow_item_type`
-#[derive(Debug)]
+/// Catalog of DPDK flow item types (`rte_flow_item_type`).
+///
+/// This enum provides documented, IDE-friendly access to the full set of match item types
+/// supported by DPDK's `rte_flow` API.  Each variant maps 1:1 to its `RTE_FLOW_ITEM_TYPE_*`
+/// constant and carries the documentation from the DPDK headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::FromRepr, strum::IntoStaticStr)]
 #[repr(u32)]
 pub enum MatchType {
     /// \[META\]
@@ -510,6 +553,16 @@ pub enum MatchType {
 }
 
 /// This is a wrapper around `struct rte_flow_item`.
+/// A single flow match criterion.
+///
+/// Each variant pairs a protocol layer with a [`FlowSpec`] that carries a spec value and an
+/// optional mask.  Wildcarding is controlled by the mask, not by the spec value — a zero in the
+/// spec is *not* a wildcard; it literally matches zero.
+///
+/// The inner header types (`Raw*Header`) use raw primitives rather than the validated types from
+/// [`net`] because matching on protocol-invalid values (e.g. zero ports, zero VNI) is a legitimate
+/// use case — for instance, hardware-offloaded rejection of malformed frames.  See the
+/// [module-level documentation](self) for the full rationale.
 pub enum FlowMatch {
     /// The end of a match
     End,
@@ -525,15 +578,15 @@ pub enum FlowMatch {
     // },
     // Raw(FlowSpec<Vec<u8>>),
     /// Matches an Ethernet header
-    Eth(FlowSpec<EthHeader>),
-    Vlan(FlowSpec<VlanHeader>),
-    Ipv4(FlowSpec<Ipv4Header>),
-    Ipv6(FlowSpec<Ipv6Header>),
-    // Icmp(FlowSpec<IcmpHeader>),
-    Udp(FlowSpec<UdpHeader>),
-    Tcp(FlowSpec<TcpHeader>),
-    // Sctp(FlowSpec<SctpHeader>),
-    Vxlan(FlowSpec<VxlanHeader>),
+    Eth(FlowSpec<RawEthHeader>),
+    Vlan(FlowSpec<RawVlanHeader>),
+    Ipv4(FlowSpec<RawIpv4Header>),
+    Ipv6(FlowSpec<RawIpv6Header>),
+    // Icmp(FlowSpec<RawIcmpHeader>),
+    Udp(FlowSpec<RawUdpHeader>),
+    Tcp(FlowSpec<RawTcpHeader>),
+    // Sctp(FlowSpec<RawSctpHeader>),
+    Vxlan(FlowSpec<RawVxlanHeader>),
     // Etag(FlowSpec<EtagHeader>),
     // Nvgre(FlowSpec<NvgreHeader>),
     // Mpls(FlowSpec<MplsHeader>),
@@ -576,38 +629,41 @@ pub struct MatchMeta {
     pub data: u32,
 }
 
-#[derive(Debug)]
-pub struct Vni(pub u32);
-
 // TODO: expose remaining fields
-pub struct VxlanHeader {
-    pub vni: Vni,
-}
-
-pub struct UdpPort(pub u16);
-pub struct TcpPort(pub u16);
-
-// TODO: expose remaining fields
-pub struct TcpHeader {
-    pub src_port: TcpPort,
-    pub dst_port: TcpPort,
+pub struct RawVxlanHeader {
+    /// VXLAN Network Identifier (24-bit, stored as u32).
+    pub vni: u32,
 }
 
 // TODO: expose remaining fields
-pub struct UdpHeader {
-    pub src_port: UdpPort,
-    pub dst_port: UdpPort,
+pub struct RawTcpHeader {
+    /// TCP source port.
+    pub src_port: u16,
+    /// TCP destination port.
+    pub dst_port: u16,
 }
 
 // TODO: expose remaining fields
-pub struct Ipv6Header {
+pub struct RawUdpHeader {
+    /// UDP source port.
+    pub src_port: u16,
+    /// UDP destination port.
+    pub dst_port: u16,
+}
+
+// TODO: expose remaining fields
+pub struct RawIpv6Header {
+    /// IPv6 source address.
     pub src: core::net::Ipv6Addr,
+    /// IPv6 destination address.
     pub dst: core::net::Ipv6Addr,
 }
 
 // TODO: expose remaining fields
-pub struct Ipv4Header {
+pub struct RawIpv4Header {
+    /// IPv4 source address.
     pub src: core::net::Ipv4Addr,
+    /// IPv4 destination address.
     pub dst: core::net::Ipv4Addr,
 }
 
@@ -641,22 +697,16 @@ impl<T> FlowSpec<T> {
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, Ord, PartialOrd, Eq, PartialEq)]
-pub struct MacAddr(pub [u8; 6]);
-
-#[derive(Debug, Clone, Copy)]
-pub struct EtherType(pub u16);
-
-pub struct EthHeader {
-    src: MacAddr,
-    dst: MacAddr,
-    ether_type: EtherType,
+pub struct RawEthHeader {
+    src: Mac,
+    dst: Mac,
+    ether_type: EthType,
 }
 
-impl EthHeader {
+impl RawEthHeader {
     /// Create a new Ethernet header specification.
     #[must_use]
-    pub fn new(src: MacAddr, dst: MacAddr, ether_type: EtherType) -> Self {
+    pub fn new(src: Mac, dst: Mac, ether_type: EthType) -> Self {
         Self {
             src,
             dst,
@@ -666,26 +716,26 @@ impl EthHeader {
 
     /// Source MAC address.
     #[must_use]
-    pub fn src(&self) -> MacAddr {
+    pub fn src(&self) -> Mac {
         self.src
     }
 
     /// Destination MAC address.
     #[must_use]
-    pub fn dst(&self) -> MacAddr {
+    pub fn dst(&self) -> Mac {
         self.dst
     }
 
     /// Ethernet type field.
     #[must_use]
-    pub fn ether_type(&self) -> EtherType {
+    pub fn ether_type(&self) -> EthType {
         self.ether_type
     }
 }
 
 /// TODO: forbid multicast mac src
-impl From<EthHeader> for dpdk_sys::rte_flow_item_eth {
-    fn from(header: EthHeader) -> Self {
+impl From<RawEthHeader> for dpdk_sys::rte_flow_item_eth {
+    fn from(header: RawEthHeader) -> Self {
         let mut eth = dpdk_sys::rte_flow_item_eth::default();
         eth.annon1.hdr = dpdk_sys::rte_ether_hdr {
             dst_addr: dpdk_sys::rte_ether_addr {
@@ -694,11 +744,11 @@ impl From<EthHeader> for dpdk_sys::rte_flow_item_eth {
             src_addr: dpdk_sys::rte_ether_addr {
                 addr_bytes: header.src.0,
             },
-            ether_type: hton_16(header.ether_type.0),
+            ether_type: hton_16(header.ether_type.as_u16()),
         };
-        if header.ether_type.0 == 0x8100
-            || header.ether_type.0 == 0x88a8
-            || header.ether_type.0 == 0x9100
+        if header.ether_type == EthType::VLAN
+            || header.ether_type == EthType::VLAN_QINQ
+            || header.ether_type == EthType::VLAN_DOUBLE_TAGGED
         {
             eth.set_has_vlan(1);
         }
@@ -706,12 +756,13 @@ impl From<EthHeader> for dpdk_sys::rte_flow_item_eth {
     }
 }
 
-pub struct VlanTci(pub u16);
-
-pub struct VlanHeader {
-    pub ether_type: EtherType,
-    pub tci: VlanTci,
-    pub inner_ether_type: EtherType,
+pub struct RawVlanHeader {
+    /// Outer VLAN EtherType.
+    pub ether_type: EthType,
+    /// Tag Control Information (PCP + DEI + VID packed as raw u16).
+    pub tci: u16,
+    /// Inner EtherType (payload protocol).
+    pub inner_ether_type: EthType,
     // TODO: figure out why DPDK lets you spec TCI twice
 }
 
@@ -720,6 +771,7 @@ fn hton_16<T: Debug + Into<u16>>(x: T) -> u16 {
     u16::to_be(x.into())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::FromRepr, strum::IntoStaticStr)]
 #[repr(u32)]
 pub enum FlowActionType {
     /// End marker for action lists.
@@ -901,6 +953,12 @@ pub struct FlowMark(pub u32);
 pub struct CounterId(pub u32);
 pub struct MeterId(pub u32);
 
+/// An action to apply to traffic matched by a flow rule.
+///
+/// Unlike [`FlowMatch`], actions use validated types from the [`net`] crate wherever applicable
+/// (e.g. [`Vid`], [`EthType`]).  Actions produce values that will appear on the wire, so
+/// protocol-level validity is enforced.  Crafting deliberately invalid outbound packets is
+/// expressly out of scope.
 pub enum FlowAction {
     End,
     Void,
@@ -918,13 +976,13 @@ pub enum FlowAction {
     // Security  // TODO: expose security as an action
     PopVlan,
     PushVlan {
-        ethertype: EtherType,
+        ethertype: EthType,
     },
     SetVlanVid {
-        vlan_id: net::vlan::Vid,
+        vlan_id: Vid,
     },
     // SetVlanPcp { // TODO: expose PCP as an action
-    //     pcp: net::vlan::Pcp,
+    //     pcp: net::vlan::Pcp, // TODO: import Pcp when exposed
     // },
     // PopMpls // TODO: expose MPLS as an action
     // PushMpls // TODO: expose MPLS as an action
@@ -959,6 +1017,7 @@ pub enum FlowAction {
 }
 
 /// Modify a field
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::FromRepr, strum::IntoStaticStr)]
 #[repr(u32)]
 pub enum FieldModificationOperation {
     /// Set a field
@@ -971,6 +1030,7 @@ pub enum FieldModificationOperation {
 
 /// A wrapper around a `rte_flow_action_modify_field` that specifies the
 /// field to modify and its new value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::FromRepr, strum::IntoStaticStr)]
 #[repr(u32)]
 pub enum FlowFieldId {
     /// Start with a packet.
@@ -1079,22 +1139,55 @@ pub enum FlowFieldId {
     VxlanLastReserved = dpdk_sys::rte_flow_field_id::RTE_FLOW_FIELD_VXLAN_LAST_RSVD,
 }
 
-/// A wrapper around a `rte_flow_action_modify_field` that specifies the
-/// field to modify and its new value.
+// -- repr(u32) → u32 conversions ------------------------------------------------
+//
+// Centralised `From` impls for every `#[repr(u32)]` enum so call-sites can
+// write `.into()` instead of bare `as u32` casts.
+
+impl From<MatchType> for u32 {
+    fn from(v: MatchType) -> Self {
+        v as Self
+    }
+}
+
+impl From<FlowActionType> for u32 {
+    fn from(v: FlowActionType) -> Self {
+        v as Self
+    }
+}
+
+impl From<FieldModificationOperation> for u32 {
+    fn from(v: FieldModificationOperation) -> Self {
+        v as Self
+    }
+}
+
+impl From<FlowFieldId> for u32 {
+    fn from(v: FlowFieldId) -> Self {
+        v as Self
+    }
+}
+
+/// A field modification action (`RTE_FLOW_ACTION_TYPE_MODIFY_FIELD`).
+///
+/// Each variant identifies a header field and the value to write into it.  As with
+/// [`FlowAction`], validated [`net`] types are used where they exist because these values will be
+/// written into outbound packets.  Fields without a validated type (e.g. TCP sequence numbers)
+/// use raw primitives.
 #[derive(Debug, Clone, Copy)]
 pub enum SetFlowField {
     /// Dest mac
-    MacDst(MacAddr),
+    MacDst(Mac),
     /// Source mac
-    MacSrc(MacAddr),
+    MacSrc(Mac),
     /// Vlan ethertype
-    VlanType(EtherType),
+    VlanType(EthType),
     /// Vlan VID
-    VlanVid(net::vlan::Vid),
+    VlanVid(Vid),
     /// Ethertype
-    EtherType(EtherType),
+    EtherType(EthType),
     /// IPv4 DSCP
-    Ipv4Dscp(u8),
+    Ipv4Dscp(Dscp),
     /// IPv4 TTL
     Ipv4Ttl(u8),
     /// Ipv4 source
@@ -1102,7 +1195,7 @@ pub enum SetFlowField {
     /// Ipv4 dest
     Ipv4Dst(core::net::Ipv4Addr),
     /// Ipv6 DSCP
-    Ipv6Dscp(u8),
+    Ipv6Dscp(Dscp),
     /// Ipv6 hop limit (ttl)
     Ipv6HopLimit(u8),
     /// Ipv6 source
@@ -1130,9 +1223,9 @@ pub enum SetFlowField {
     /// Metadata
     Meta(MatchMeta),
     /// Ipv4 ECN
-    IpV4Ecn(u8),
+    IpV4Ecn(Ecn),
     /// IPv6 ECN
-    IpV6Ecn(u8),
+    IpV6Ecn(Ecn),
 }
 
 /// A wrapper around a `rte_flow_action_modify_field` that specifies the
@@ -1160,13 +1253,13 @@ impl SetFlowField {
             width: u32,
         ) -> dpdk_sys::rte_flow_action_modify_field {
             dpdk_sys::rte_flow_action_modify_field {
-                operation: FieldModificationOperation::Set as u32,
+                operation: FieldModificationOperation::Set.into(),
                 src: dpdk_sys::rte_flow_field_data {
-                    field: FlowFieldId::Value as u32,
+                    field: FlowFieldId::Value.into(),
                     annon1: dpdk_sys::rte_flow_field_data__bindgen_ty_1 { value },
                 },
                 dst: dpdk_sys::rte_flow_field_data {
-                    field: dst_field as u32,
+                    field: dst_field.into(),
                     annon1: dpdk_sys::rte_flow_field_data__bindgen_ty_1::default(),
                 },
                 width,
@@ -1183,23 +1276,23 @@ impl SetFlowField {
 
         let conf = match self {
             SetFlowField::MacDst(mac) => {
-                set_field(FlowFieldId::MacDst, pack(&mac.0), size_of::<MacAddr>() as u32)
+                set_field(FlowFieldId::MacDst, pack(&mac.0), size_of::<Mac>() as u32)
             }
             SetFlowField::MacSrc(mac) => {
-                set_field(FlowFieldId::MacSrc, pack(&mac.0), size_of::<MacAddr>() as u32)
+                set_field(FlowFieldId::MacSrc, pack(&mac.0), size_of::<Mac>() as u32)
             }
             SetFlowField::VlanType(et) => {
-                set_field(FlowFieldId::VlanType, pack(&et.0.to_be_bytes()), size_of::<u16>() as u32)
+                set_field(FlowFieldId::VlanType, pack(&et.as_u16().to_be_bytes()), size_of::<u16>() as u32)
             }
             SetFlowField::VlanVid(vid) => {
                 let raw: u16 = (*vid).into();
                 set_field(FlowFieldId::VlanVid, pack(&raw.to_be_bytes()), size_of::<u16>() as u32)
             }
             SetFlowField::EtherType(et) => {
-                set_field(FlowFieldId::EtherType, pack(&et.0.to_be_bytes()), size_of::<u16>() as u32)
+                set_field(FlowFieldId::EtherType, pack(&et.as_u16().to_be_bytes()), size_of::<u16>() as u32)
             }
             SetFlowField::Ipv4Dscp(dscp) => {
-                set_field(FlowFieldId::Ipv4Dscp, pack(&[*dscp]), size_of::<u8>() as u32)
+                set_field(FlowFieldId::Ipv4Dscp, pack(&[dscp.value()]), size_of::<u8>() as u32)
             }
             SetFlowField::Ipv4Ttl(ttl) => {
                 set_field(FlowFieldId::Ipv4Ttl, pack(&[*ttl]), size_of::<u8>() as u32)
@@ -1211,7 +1304,7 @@ impl SetFlowField {
                 set_field(FlowFieldId::Ipv4Dst, pack(&addr.octets()), 4)
             }
             SetFlowField::Ipv6Dscp(dscp) => {
-                set_field(FlowFieldId::Ipv6Dscp, pack(&[*dscp]), size_of::<u8>() as u32)
+                set_field(FlowFieldId::Ipv6Dscp, pack(&[dscp.value()]), size_of::<u8>() as u32)
             }
             SetFlowField::Ipv6HopLimit(hl) => {
                 set_field(FlowFieldId::Ipv6HopLimit, pack(&[*hl]), size_of::<u8>() as u32)
@@ -1258,10 +1351,10 @@ impl SetFlowField {
                 set_field(FlowFieldId::Meta, pack(&meta.data.to_be_bytes()), size_of::<u32>() as u32)
             }
             SetFlowField::IpV4Ecn(ecn) => {
-                set_field(FlowFieldId::Ipv4Ecn, pack(&[*ecn]), size_of::<u8>() as u32)
+                set_field(FlowFieldId::Ipv4Ecn, pack(&[ecn.value()]), size_of::<u8>() as u32)
             }
             SetFlowField::IpV6Ecn(ecn) => {
-                set_field(FlowFieldId::Ipv6Ecn, pack(&[*ecn]), size_of::<u8>() as u32)
+                set_field(FlowFieldId::Ipv6Ecn, pack(&[ecn.value()]), size_of::<u8>() as u32)
             }
         };
         SetFieldAction { rule: *self, conf }
@@ -1396,11 +1489,11 @@ impl CFlowActions {
 
 // -- Header conversion helpers --
 
-/// Convert an [`EthHeader`] reference to a C `rte_flow_item_eth`.
+/// Convert a [`RawEthHeader`] reference to a C `rte_flow_item_eth`.
 ///
-/// This duplicates the logic in `From<EthHeader> for rte_flow_item_eth`
+/// This duplicates the logic in `From<RawEthHeader> for rte_flow_item_eth`
 /// but operates on a borrow (the `From` impl consumes by value).
-fn eth_to_c(header: &EthHeader) -> dpdk_sys::rte_flow_item_eth {
+fn eth_to_c(header: &RawEthHeader) -> dpdk_sys::rte_flow_item_eth {
     let mut eth = dpdk_sys::rte_flow_item_eth::default();
     eth.annon1.hdr = dpdk_sys::rte_ether_hdr {
         dst_addr: dpdk_sys::rte_ether_addr {
@@ -1409,11 +1502,11 @@ fn eth_to_c(header: &EthHeader) -> dpdk_sys::rte_flow_item_eth {
         src_addr: dpdk_sys::rte_ether_addr {
             addr_bytes: header.src.0,
         },
-        ether_type: hton_16(header.ether_type.0),
+        ether_type: hton_16(header.ether_type.as_u16()),
     };
-    if header.ether_type.0 == 0x8100
-        || header.ether_type.0 == 0x88a8
-        || header.ether_type.0 == 0x9100
+    if header.ether_type == EthType::VLAN
+        || header.ether_type == EthType::VLAN_QINQ
+        || header.ether_type == EthType::VLAN_DOUBLE_TAGGED
     {
         eth.set_has_vlan(1);
     }
@@ -1429,8 +1522,6 @@ fn eth_to_c(header: &EthHeader) -> dpdk_sys::rte_flow_item_eth {
 /// Returns [`FlowError::UnsupportedMatchType`] if a match variant lacks
 /// a C-level conversion.
 fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
-    use dpdk_sys::rte_flow_item_type::*;
-
     let mut items: Vec<dpdk_sys::rte_flow_item> = Vec::with_capacity(pattern.len() + 1);
     let mut storage: Vec<Box<dyn Any>> = Vec::with_capacity(pattern.len() * 2);
 
@@ -1458,7 +1549,7 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
         match m {
             FlowMatch::End => {
                 items.push(dpdk_sys::rte_flow_item {
-                    type_: RTE_FLOW_ITEM_TYPE_END,
+                    type_: MatchType::End.into(),
                     spec: ptr::null(),
                     last: ptr::null(),
                     mask: ptr::null(),
@@ -1466,7 +1557,7 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
             }
             FlowMatch::Void => {
                 items.push(dpdk_sys::rte_flow_item {
-                    type_: RTE_FLOW_ITEM_TYPE_VOID,
+                    type_: MatchType::Void.into(),
                     spec: ptr::null(),
                     last: ptr::null(),
                     mask: ptr::null(),
@@ -1474,7 +1565,7 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
             }
             FlowMatch::Any => {
                 items.push(dpdk_sys::rte_flow_item {
-                    type_: RTE_FLOW_ITEM_TYPE_ANY,
+                    type_: MatchType::Any.into(),
                     spec: ptr::null(),
                     last: ptr::null(),
                     mask: ptr::null(),
@@ -1485,7 +1576,7 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
                 let mask_c = fs.mask().map(eth_to_c);
                 let (spec_ptr, mask_ptr) = push_spec_mask(&mut storage, spec_c, mask_c);
                 items.push(dpdk_sys::rte_flow_item {
-                    type_: RTE_FLOW_ITEM_TYPE_ETH,
+                    type_: MatchType::Eth.into(),
                     spec: spec_ptr,
                     last: ptr::null(),
                     mask: mask_ptr,
@@ -1510,7 +1601,7 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
                 });
                 let (spec_ptr, mask_ptr) = push_spec_mask(&mut storage, spec, mask_c);
                 items.push(dpdk_sys::rte_flow_item {
-                    type_: RTE_FLOW_ITEM_TYPE_IPV4,
+                    type_: MatchType::Ipv4.into(),
                     spec: spec_ptr,
                     last: ptr::null(),
                     mask: mask_ptr,
@@ -1525,7 +1616,7 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
                 let (spec_ptr, spec_box) = heap_ptr(spec);
                 storage.push(spec_box);
                 items.push(dpdk_sys::rte_flow_item {
-                    type_: RTE_FLOW_ITEM_TYPE_IPV6,
+                    type_: MatchType::Ipv6.into(),
                     spec: spec_ptr,
                     last: ptr::null(),
                     mask: ptr::null(),
@@ -1534,23 +1625,23 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
             FlowMatch::Udp(fs) => {
                 let spec = dpdk_sys::rte_flow_item_udp {
                     hdr: dpdk_sys::rte_udp_hdr {
-                        src_port: fs.spec().src_port.0.to_be(),
-                        dst_port: fs.spec().dst_port.0.to_be(),
+                        src_port: fs.spec().src_port.to_be(),
+                        dst_port: fs.spec().dst_port.to_be(),
                         ..Default::default()
                     },
                 };
                 let mask_c = fs.mask().map(|m| {
                     dpdk_sys::rte_flow_item_udp {
                         hdr: dpdk_sys::rte_udp_hdr {
-                            src_port: m.src_port.0.to_be(),
-                            dst_port: m.dst_port.0.to_be(),
+                            src_port: m.src_port.to_be(),
+                            dst_port: m.dst_port.to_be(),
                             ..Default::default()
                         },
                     }
                 });
                 let (spec_ptr, mask_ptr) = push_spec_mask(&mut storage, spec, mask_c);
                 items.push(dpdk_sys::rte_flow_item {
-                    type_: RTE_FLOW_ITEM_TYPE_UDP,
+                    type_: MatchType::Udp.into(),
                     spec: spec_ptr,
                     last: ptr::null(),
                     mask: mask_ptr,
@@ -1559,23 +1650,23 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
             FlowMatch::Tcp(fs) => {
                 let spec = dpdk_sys::rte_flow_item_tcp {
                     hdr: dpdk_sys::rte_tcp_hdr {
-                        src_port: fs.spec().src_port.0.to_be(),
-                        dst_port: fs.spec().dst_port.0.to_be(),
+                        src_port: fs.spec().src_port.to_be(),
+                        dst_port: fs.spec().dst_port.to_be(),
                         ..Default::default()
                     },
                 };
                 let mask_c = fs.mask().map(|m| {
                     dpdk_sys::rte_flow_item_tcp {
                         hdr: dpdk_sys::rte_tcp_hdr {
-                            src_port: m.src_port.0.to_be(),
-                            dst_port: m.dst_port.0.to_be(),
+                            src_port: m.src_port.to_be(),
+                            dst_port: m.dst_port.to_be(),
                             ..Default::default()
                         },
                     }
                 });
                 let (spec_ptr, mask_ptr) = push_spec_mask(&mut storage, spec, mask_c);
                 items.push(dpdk_sys::rte_flow_item {
-                    type_: RTE_FLOW_ITEM_TYPE_TCP,
+                    type_: MatchType::Tcp.into(),
                     spec: spec_ptr,
                     last: ptr::null(),
                     mask: mask_ptr,
@@ -1592,7 +1683,7 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
                 let (spec_ptr, spec_box) = heap_ptr(spec);
                 storage.push(spec_box);
                 items.push(dpdk_sys::rte_flow_item {
-                    type_: RTE_FLOW_ITEM_TYPE_META,
+                    type_: MatchType::Meta.into(),
                     spec: spec_ptr,
                     last: ptr::null(),
                     mask: ptr::null(),
@@ -1607,7 +1698,7 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
                 let (spec_ptr, spec_box) = heap_ptr(spec);
                 storage.push(spec_box);
                 items.push(dpdk_sys::rte_flow_item {
-                    type_: RTE_FLOW_ITEM_TYPE_TAG,
+                    type_: MatchType::Tag.into(),
                     spec: spec_ptr,
                     last: ptr::null(),
                     mask: ptr::null(),
@@ -1622,7 +1713,7 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
 
     // Terminate the pattern with an END sentinel.
     items.push(dpdk_sys::rte_flow_item {
-        type_: RTE_FLOW_ITEM_TYPE_END,
+        type_: MatchType::End.into(),
         spec: ptr::null(),
         last: ptr::null(),
         mask: ptr::null(),
@@ -1643,8 +1734,6 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
 /// Returns [`FlowError::UnsupportedActionType`] if an action variant lacks
 /// a C-level conversion.
 fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
-    use dpdk_sys::rte_flow_action_type::*;
-
     let mut c_actions: Vec<dpdk_sys::rte_flow_action> = Vec::with_capacity(actions.len() + 1);
     let mut storage: Vec<Box<dyn Any>> = Vec::with_capacity(actions.len());
 
@@ -1652,43 +1741,43 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
         match a {
             FlowAction::End => {
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_END,
+                    type_: FlowActionType::End.into(),
                     conf: ptr::null(),
                 });
             }
             FlowAction::Void => {
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_VOID,
+                    type_: FlowActionType::Void.into(),
                     conf: ptr::null(),
                 });
             }
             FlowAction::PassThrough => {
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_PASSTHRU,
+                    type_: FlowActionType::PassThrough.into(),
                     conf: ptr::null(),
                 });
             }
             FlowAction::Flag => {
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_FLAG,
+                    type_: FlowActionType::Flag.into(),
                     conf: ptr::null(),
                 });
             }
             FlowAction::Drop => {
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_DROP,
+                    type_: FlowActionType::Drop.into(),
                     conf: ptr::null(),
                 });
             }
             FlowAction::PopVlan => {
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_OF_POP_VLAN,
+                    type_: FlowActionType::PopVlan.into(),
                     conf: ptr::null(),
                 });
             }
             FlowAction::MacSwap => {
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_MAC_SWAP,
+                    type_: FlowActionType::MacSwap.into(),
                     conf: ptr::null(),
                 });
             }
@@ -1697,7 +1786,7 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
                 let (conf_ptr, conf_box) = heap_ptr(conf);
                 storage.push(conf_box);
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_JUMP,
+                    type_: FlowActionType::Jump.into(),
                     conf: conf_ptr,
                 });
             }
@@ -1706,7 +1795,7 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
                 let (conf_ptr, conf_box) = heap_ptr(conf);
                 storage.push(conf_box);
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_MARK,
+                    type_: FlowActionType::Mark.into(),
                     conf: conf_ptr,
                 });
             }
@@ -1717,7 +1806,7 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
                 let (conf_ptr, conf_box) = heap_ptr(conf);
                 storage.push(conf_box);
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_QUEUE,
+                    type_: FlowActionType::Queue.into(),
                     conf: conf_ptr,
                 });
             }
@@ -1726,7 +1815,7 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
                 let (conf_ptr, conf_box) = heap_ptr(conf);
                 storage.push(conf_box);
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_COUNT,
+                    type_: FlowActionType::Count.into(),
                     conf: conf_ptr,
                 });
             }
@@ -1735,18 +1824,18 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
                 let (conf_ptr, conf_box) = heap_ptr(conf);
                 storage.push(conf_box);
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_METER,
+                    type_: FlowActionType::Meter.into(),
                     conf: conf_ptr,
                 });
             }
             FlowAction::PushVlan { ethertype } => {
                 let conf = dpdk_sys::rte_flow_action_of_push_vlan {
-                    ethertype: ethertype.0.to_be(),
+                    ethertype: ethertype.as_u16().to_be(),
                 };
                 let (conf_ptr, conf_box) = heap_ptr(conf);
                 storage.push(conf_box);
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_OF_PUSH_VLAN,
+                    type_: FlowActionType::PushVlan.into(),
                     conf: conf_ptr,
                 });
             }
@@ -1758,7 +1847,7 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
                 let (conf_ptr, conf_box) = heap_ptr(conf);
                 storage.push(conf_box);
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_OF_SET_VLAN_VID,
+                    type_: FlowActionType::SetVlanVid.into(),
                     conf: conf_ptr,
                 });
             }
@@ -1768,7 +1857,7 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
                 let (conf_ptr, conf_box) = heap_ptr(conf);
                 storage.push(conf_box);
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_AGE,
+                    type_: FlowActionType::Age.into(),
                     conf: conf_ptr,
                 });
             }
@@ -1777,11 +1866,18 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
                 let (conf_ptr, conf_box) = heap_ptr(action.conf);
                 storage.push(conf_box);
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_MODIFY_FIELD,
+                    type_: FlowActionType::ModifyField.into(),
                     conf: conf_ptr,
                 });
             }
             FlowAction::RawEncap { data, mask } => {
+                if let Some(m) = mask && m.len() != data.len() {
+                    return Err(FlowError::RawEncapMaskLengthMismatch {
+                        data_len: data.len(),
+                        mask_len: m.len(),
+                    });
+                }
+
                 // Keep the data/mask buffers alive via cloned Vecs in storage.
                 let data_clone = data.clone();
                 let data_ptr = data_clone.as_ptr();
@@ -1806,7 +1902,7 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
                 let (conf_ptr, conf_box) = heap_ptr(conf);
                 storage.push(conf_box);
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_RAW_ENCAP,
+                    type_: FlowActionType::RawEncap.into(),
                     conf: conf_ptr,
                 });
             }
@@ -1823,7 +1919,7 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
                 let (conf_ptr, conf_box) = heap_ptr(conf);
                 storage.push(conf_box);
                 c_actions.push(dpdk_sys::rte_flow_action {
-                    type_: RTE_FLOW_ACTION_TYPE_RAW_DECAP,
+                    type_: FlowActionType::RawDecap.into(),
                     conf: conf_ptr,
                 });
             }
@@ -1832,7 +1928,7 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
 
     // Terminate the action list with an END sentinel.
     c_actions.push(dpdk_sys::rte_flow_action {
-        type_: RTE_FLOW_ACTION_TYPE_END,
+        type_: FlowActionType::End.into(),
         conf: ptr::null(),
     });
 
