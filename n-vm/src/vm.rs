@@ -71,20 +71,18 @@ async fn launch_virtiofsd(path: impl AsRef<str>) -> tokio::process::Child {
     let uid = nix::unistd::getuid().as_raw();
     let gid = nix::unistd::getgid().as_raw();
     tokio::process::Command::new("/bin/virtiofsd")
-        .args([
-            "--shared-dir".to_string(),
-            path.as_ref().to_string(),
-            "--readonly".to_string(),
-            "--tag".to_string(),
-            VIRTIOFS_ROOT_TAG.to_string(),
-            "--socket-path".to_string(),
-            VIRTIOFSD_SOCKET_PATH.to_string(),
-            "--announce-submounts".to_string(),
-            "--sandbox=none".to_string(),
-            "--rlimit-nofile=0".to_string(),
-            format!("--translate-uid=squash-host:0:{uid}:{MAX}", MAX = u32::MAX),
-            format!("--translate-gid=squash-host:0:{gid}:{MAX}", MAX = u32::MAX),
-        ])
+        .arg("--shared-dir")
+        .arg(path.as_ref())
+        .arg("--readonly")
+        .arg("--tag")
+        .arg(VIRTIOFS_ROOT_TAG)
+        .arg("--socket-path")
+        .arg(VIRTIOFSD_SOCKET_PATH)
+        .arg("--announce-submounts")
+        .arg("--sandbox=none")
+        .arg("--rlimit-nofile=0")
+        .arg(format!("--translate-uid=squash-host:0:{uid}:{MAX}", MAX = u32::MAX))
+        .arg(format!("--translate-gid=squash-host:0:{gid}:{MAX}", MAX = u32::MAX))
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
@@ -349,7 +347,7 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
                 }
             }
         }
-        String::from_utf8_lossy(&buf).to_string()
+        String::from_utf8_lossy(&buf).into_owned()
     });
 
     // ── Build VM configuration ───────────────────────────────────────
@@ -475,12 +473,12 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
         success: virtiofsd.status.success()
             && hypervisor_verdict
             && hypervisor_output.status.success(),
-        stdout: String::from_utf8_lossy(&hypervisor_output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&hypervisor_output.stderr).to_string(),
+        stdout: String::from_utf8_lossy(&hypervisor_output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&hypervisor_output.stderr).into_owned(),
         console: kernel_log,
         init_trace,
-        virtiofsd_stdout: String::from_utf8_lossy(virtiofsd.stdout.as_slice()).to_string(),
-        virtiofsd_stderr: String::from_utf8_lossy(virtiofsd.stderr.as_slice()).to_string(),
+        virtiofsd_stdout: String::from_utf8_lossy(virtiofsd.stdout.as_slice()).into_owned(),
+        virtiofsd_stderr: String::from_utf8_lossy(virtiofsd.stderr.as_slice()).into_owned(),
         hypervisor_events,
     }
 }
