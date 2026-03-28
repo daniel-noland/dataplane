@@ -18,9 +18,9 @@ macro_rules! fatal {
             ::tracing::error!("see other logs for cause of failure.  The general protection fault is expected.");
             let _ = stdout_lock.flush();
             let _ = stderr_lock.flush();
-            ::nix::unistd::close(0).unwrap();
-            ::nix::unistd::close(1).unwrap();
-            ::nix::unistd::close(2).unwrap();
+            let _ = ::nix::unistd::close(0);
+            let _ = ::nix::unistd::close(1);
+            let _ = ::nix::unistd::close(2);
             // Note: I use abort here so that the panic handlers can't interfere with the shutdown process.
             //
             // If we use panic! then the last few lines of the error message can get mangled because

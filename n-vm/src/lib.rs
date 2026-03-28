@@ -31,17 +31,3 @@ pub use n_vm_protocol::{
     VM_ROOT_SHARE_PATH, VM_RUN_DIR, vhost_vsock_listener_path,
 };
 pub use vm::{VmTestOutput, run_in_vm};
-
-/// Logs an error message and then panics with the same message.
-///
-/// This is the `n-vm` (host/container side) variant of the fatal macro.
-/// Unlike the `n-it` version (which carefully flushes stdio and aborts to
-/// trigger a guest panic), this version simply panics since it runs outside
-/// the VM where normal panic handling is appropriate.
-#[macro_export]
-macro_rules! fatal {
-    ($msg:expr) => {
-        ::tracing::error!($msg);
-        panic!($msg);
-    };
-}
