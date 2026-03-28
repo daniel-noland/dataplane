@@ -188,6 +188,8 @@ ureq = { version = "3.3.0", default-features = false, features = [] }
 url = { version = "2.5.8", default-features = false, features = [] }
 uuid = { version = "1.22.0", default-features = false, features = [] }
 
+rstar = { version = "0.12.2", default-features = true }
+
 [profile.dev]
 panic = "unwind"
 debug-assertions = true
