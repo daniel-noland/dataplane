@@ -9,11 +9,22 @@ use bollard::query_parameters::{
     CreateContainerOptions, InspectContainerOptions, RemoveContainerOptions, StartContainerOptions,
 };
 use bollard::secret::{
-    ContainerCreateBody, ContainerState, DeviceMapping, HostConfig, MountBindOptions,
+    ContainerCreateBody, DeviceMapping, HostConfig, MountBindOptions,
     RestartPolicy, RestartPolicyNameEnum,
 };
 use n_vm_protocol::{ENV_IN_TEST_CONTAINER, ENV_MARKER_VALUE, VM_ROOT_SHARE_PATH};
 use tokio_stream::StreamExt;
+
+/// The result of running a test inside a Docker container.
+///
+/// This is a lightweight wrapper that avoids exposing the `bollard` crate's
+/// [`ContainerState`](bollard::secret::ContainerState) type as part of the
+/// public API.
+#[derive(Debug)]
+pub struct ContainerTestResult {
+    /// The exit code of the container's main process, if available.
+    pub exit_code: Option<i64>,
+}
 
 /// Launches a Docker container and re-runs the current test binary inside it.
 ///
@@ -28,11 +39,11 @@ use tokio_stream::StreamExt;
 /// 3. Bind-mounts the test binary directory into the container.
 /// 4. Starts the container with `IN_TEST_CONTAINER=YES` and streams its
 ///    stdout/stderr to the host's stdout/stderr.
-/// 5. Waits for the container to exit and returns its [`ContainerState`].
+/// 5. Waits for the container to exit and returns a [`ContainerTestResult`].
 ///
 /// The type parameter `F` is used only to derive the test name via
 /// [`std::any::type_name`]; the function itself is never called in this tier.
-pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerState {
+pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -181,7 +192,7 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerState {
                 }
             }
         }
-        let exit = client
+        let state = client
             .inspect_container(&container.id, None::<InspectContainerOptions>)
             .await
             .unwrap()
@@ -191,6 +202,8 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerState {
             .remove_container(&container.id, None::<RemoveContainerOptions>)
             .await
             .unwrap();
-        exit
+        ContainerTestResult {
+            exit_code: state.exit_code,
+        }
     })
 }
