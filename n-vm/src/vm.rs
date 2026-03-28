@@ -46,14 +46,29 @@ async fn launch_virtiofsd(path: impl AsRef<str>) -> tokio::process::Child {
         .unwrap()
 }
 
+/// Collected output from a test that ran inside a VM.
+///
+/// This struct aggregates all observable output from the three-tier test
+/// execution (hypervisor events, kernel console, init system tracing, and the
+/// test's own stdout/stderr).  Its [`Display`](std::fmt::Display) implementation
+/// formats everything into labelled sections for easy reading in test failure
+/// output.
 pub struct VmTestOutput {
+    /// Whether the test, hypervisor, and virtiofsd all exited successfully.
     pub success: bool,
+    /// Captured stdout from the cloud-hypervisor process.
     pub stdout: String,
+    /// Captured stderr from the cloud-hypervisor process.
     pub stderr: String,
+    /// Kernel serial console output (from the guest's `ttyS0`).
     pub console: String,
+    /// Tracing output from the `n-it` init system, streamed via vsock.
     pub init_trace: String,
+    /// Captured stdout from the virtiofsd process.
     pub virtiofsd_stdout: String,
+    /// Captured stderr from the virtiofsd process.
     pub virtiofsd_stderr: String,
+    /// Cloud-hypervisor lifecycle events collected during the VM's lifetime.
     pub hypervisor_events: Vec<hypervisor::Event>,
 }
 
@@ -84,6 +99,20 @@ impl std::fmt::Display for VmTestOutput {
     }
 }
 
+/// Boots a cloud-hypervisor VM and runs the test function inside it.
+///
+/// This is the **container-tier** entry point, called from the code generated
+/// by `#[in_vm]` when `IN_TEST_CONTAINER=YES`.  It:
+///
+/// 1. Launches virtiofsd to share the container's root filesystem into the VM.
+/// 2. Binds a Unix socket for the init system's vsock tracing stream.
+/// 3. Configures and boots a cloud-hypervisor VM with the test binary as the
+///    init payload argument.
+/// 4. Collects hypervisor events, kernel console output, and init system traces.
+/// 5. Shuts down the VM and returns a [`VmTestOutput`] with the results.
+///
+/// The type parameter `F` is used only to derive the test name via
+/// [`std::any::type_name`]; the function itself is never called in this tier.
 pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
     let test_name = std::any::type_name::<F>().trim_start_matches("&");
     let full_bin_name = std::env::args().next().unwrap(); // TODO: use /proc/self/exe readlink

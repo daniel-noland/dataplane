@@ -19,6 +19,12 @@ pub use container::run_test_in_vm;
 pub use n_vm_macros::in_vm;
 pub use vm::{VmTestOutput, run_in_vm};
 
+/// Logs an error message and then panics with the same message.
+///
+/// This is the `n-vm` (host/container side) variant of the fatal macro.
+/// Unlike the `n-it` version (which carefully flushes stdio and aborts to
+/// trigger a guest panic), this version simply panics since it runs outside
+/// the VM where normal panic handling is appropriate.
 #[macro_export]
 macro_rules! fatal {
     ($msg:expr) => {

@@ -3,6 +3,14 @@ use std::sync::{Mutex, MutexGuard};
 
 use tracing_subscriber::fmt::MakeWriter;
 
+/// A [`MakeWriter`] implementation that writes tracing output to a vsock stream.
+///
+/// This is used by the init system to stream structured tracing data back to
+/// the host (container tier) over a vsock connection, where it is collected as
+/// part of [`VmTestOutput::init_trace`](n_vm::VmTestOutput).
+///
+/// The inner stream is protected by a [`Mutex`] so that the type is
+/// naturally `Send + Sync` without requiring `unsafe`.
 pub struct VsockWriter(Mutex<vsock::VsockStream>);
 
 impl VsockWriter {
@@ -11,6 +19,8 @@ impl VsockWriter {
     }
 }
 
+/// RAII guard returned by [`VsockWriter::make_writer`] that implements
+/// [`std::io::Write`] by delegating to the locked vsock stream.
 pub struct VsockWriterGuard<'a>(MutexGuard<'a, vsock::VsockStream>);
 
 impl Write for VsockWriterGuard<'_> {

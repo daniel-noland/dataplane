@@ -14,11 +14,24 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, trace, warn};
 
+/// Minimal init system for running tests inside a cloud-hypervisor VM.
+///
+/// This unit struct groups all init system functionality as associated methods.
+/// It is intended to run as PID 1 and handles filesystem mounting, process
+/// lifecycle management, signal forwarding, and clean shutdown.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct InitSystem;
 
 impl InitSystem {
+    /// Mounts the essential virtual filesystems required by the guest OS.
+    ///
+    /// Mounts `/proc`, `/sys`, `/tmp`, `/run`, and `/sys/fs/cgroup` with
+    /// appropriate security flags (`nosuid`, `noexec`, `nodev`).  `/dev` is
+    /// not mounted here because `CONFIG_DEVTMPFS_MOUNT` is enabled in the
+    /// kernel configuration.
+    ///
+    /// Calls [`fatal!`] (which aborts the process) if any mount fails.
     pub fn mount_essential_filesystems() -> Result<(), std::io::Error> {
         fn fail_to_mount(mount: &'static str, e: Errno) -> ! {
             match e {
@@ -100,6 +113,14 @@ impl InitSystem {
         Ok(())
     }
 
+    /// Spawns the test binary as the main child process.
+    ///
+    /// Reads the binary path and test name from the kernel command line
+    /// arguments (passed via `init=`), sets `IN_VM=YES` so the `#[in_vm]`
+    /// macro executes the test body directly, and redirects stdout/stderr to
+    /// the hypervisor console (`/dev/hvc0`).
+    ///
+    /// Returns the console file handle (for flushing) and the child process.
     pub async fn spawn_main_process() -> (tokio::fs::File, Child) {
         debug!("spawning main process");
 
@@ -141,10 +162,12 @@ impl InitSystem {
         (console, child)
     }
 
-    /// Reaps all orphaned child processes.
+    /// Reaps all orphaned child processes via non-blocking `waitpid`.
     ///
-    /// Returns None if all processes exited cleanly, Some(()) if any process exited with error or was killed by signal.
-    /// This is important because if the test is leaking processes that is a failure criteria.
+    /// Returns `None` if all reaped processes exited cleanly, or `Some(())`
+    /// if any process exited with a non-zero status or was killed by a signal.
+    /// This distinction matters because leaked processes are treated as a test
+    /// failure.
     #[tracing::instrument(level = "debug")]
     pub fn reap() -> Option<()> {
         let mut success = true;
@@ -177,7 +200,14 @@ impl InitSystem {
         if success { None } else { Some(()) }
     }
 
-    /// Send signal to all processes except init (PID 1)
+    /// Sends a signal to all processes except init (PID 1).
+    ///
+    /// Uses `kill(-1, signal)` which targets every process the caller has
+    /// permission to signal.  Returns `Some(())` if at least one process
+    /// received the signal, `None` if no processes were found (`ESRCH`).
+    ///
+    /// Calls [`fatal!`] on `EPERM` or unexpected errors, since an init
+    /// system that cannot signal its children is in an unrecoverable state.
     #[tracing::instrument(level = "info")]
     pub fn send_signal_to_all_processes(signal: Signal) -> Option<()> {
         // Using PID -1 means "all processes that the calling process has permission to send signals to"
@@ -201,9 +231,14 @@ impl InitSystem {
         }
     }
 
-    // Terminate all remaining processes, first with SIGTERM
-    //
-    // Returns None if no processes were remaining, Some(()) if processes were terminated (even if unsuccessfully)
+    /// Terminates all remaining child processes with SIGTERM.
+    ///
+    /// Sends up to `MAX_SIGTERM_ATTEMPTS` rounds of SIGTERM (with 10 ms
+    /// sleeps between rounds), reaping exited processes after each round.
+    ///
+    /// Returns `None` if no child processes were remaining, or `Some(())`
+    /// if processes were found (whether or not they all terminated
+    /// successfully).
     #[tracing::instrument(level = "info")]
     pub async fn terminate_remaining_processes() -> Option<()> {
         const MAX_SIGTERM_ATTEMPTS: u8 = 50;
@@ -234,6 +269,11 @@ impl InitSystem {
         return Some(());
     }
 
+    /// Unmounts all essential filesystems in reverse order of mounting.
+    ///
+    /// Syncs the filesystem before and after each unmount.  Uses
+    /// `MNT_DETACH` to handle busy mount points, retrying on `EBUSY`.
+    /// Calls [`fatal!`] on `EINVAL` or unexpected errors.
     #[tracing::instrument(level = "info")]
     pub fn unmount_filesystems() {
         debug!("syncing filesystems");
@@ -274,6 +314,15 @@ impl InitSystem {
         sync();
     }
 
+    /// Performs a clean system shutdown.
+    ///
+    /// 1. Terminates any remaining child processes.
+    /// 2. Unmounts all filesystems.
+    /// 3. If the test succeeded, powers off the VM via `reboot(RB_POWER_OFF)`.
+    /// 4. If the test failed, calls [`fatal!`] which aborts the process,
+    ///    triggering a guest panic that the hypervisor detects as a failure.
+    ///
+    /// This function never returns (its return type is [`Infallible`]).
     #[tracing::instrument(level = "info")]
     pub async fn shutdown_system(success: bool) -> Infallible {
         info!("beginning system shutdown");
@@ -309,6 +358,13 @@ impl InitSystem {
         }
     }
 
+    /// Main entry point for the init system.
+    ///
+    /// Registers signal handlers, mounts filesystems, spawns the test process,
+    /// and enters the main event loop.  The event loop forwards signals to the
+    /// test process and waits for it to exit, then initiates shutdown.
+    ///
+    /// This function never returns (its return type is [`Infallible`]).
     #[tracing::instrument(level = "info")]
     pub async fn run() -> Infallible {
         info!("starting init system");
@@ -421,6 +477,7 @@ impl InitSystem {
         InitSystem::shutdown_system(success).await
     }
 
+    /// Lists all direct child processes of init (PPID == 1) by scanning `/proc`.
     pub async fn list_child_processes() -> Vec<Pid> {
         let mut child_pids = tokio::fs::read_dir("/proc").await.unwrap();
         let mut children = vec![];
