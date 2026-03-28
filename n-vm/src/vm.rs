@@ -43,7 +43,7 @@ async fn launch_virtiofsd(path: impl AsRef<str>) -> tokio::process::Child {
         .stdout(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .unwrap()
+        .expect("failed to spawn virtiofsd process")
 }
 
 /// Collected output from a test that ran inside a VM.
@@ -115,14 +115,22 @@ impl std::fmt::Display for VmTestOutput {
 /// [`std::any::type_name`]; the function itself is never called in this tier.
 pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
     let test_name = std::any::type_name::<F>().trim_start_matches("&");
-    let full_bin_name = std::env::args().next().unwrap(); // TODO: use /proc/self/exe readlink
-    let (_share_path, bin_name) = full_bin_name.rsplit_once("/").unwrap();
+    let full_bin_name = std::env::args()
+        .next()
+        .expect("argv[0] missing: cannot determine test binary path");
+    let (_share_path, bin_name) = full_bin_name
+        .rsplit_once("/")
+        .expect("test binary path does not contain a '/' separator");
     let virtiofsd = launch_virtiofsd(VM_ROOT_SHARE_PATH).await;
-    let listen = tokio::net::UnixListener::bind(vhost_vsock_listener_path()).unwrap();
+    let listen = tokio::net::UnixListener::bind(vhost_vsock_listener_path())
+        .expect("failed to bind vsock listener unix socket");
     let init_system_trace = tokio::spawn(async move {
         const CAPACITY_GUESS: usize = 32_768;
         let mut init_system_trace = Vec::with_capacity(CAPACITY_GUESS);
-        let (mut connection, _) = listen.accept().await.unwrap();
+        let (mut connection, _) = listen
+            .accept()
+            .await
+            .expect("failed to accept init system vsock connection");
         loop {
             tokio::select! {
                 res = connection.read_buf(&mut init_system_trace) => {
@@ -143,7 +151,9 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
         }
         String::from_utf8_lossy(&init_system_trace).to_string()
     });
-    let (_, test_name) = test_name.split_once("::").unwrap();
+    let (_, test_name) = test_name
+        .split_once("::")
+        .expect("type_name did not contain '::' separator for test name");
     let config = VmConfig {
         payload: PayloadConfig {
             firmware: None,
@@ -248,11 +258,16 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
         ..Default::default()
     };
 
-    let (event_sender, event_receiver) = tokio::net::unix::pipe::pipe().unwrap();
-    let event_sender = event_sender.into_blocking_fd().unwrap();
+    let (event_sender, event_receiver) =
+        tokio::net::unix::pipe::pipe().expect("failed to create event monitor pipe");
+    let event_sender = event_sender
+        .into_blocking_fd()
+        .expect("failed to convert event sender to blocking fd");
     let vmm_socket_path = HYPERVISOR_API_SOCKET_PATH;
 
-    tokio::fs::try_exists("/dev/kvm").await.unwrap();
+    tokio::fs::try_exists("/dev/kvm")
+        .await
+        .expect("/dev/kvm does not exist or is not accessible");
 
     const EVENT_MONITOR_FD: i32 = 3;
     let process = tokio::process::Command::new("/bin/cloud-hypervisor")
@@ -270,12 +285,15 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
             parent_fd: event_sender,
             child_fd: EVENT_MONITOR_FD,
         }])
-        .unwrap()
+        .expect("failed to set up fd mappings for cloud-hypervisor")
         .spawn()
-        .unwrap();
+        .expect("failed to spawn cloud-hypervisor process");
 
     // the first vmm event is "readable" when they hypervisor starts.  This also indicates that the api socket should exist.
-    event_receiver.readable().await.unwrap();
+    event_receiver
+        .readable()
+        .await
+        .expect("event monitor pipe not readable after hypervisor start");
     // on the off chance that we get the readable event before the socket is created, loop until it exists
     let mut loops = 0;
     while loops < 100 {
@@ -286,11 +304,7 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Err(err) => {
-                // let mut stderr = process.stderr.unwrap();
-                panic!(
-                    "unable to connect to hypervisor: {err}, {:?}",
-                    process.stderr.unwrap()
-                );
+                panic!("unable to connect to hypervisor: {err}");
             }
         }
     }
@@ -313,7 +327,12 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
             }
         }
     }
-    client.lock().await.create_vm(config).await.unwrap();
+    client
+        .lock()
+        .await
+        .create_vm(config)
+        .await
+        .expect("failed to create VM via hypervisor API");
     let hypervisor_watch = tokio::spawn(hypervisor::watch(event_receiver));
     let kernel_log = tokio::task::spawn(async move {
         let mut loops = 0;
@@ -331,20 +350,33 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
         }
         let mut stream = tokio::net::UnixStream::connect(KERNEL_CONSOLE_SOCKET_PATH)
             .await
-            .unwrap();
+            .expect("failed to connect to kernel console socket");
         let mut kernel_log = String::with_capacity(16_384);
-        stream.read_to_string(&mut kernel_log).await.unwrap();
+        stream
+            .read_to_string(&mut kernel_log)
+            .await
+            .expect("failed to read kernel console output");
         kernel_log
     });
-    client.lock().await.boot_vm().await.unwrap();
+    client
+        .lock()
+        .await
+        .boot_vm()
+        .await
+        .expect("failed to boot VM via hypervisor API");
     let init_trace = match init_system_trace.await {
         Ok(log) => log,
         Err(err) => {
             format!("unable to join init system task: {err}")
         }
     };
-    let (hypervisor_events, hypervisor_verdict) = hypervisor_watch.await.unwrap();
-    let hypervisor_output = process.wait_with_output().await.unwrap();
+    let (hypervisor_events, hypervisor_verdict) = hypervisor_watch
+        .await
+        .expect("hypervisor event watcher task panicked");
+    let hypervisor_output = process
+        .wait_with_output()
+        .await
+        .expect("failed to collect cloud-hypervisor process output");
     let kernel_log = kernel_log
         .await
         .unwrap_or_else(|err| format!("!!!KERNEL LOG MISSING!!!:\n\n{err:#?}\n\n"));
@@ -362,7 +394,10 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
         }
     }
 
-    let virtiofsd = virtiofsd.wait_with_output().await.unwrap();
+    let virtiofsd = virtiofsd
+        .wait_with_output()
+        .await
+        .expect("failed to collect virtiofsd process output");
     VmTestOutput {
         success: virtiofsd.status.success()
             && hypervisor_verdict

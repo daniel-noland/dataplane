@@ -47,7 +47,7 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
+        .expect("failed to build tokio runtime for test container");
     runtime.block_on(async {
         const REQUIRED_CAPS: [&str; 6] = [
             "SYS_CHROOT", // for chroot (required by virtiofsd)
@@ -65,14 +65,30 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
             "/dev/vhost-net".into(), // for network communication with the vm
             docker_host, // allows the launch of sibling containers (may not be needed)
         ];
-        let (_, test_name) = std::any::type_name::<F>().split_once("::").unwrap();
-        let bin_path = std::fs::read_link("/proc/self/exe").unwrap();
-        let bin_dir = std::fs::canonicalize(bin_path.parent().unwrap()).unwrap();
-        let client = bollard::Docker::connect_with_unix_defaults().unwrap();
+        let (_, test_name) = std::any::type_name::<F>()
+            .split_once("::")
+            .expect("type_name did not contain '::' separator for test name");
+        let bin_path = std::fs::read_link("/proc/self/exe")
+            .expect("failed to read /proc/self/exe symlink");
+        let bin_parent = bin_path
+            .parent()
+            .expect("test binary path has no parent directory");
+        let bin_dir = std::fs::canonicalize(bin_parent)
+            .expect("failed to canonicalize test binary directory");
+        let bin_dir_str = bin_dir
+            .to_str()
+            .expect("test binary directory path is not valid UTF-8");
+        let client = bollard::Docker::connect_with_unix_defaults()
+            .expect("failed to connect to Docker daemon");
         use std::os::unix::fs::MetadataExt;
         let cap_add = REQUIRED_CAPS.map(|cap| cap.into()).into();
         let add_groups = required_files
-            .map(|path| std::fs::metadata(&path).unwrap_or_else(|e| panic!("error on {path}: {e}")).gid().to_string())
+            .map(|path| {
+                std::fs::metadata(&path)
+                    .unwrap_or_else(|e| panic!("failed to stat required device {path}: {e}"))
+                    .gid()
+                    .to_string()
+            })
             .into();
         let devices = REQUIRED_DEVICES
             .map(|path| DeviceMapping {
@@ -81,7 +97,10 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
                 cgroup_permissions: Some("rwm".into()),
             })
             .into();
-        let args = [bin_path.to_str().unwrap().to_string()]
+        let bin_path_str = bin_path
+            .to_str()
+            .expect("test binary path is not valid UTF-8");
+        let args = [bin_path_str.to_string()]
             .into_iter()
             .chain([test_name.to_string(), "--exact".into(), "--format=terse".into()])
             .collect();
@@ -116,8 +135,8 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
                     readonly_rootfs: Some(true),
                     mounts: Some([
                         bollard::models::Mount {
-                            source: Some(bin_dir.to_str().unwrap().into()),
-                            target: Some(bin_dir.to_str().unwrap().into()),
+                            source: Some(bin_dir_str.into()),
+                            target: Some(bin_dir_str.into()),
                             typ: Some(bollard::secret::MountTypeEnum::BIND),
                             read_only: Some(true),
                             bind_options: Some(MountBindOptions {
@@ -129,8 +148,8 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
                             ..Default::default()
                         },
                         bollard::models::Mount {
-                            source: Some(bin_dir.to_str().unwrap().into()),
-                            target: Some(format!("{}/{}", VM_ROOT_SHARE_PATH, bin_dir.to_str().unwrap())),
+                            source: Some(bin_dir_str.into()),
+                            target: Some(format!("{}/{}", VM_ROOT_SHARE_PATH, bin_dir_str)),
                             typ: Some(bollard::secret::MountTypeEnum::BIND),
                             read_only: Some(true),
                             bind_options: Some(MountBindOptions {
@@ -154,11 +173,11 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
                 }),
                 ..Default::default()
             }
-        ).await.unwrap();
+        ).await.expect("failed to create Docker container");
         client
             .start_container(&container.id, None::<StartContainerOptions>)
             .await
-            .unwrap();
+            .expect("failed to start Docker container");
         let mut logs = client.logs(
             &container.id,
             Some(bollard::query_parameters::LogsOptions {
@@ -188,20 +207,20 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
                     bollard::container::LogOutput::StdIn { .. } => unreachable!(),
                 },
                 Err(e) => {
-                    panic!("{e:#?}");
+                    panic!("error reading container logs: {e:#?}");
                 }
             }
         }
         let state = client
             .inspect_container(&container.id, None::<InspectContainerOptions>)
             .await
-            .unwrap()
+            .expect("failed to inspect container after exit")
             .state
-            .unwrap();
+            .expect("container inspection returned no state");
         client
             .remove_container(&container.id, None::<RemoveContainerOptions>)
             .await
-            .unwrap();
+            .expect("failed to remove container");
         ContainerTestResult {
             exit_code: state.exit_code,
         }
