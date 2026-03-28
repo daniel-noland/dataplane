@@ -1,13 +1,14 @@
 extern crate proc_macro;
 
 use quote::quote;
+use syn::parse_macro_input;
 
 #[proc_macro_attribute]
 pub fn in_vm(
     _attr: proc_macro::TokenStream,
     input: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    let x: syn::ItemFn = syn::parse(input.clone()).unwrap();
+    let x = parse_macro_input!(input as syn::ItemFn);
     let block = x.block;
     let vis = x.vis;
     let sig = x.sig.clone();
@@ -35,7 +36,9 @@ pub fn in_vm(
                             .unwrap();
                         let _guard = runtime.enter();
                         runtime.block_on(async {
-                            ::tracing_subscriber::fmt()
+                            // Use try_init() to avoid panicking if a subscriber is already set
+                            // (e.g. when multiple #[in_vm] tests run in the same binary).
+                            let _ = ::tracing_subscriber::fmt()
                                 .with_max_level(tracing::Level::INFO)
                                 .with_thread_names(true)
                                 .without_time()
@@ -43,7 +46,7 @@ pub fn in_vm(
                                 .with_line_number(true)
                                 .with_target(true)
                                 .with_file(true)
-                                .init();
+                                .try_init();
                             let _init_span = ::tracing::span!(tracing::Level::INFO, "hypervisor");
                             let _guard = _init_span.enter();
                             let output = ::n_vm::run_in_vm(#ident).await;
