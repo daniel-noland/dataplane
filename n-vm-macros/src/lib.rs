@@ -108,57 +108,72 @@ pub fn in_vm(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let attrs = &func.attrs;
     let ident = &func.sig.ident;
 
+    // The three tiers are dispatched as a flat if / else-if / else chain.
+    // Each tier is identified by an environment variable set by the
+    // enclosing layer before re-executing the test binary.
     quote! {
         #(#attrs)*
         #vis #sig {
-            match ::std::env::var(::n_vm::ENV_IN_VM) {
-                Ok(var) if var == ::n_vm::ENV_MARKER_VALUE => {
-                    {
-                        #block
-                    }
-                    return;
-                }
-                _ => {
-                    if let Ok(val) = ::std::env::var(::n_vm::ENV_IN_TEST_CONTAINER)
-                        && val == ::n_vm::ENV_MARKER_VALUE
-                    {
-                        let runtime = ::tokio::runtime::Builder::new_current_thread()
-                            .enable_io()
-                            .enable_time()
-                            .build()
-                            .unwrap();
-                        let _guard = runtime.enter();
-                        runtime.block_on(async {
-                            // Use try_init() to avoid panicking if a subscriber is already set
-                            // (e.g. when multiple #[in_vm] tests run in the same binary).
-                            let _ = ::tracing_subscriber::fmt()
-                                .with_max_level(tracing::Level::INFO)
-                                .with_thread_names(true)
-                                .without_time()
-                                .with_test_writer()
-                                .with_line_number(true)
-                                .with_target(true)
-                                .with_file(true)
-                                .try_init();
-                            let _init_span = ::tracing::span!(tracing::Level::INFO, "hypervisor");
-                            let _guard = _init_span.enter();
-                            let output = ::n_vm::run_in_vm(#ident).await;
-                            eprintln!("{output}");
-                            assert!(output.success);
-                        });
-                        return;
-                    }
-                }
+            // ── Tier 3: VM guest ─────────────────────────────────────
+            // The init system (`n-it`) sets IN_VM=YES before spawning
+            // the test binary.  Execute the original test body directly.
+            if ::std::env::var(::n_vm::ENV_IN_VM).as_deref()
+                == ::core::result::Result::Ok(::n_vm::ENV_MARKER_VALUE)
+            {
+                { #block }
+                return;
             }
-            eprintln!("•─────⋅☾☾☾☾BEGIN NESTED TEST ENVIRONMENT☽☽☽☽⋅─────•");
+
+            // ── Tier 2: Docker container ─────────────────────────────
+            // `run_test_in_vm` sets IN_TEST_CONTAINER=YES before
+            // starting the container.  Boot a cloud-hypervisor VM and
+            // re-execute the test inside it.
+            if ::std::env::var(::n_vm::ENV_IN_TEST_CONTAINER).as_deref()
+                == ::core::result::Result::Ok(::n_vm::ENV_MARKER_VALUE)
+            {
+                let runtime = ::tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .expect("failed to build tokio runtime for #[in_vm] container tier");
+                let _guard = runtime.enter();
+                runtime.block_on(async {
+                    // Use try_init() to avoid panicking if a subscriber is already set
+                    // (e.g. when multiple #[in_vm] tests run in the same binary).
+                    let _ = ::tracing_subscriber::fmt()
+                        .with_max_level(::tracing::Level::INFO)
+                        .with_thread_names(true)
+                        .without_time()
+                        .with_test_writer()
+                        .with_line_number(true)
+                        .with_target(true)
+                        .with_file(true)
+                        .try_init();
+                    let _init_span =
+                        ::tracing::span!(::tracing::Level::INFO, "hypervisor");
+                    let _guard = _init_span.enter();
+                    let output = ::n_vm::run_in_vm(#ident).await;
+                    ::std::eprintln!("{output}");
+                    assert!(output.success, "VM test failed (see output above)");
+                });
+                return;
+            }
+
+            // ── Tier 1: Host (cargo test) ────────────────────────────
+            // No environment marker is set — we are running directly on
+            // the developer's machine.  Launch a Docker container that
+            // will enter tier 2.
+            ::std::eprintln!("•─────⋅☾☾☾☾BEGIN NESTED TEST ENVIRONMENT☽☽☽☽⋅─────•");
             let container_state = ::n_vm::run_test_in_vm(#ident);
-            eprintln!("•─────⋅☾☾☾☾ END NESTED TEST ENVIRONMENT ☽☽☽☽⋅─────•");
-            if let Some(code) = container_state.exit_code {
-                if code != 0 {
-                    panic!("test container exited with code {code}");
+            ::std::eprintln!("•─────⋅☾☾☾☾ END NESTED TEST ENVIRONMENT ☽☽☽☽⋅─────•");
+            match container_state.exit_code {
+                ::core::option::Option::Some(0) => {}
+                ::core::option::Option::Some(code) => {
+                    ::std::panic!("test container exited with code {code}");
                 }
-            } else {
-                panic!("test container not return an exit code");
+                ::core::option::Option::None => {
+                    ::std::panic!("test container did not return an exit code");
+                }
             }
         }
     }

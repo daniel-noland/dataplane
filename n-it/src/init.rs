@@ -23,90 +23,65 @@ use tracing::{debug, error, info, trace, warn};
 #[non_exhaustive]
 pub struct InitSystem;
 
+/// A single entry in the essential-filesystems mount table.
+///
+/// All fields correspond to the arguments of [`nix::mount::mount`].
+struct MountEntry {
+    /// Filesystem source (e.g. `"proc"`, `"tmpfs"`).
+    source: &'static str,
+    /// Mount point path.
+    target: &'static str,
+    /// Filesystem type.
+    fstype: &'static str,
+    /// Optional comma-separated mount data (e.g. `"mode=0600,size=5%"`).
+    data: Option<&'static str>,
+}
+
+/// The filesystems that must be mounted before the test process can run.
+///
+/// `/dev` is intentionally absent because `CONFIG_DEVTMPFS_MOUNT` is
+/// enabled in the kernel configuration, so it is auto-mounted.
+///
+/// All entries share the security flags `MS_NOSUID | MS_NOEXEC | MS_NODEV`.
+const ESSENTIAL_MOUNTS: &[MountEntry] = &[
+    MountEntry { source: "proc",    target: "/proc",          fstype: "proc",    data: None },
+    MountEntry { source: "sysfs",   target: "/sys",           fstype: "sysfs",   data: None },
+    MountEntry { source: "tmpfs",   target: "/tmp",           fstype: "tmpfs",   data: Some("mode=0600,size=5%") },
+    MountEntry { source: "tmpfs",   target: "/run",           fstype: "tmpfs",   data: Some("mode=0600,size=5%") },
+    MountEntry { source: "cgroup2", target: "/sys/fs/cgroup", fstype: "cgroup2", data: Some("nsdelegate,memory_recursiveprot") },
+];
+
 impl InitSystem {
     /// Mounts the essential virtual filesystems required by the guest OS.
     ///
-    /// Mounts `/proc`, `/sys`, `/tmp`, `/run`, and `/sys/fs/cgroup` with
-    /// appropriate security flags (`nosuid`, `noexec`, `nodev`).  `/dev` is
-    /// not mounted here because `CONFIG_DEVTMPFS_MOUNT` is enabled in the
-    /// kernel configuration.
+    /// Iterates over [`ESSENTIAL_MOUNTS`] and mounts each entry with the
+    /// security flags `nosuid`, `noexec`, `nodev`.  `/dev` is not mounted
+    /// here because `CONFIG_DEVTMPFS_MOUNT` is enabled in the kernel
+    /// configuration.
     ///
     /// Calls [`fatal!`] (which aborts the process) if any mount fails.
     pub fn mount_essential_filesystems() -> Result<(), std::io::Error> {
-        fn fail_to_mount(mount: &'static str, e: Errno) -> ! {
-            match e {
-                Errno::UnknownErrno => {
-                    fatal!("unknown error while mounting {mount}");
-                }
-                Errno::EPERM => {
-                    fatal!("permission denied while mounting {mount}");
-                }
-                other => {
-                    fatal!("failed to mount {mount}: {other}");
+        /// Performs a single mount with security flags, aborting on failure.
+        fn secure_mount(entry: &MountEntry) {
+            let MountEntry { source, target, fstype, data } = entry;
+            debug!("mounting {target}");
+            if let Err(e) = mount(
+                Some(*source),
+                *target,
+                Some(*fstype),
+                MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
+                *data,
+            ) {
+                match e {
+                    Errno::UnknownErrno => fatal!("unknown error while mounting {target}"),
+                    Errno::EPERM => fatal!("permission denied while mounting {target}"),
+                    other => fatal!("failed to mount {target}: {other}"),
                 }
             }
         }
 
-        // Mount /proc with security options
-        debug!("mounting /proc");
-        if let Err(e) = mount(
-            Some("proc"),
-            "/proc",
-            Some("proc"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
-            None::<&str>,
-        ) {
-            fail_to_mount("/proc", e)
-        };
-
-        // Mount /sys with security options
-        debug!("mounting /sys");
-        if let Err(e) = mount(
-            Some("sysfs"),
-            "/sys",
-            Some("sysfs"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
-            None::<&str>,
-        ) {
-            fail_to_mount("/sys", e)
-        }
-
-        // no need to mount /dev because CONFIG_DEVTMPFS_MOUNT is enabled in the kernel.  /dev is auto mounted
-
-        // Mount /tmp as tmpfs
-        debug!("mounting /tmp");
-        if let Err(e) = mount(
-            Some("tmpfs"),
-            "/tmp",
-            Some("tmpfs"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
-            Some("mode=0600,size=5%"),
-        ) {
-            fail_to_mount("/tmp", e)
-        };
-
-        // Mount /run as tmpfs
-        debug!("mounting /run");
-        if let Err(e) = mount(
-            Some("tmpfs"),
-            "/run",
-            Some("tmpfs"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
-            Some("mode=0600,size=5%"),
-        ) {
-            fail_to_mount("/run", e)
-        }
-
-        // Mount /sys/fs/group with security options
-        debug!("mounting /sys/fs/cgroup");
-        if let Err(e) = mount(
-            Some("cgroup2"),
-            "/sys/fs/cgroup",
-            Some("cgroup2"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
-            Some("nsdelegate,memory_recursiveprot"),
-        ) {
-            fail_to_mount("/sys/fs/cgroup", e)
+        for entry in ESSENTIAL_MOUNTS {
+            secure_mount(entry);
         }
 
         debug!("all essential filesystems mounted successfully");
