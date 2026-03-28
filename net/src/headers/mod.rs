@@ -33,23 +33,30 @@ use tracing::{debug, trace};
 #[cfg(any(test, feature = "bolero"))]
 pub use contract::*;
 
+#[macro_use]
+mod accessor_macros;
+
 mod embedded;
 pub use embedded::*;
 
 const MAX_VLANS: usize = 4;
 const MAX_NET_EXTENSIONS: usize = 2;
 
-// TODO: remove `pub` from all fields
+/// A parsed set of network packet headers.
+///
+/// Fields are crate-private to prevent construction of invalid header
+/// combinations.  Use the [`HeadersBuilder`] (via `derive_builder`) for
+/// construction and the public accessor methods for reading.
 #[derive(Debug, PartialEq, Eq, Clone, Default, Builder)]
 #[builder(default)]
 pub struct Headers {
-    pub eth: Option<Eth>,
-    pub vlan: ArrayVec<Vlan, MAX_VLANS>,
-    pub net: Option<Net>,
-    pub net_ext: ArrayVec<NetExt, MAX_NET_EXTENSIONS>,
-    pub transport: Option<Transport>,
-    pub udp_encap: Option<UdpEncap>,
-    pub embedded_ip: Option<EmbeddedHeaders>,
+    pub(crate) eth: Option<Eth>,
+    pub(crate) vlan: ArrayVec<Vlan, MAX_VLANS>,
+    pub(crate) net: Option<Net>,
+    pub(crate) net_ext: ArrayVec<NetExt, MAX_NET_EXTENSIONS>,
+    pub(crate) transport: Option<Transport>,
+    pub(crate) udp_encap: Option<UdpEncap>,
+    pub(crate) embedded_ip: Option<EmbeddedHeaders>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -154,6 +161,24 @@ impl DeParse for Net {
 pub enum NetExt {
     IpAuth(IpAuth),
     Ipv6Ext(Ipv6Ext),
+}
+
+impl DeParse for NetExt {
+    type Error = ();
+
+    fn size(&self) -> NonZero<u16> {
+        match self {
+            NetExt::IpAuth(auth) => auth.size(),
+            NetExt::Ipv6Ext(ext) => ext.size(),
+        }
+    }
+
+    fn deparse(&self, buf: &mut [u8]) -> Result<NonZero<u16>, DeParseError<Self::Error>> {
+        match self {
+            NetExt::IpAuth(auth) => auth.deparse(buf),
+            NetExt::Ipv6Ext(ext) => ext.deparse(buf),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -388,7 +413,11 @@ pub enum Header {
 }
 
 impl Header {
-    fn parse_payload(&self, cursor: &mut Reader) -> Option<Header> {
+    fn parse_payload(
+        &self,
+        cursor: &mut Reader,
+        ipv6_next_header: Option<NextHeader>,
+    ) -> Option<Header> {
         use Header::{
             EmbeddedIp, Encap, Eth, Icmp4, Icmp6, IpAuth, IpV6Ext, Ipv4, Ipv6, Tcp, Udp, Vlan,
         };
@@ -399,8 +428,8 @@ impl Header {
             Ipv6(ipv6) => ipv6.parse_payload(cursor).map(Header::from),
             IpAuth(auth) => auth.parse_payload(cursor).map(Header::from),
             IpV6Ext(ext) => {
-                if let Ipv6(ipv6) = self {
-                    ext.parse_payload(ipv6.next_header(), cursor)
+                if let Some(next_header) = ipv6_next_header {
+                    ext.parse_payload(next_header, cursor)
                         .map(Header::from)
                 } else {
                     debug!("ipv6 extension header outside ipv6 header");
@@ -432,12 +461,16 @@ impl Parse for Headers {
             embedded_ip: None,
         };
         let mut prior = Header::Eth(eth);
+        let mut ipv6_next_header: Option<NextHeader> = None;
         loop {
-            let header = prior.parse_payload(&mut cursor);
+            let header = prior.parse_payload(&mut cursor, ipv6_next_header);
             match prior {
                 Header::Eth(eth) => this.eth = Some(eth),
                 Header::Ipv4(ip) => this.net = Some(Net::Ipv4(ip)),
-                Header::Ipv6(ip) => this.net = Some(Net::Ipv6(ip)),
+                Header::Ipv6(ip) => {
+                    ipv6_next_header = Some(ip.next_header());
+                    this.net = Some(Net::Ipv6(ip));
+                }
                 Header::Tcp(tcp) => this.transport = Some(Transport::Tcp(tcp)),
                 Header::Udp(udp) => this.transport = Some(Transport::Udp(udp)),
                 Header::Icmp4(icmp4) => this.transport = Some(Transport::Icmp4(icmp4)),
@@ -487,9 +520,9 @@ impl DeParse for Headers {
     type Error = ();
 
     fn size(&self) -> NonZero<u16> {
-        // TODO(blocking): Deal with ip{v4,v6} extensions
         let eth = self.eth.as_ref().map_or(0, |x| x.size().get());
         let vlan = self.vlan.iter().map(|v| v.size().get()).sum::<u16>();
+        let net_ext: u16 = self.net_ext.iter().map(|e| e.size().get()).sum();
         let net = match self.net {
             None => {
                 debug_assert!(self.transport.is_none());
@@ -509,12 +542,11 @@ impl DeParse for Headers {
             .embedded_ip
             .as_ref()
             .map_or(0, |embedded_header| embedded_header.size().get());
-        NonZero::new(eth + vlan + net + transport + encap + embedded_ip)
+        NonZero::new(eth + vlan + net + net_ext + transport + encap + embedded_ip)
             .unwrap_or_else(|| unreachable!())
     }
 
     fn deparse(&self, buf: &mut [u8]) -> Result<NonZero<u16>, DeParseError<Self::Error>> {
-        // TODO(blocking): Deal with ip{v4,v6} extensions
         let len = buf.len();
         if len < self.size().into_non_zero_usize().get() {
             return Err(DeParseError::Length(LengthError {
@@ -545,6 +577,10 @@ impl DeParse for Headers {
             Some(ref net) => {
                 cursor.write(net)?;
             }
+        }
+
+        for ext in &self.net_ext {
+            cursor.write(ext)?;
         }
 
         match self.transport {
@@ -597,7 +633,7 @@ pub enum PushVlanError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PopVlanError {
-    #[error("can't push vlan without an ethernet header")]
+    #[error("can't pop vlan without an ethernet header")]
     NoEthernetHeader,
 }
 
@@ -611,6 +647,84 @@ impl Headers {
     /// Add / Replace Ethernet header
     pub fn set_eth(&mut self, eth: Eth) {
         self.eth = Some(eth);
+    }
+
+    // ---- public read accessors ----
+
+    /// Get a reference to the Ethernet header, if present.
+    #[must_use]
+    pub fn eth(&self) -> Option<&Eth> {
+        self.eth.as_ref()
+    }
+
+    /// Get a mutable reference to the Ethernet header, if present.
+    pub fn eth_mut(&mut self) -> Option<&mut Eth> {
+        self.eth.as_mut()
+    }
+
+    /// Get a reference to the VLAN header stack.
+    #[must_use]
+    pub fn vlan(&self) -> &ArrayVec<Vlan, MAX_VLANS> {
+        &self.vlan
+    }
+
+    /// Get a reference to the network (IP) header, if present.
+    #[must_use]
+    pub fn net(&self) -> Option<&Net> {
+        self.net.as_ref()
+    }
+
+    /// Get a mutable reference to the network (IP) header, if present.
+    pub fn net_mut(&mut self) -> Option<&mut Net> {
+        self.net.as_mut()
+    }
+
+    /// Get a reference to the network extension headers (e.g. IPv6 extensions,
+    /// IP Authentication headers).
+    #[must_use]
+    pub fn net_ext(&self) -> &ArrayVec<NetExt, MAX_NET_EXTENSIONS> {
+        &self.net_ext
+    }
+
+    /// Get a reference to the transport header, if present.
+    #[must_use]
+    pub fn transport(&self) -> Option<&Transport> {
+        self.transport.as_ref()
+    }
+
+    /// Get a mutable reference to the transport header, if present.
+    pub fn transport_mut(&mut self) -> Option<&mut Transport> {
+        self.transport.as_mut()
+    }
+
+    /// Replace the transport header, returning the previous value.
+    pub fn set_transport(&mut self, transport: Option<Transport>) -> Option<Transport> {
+        std::mem::replace(&mut self.transport, transport)
+    }
+
+    /// Get a reference to the UDP encapsulation header, if present.
+    #[must_use]
+    pub fn udp_encap(&self) -> Option<&UdpEncap> {
+        self.udp_encap.as_ref()
+    }
+
+    /// Get a mutable reference to the UDP encapsulation header, if present.
+    pub fn udp_encap_mut(&mut self) -> Option<&mut UdpEncap> {
+        self.udp_encap.as_mut()
+    }
+
+    /// Get a reference to the embedded IP headers, if present.
+    ///
+    /// Embedded IP headers appear inside ICMP error messages, which contain a
+    /// (potentially truncated) copy of the original offending packet.
+    #[must_use]
+    pub fn embedded_ip(&self) -> Option<&EmbeddedHeaders> {
+        self.embedded_ip.as_ref()
+    }
+
+    /// Get a mutable reference to the embedded IP headers, if present.
+    pub fn embedded_ip_mut(&mut self) -> Option<&mut EmbeddedHeaders> {
+        self.embedded_ip.as_mut()
     }
 
     /// Push a VLAN header to the top of the stack.
@@ -730,219 +844,25 @@ impl Headers {
     }
 }
 
-// Eth traits
+// ---------------------------------------------------------------------------
+// Try* accessor traits — definitions + concrete impls on Headers
+// ---------------------------------------------------------------------------
 
-pub trait TryEth {
-    fn try_eth(&self) -> Option<&Eth>;
-}
+// Field accessors (Option<T> -> as_ref / as_mut)
+define_field_accessor!(TryEth::try_eth / TryEthMut::try_eth_mut -> Eth, for Headers => self.eth);
+define_field_accessor!(TryIp::try_ip / TryIpMut::try_ip_mut -> Net, for Headers => self.net);
+define_field_accessor!(TryTransport::try_transport / TryTransportMut::try_transport_mut -> Transport, for Headers => self.transport);
 
-pub trait TryEthMut {
-    fn try_eth_mut(&mut self) -> Option<&mut Eth>;
-}
+// Variant accessors (Option<Enum> -> match variant)
+define_variant_accessor!(TryIpv4::try_ipv4 / TryIpv4Mut::try_ipv4_mut -> Ipv4, for Headers => self.net, match Net::Ipv4);
+define_variant_accessor!(TryIpv6::try_ipv6 / TryIpv6Mut::try_ipv6_mut -> Ipv6, for Headers => self.net, match Net::Ipv6);
+define_variant_accessor!(TryTcp::try_tcp / TryTcpMut::try_tcp_mut -> Tcp, for Headers => self.transport, match Transport::Tcp);
+define_variant_accessor!(TryUdp::try_udp / TryUdpMut::try_udp_mut -> Udp, for Headers => self.transport, match Transport::Udp);
+define_variant_accessor!(TryIcmp4::try_icmp4 / TryIcmp4Mut::try_icmp4_mut -> Icmp4, for Headers => self.transport, match Transport::Icmp4);
+define_variant_accessor!(TryIcmp6::try_icmp6 / TryIcmp6Mut::try_icmp6_mut -> Icmp6, for Headers => self.transport, match Transport::Icmp6);
+define_variant_accessor!(TryVxlan::try_vxlan / TryVxlanMut::try_vxlan_mut -> Vxlan, for Headers => self.udp_encap, match UdpEncap::Vxlan);
 
-impl TryEth for Headers {
-    fn try_eth(&self) -> Option<&Eth> {
-        self.eth.as_ref()
-    }
-}
-
-impl TryEthMut for Headers {
-    fn try_eth_mut(&mut self) -> Option<&mut Eth> {
-        self.eth.as_mut()
-    }
-}
-
-// Ipv4 traits
-
-pub trait TryIpv4 {
-    fn try_ipv4(&self) -> Option<&Ipv4>;
-}
-
-pub trait TryIpv4Mut {
-    fn try_ipv4_mut(&mut self) -> Option<&mut Ipv4>;
-}
-
-impl TryIpv4 for Headers {
-    fn try_ipv4(&self) -> Option<&Ipv4> {
-        match &self.net {
-            Some(Net::Ipv4(header)) => Some(header),
-            _ => None,
-        }
-    }
-}
-
-impl TryIpv4Mut for Headers {
-    fn try_ipv4_mut(&mut self) -> Option<&mut Ipv4> {
-        match &mut self.net {
-            Some(Net::Ipv4(header)) => Some(header),
-            _ => None,
-        }
-    }
-}
-
-// Ipv6 traits
-
-pub trait TryIpv6 {
-    fn try_ipv6(&self) -> Option<&Ipv6>;
-}
-
-pub trait TryIpv6Mut {
-    fn try_ipv6_mut(&mut self) -> Option<&mut Ipv6>;
-}
-
-impl TryIpv6 for Headers {
-    fn try_ipv6(&self) -> Option<&Ipv6> {
-        match &self.net {
-            Some(Net::Ipv6(header)) => Some(header),
-            _ => None,
-        }
-    }
-}
-
-impl TryIpv6Mut for Headers {
-    fn try_ipv6_mut(&mut self) -> Option<&mut Ipv6> {
-        match &mut self.net {
-            Some(Net::Ipv6(header)) => Some(header),
-            _ => None,
-        }
-    }
-}
-
-// IP version-agnostic traits
-
-pub trait TryIp {
-    fn try_ip(&self) -> Option<&Net>;
-}
-
-pub trait TryIpMut {
-    fn try_ip_mut(&mut self) -> Option<&mut Net>;
-}
-
-impl TryIp for Headers {
-    fn try_ip(&self) -> Option<&Net> {
-        self.net.as_ref()
-    }
-}
-
-impl TryIpMut for Headers {
-    fn try_ip_mut(&mut self) -> Option<&mut Net> {
-        self.net.as_mut()
-    }
-}
-
-// Tcp traits
-
-pub trait TryTcp {
-    fn try_tcp(&self) -> Option<&Tcp>;
-}
-
-pub trait TryTcpMut {
-    fn try_tcp_mut(&mut self) -> Option<&mut Tcp>;
-}
-
-impl TryTcp for Headers {
-    fn try_tcp(&self) -> Option<&Tcp> {
-        match &self.transport {
-            Some(Transport::Tcp(header)) => Some(header),
-            _ => None,
-        }
-    }
-}
-
-impl TryTcpMut for Headers {
-    fn try_tcp_mut(&mut self) -> Option<&mut Tcp> {
-        match &mut self.transport {
-            Some(Transport::Tcp(header)) => Some(header),
-            _ => None,
-        }
-    }
-}
-
-// UDP traits
-
-pub trait TryUdp {
-    fn try_udp(&self) -> Option<&Udp>;
-}
-
-pub trait TryUdpMut {
-    fn try_udp_mut(&mut self) -> Option<&mut Udp>;
-}
-
-impl TryUdp for Headers {
-    fn try_udp(&self) -> Option<&Udp> {
-        match &self.transport {
-            Some(Transport::Udp(header)) => Some(header),
-            _ => None,
-        }
-    }
-}
-
-impl TryUdpMut for Headers {
-    fn try_udp_mut(&mut self) -> Option<&mut Udp> {
-        match &mut self.transport {
-            Some(Transport::Udp(header)) => Some(header),
-            _ => None,
-        }
-    }
-}
-
-// ICMPv4 traits
-
-pub trait TryIcmp4 {
-    fn try_icmp4(&self) -> Option<&Icmp4>;
-}
-
-pub trait TryIcmp4Mut {
-    fn try_icmp4_mut(&mut self) -> Option<&mut Icmp4>;
-}
-
-impl TryIcmp4 for Headers {
-    fn try_icmp4(&self) -> Option<&Icmp4> {
-        match &self.transport {
-            Some(Transport::Icmp4(header)) => Some(header),
-            _ => None,
-        }
-    }
-}
-
-impl TryIcmp4Mut for Headers {
-    fn try_icmp4_mut(&mut self) -> Option<&mut Icmp4> {
-        match &mut self.transport {
-            Some(Transport::Icmp4(header)) => Some(header),
-            _ => None,
-        }
-    }
-}
-
-// ICMP6 traits
-
-pub trait TryIcmp6 {
-    fn try_icmp6(&self) -> Option<&Icmp6>;
-}
-
-pub trait TryIcmp6Mut {
-    fn try_icmp6_mut(&mut self) -> Option<&mut Icmp6>;
-}
-
-impl TryIcmp6 for Headers {
-    fn try_icmp6(&self) -> Option<&Icmp6> {
-        match &self.transport {
-            Some(Transport::Icmp6(header)) => Some(header),
-            _ => None,
-        }
-    }
-}
-
-impl TryIcmp6Mut for Headers {
-    fn try_icmp6_mut(&mut self) -> Option<&mut Icmp6> {
-        match &mut self.transport {
-            Some(Transport::Icmp6(header)) => Some(header),
-            _ => None,
-        }
-    }
-}
-
-// ICMP version-agnostic traits
+// ICMP version-agnostic traits — irregular return type, kept hand-written.
 
 pub trait TryIcmpAny {
     fn try_icmp_any(&self) -> Option<IcmpAny<'_>>;
@@ -967,56 +887,6 @@ impl TryIcmpAnyMut for Headers {
         match &mut self.transport {
             Some(Transport::Icmp4(header)) => Some(IcmpAnyMut::V4(header)),
             Some(Transport::Icmp6(header)) => Some(IcmpAnyMut::V6(header)),
-            _ => None,
-        }
-    }
-}
-
-// Generic Transport traits
-
-pub trait TryTransport {
-    fn try_transport(&self) -> Option<&Transport>;
-}
-
-pub trait TryTransportMut {
-    fn try_transport_mut(&mut self) -> Option<&mut Transport>;
-}
-
-impl TryTransport for Headers {
-    fn try_transport(&self) -> Option<&Transport> {
-        self.transport.as_ref()
-    }
-}
-
-impl TryTransportMut for Headers {
-    fn try_transport_mut(&mut self) -> Option<&mut Transport> {
-        self.transport.as_mut()
-    }
-}
-
-// Vxlan traits
-
-pub trait TryVxlan {
-    fn try_vxlan(&self) -> Option<&Vxlan>;
-}
-
-pub trait TryVxlanMut {
-    fn try_vxlan_mut(&mut self) -> Option<&mut Vxlan>;
-}
-
-impl TryVxlan for Headers {
-    fn try_vxlan(&self) -> Option<&Vxlan> {
-        match &self.udp_encap {
-            Some(UdpEncap::Vxlan(vxlan)) => Some(vxlan),
-            _ => None,
-        }
-    }
-}
-
-impl TryVxlanMut for Headers {
-    fn try_vxlan_mut(&mut self) -> Option<&mut Vxlan> {
-        match &mut self.udp_encap {
-            Some(UdpEncap::Vxlan(vxlan)) => Some(vxlan),
             _ => None,
         }
     }
@@ -1138,167 +1008,26 @@ pub trait TryHeadersMut {
     fn headers_mut(&mut self) -> &mut impl AbstractHeadersMut;
 }
 
-impl<T> TryEth for T
-where
-    T: TryHeaders,
-{
-    fn try_eth(&self) -> Option<&Eth> {
-        self.headers().try_eth()
+// ---------------------------------------------------------------------------
+// Blanket delegation impls — forward through TryHeaders / TryHeadersMut
+// ---------------------------------------------------------------------------
+
+impl_delegated_accessors! {
+    via TryHeaders::headers / TryHeadersMut::headers_mut {
+        TryEth::try_eth / TryEthMut::try_eth_mut -> Eth,
+        TryIpv4::try_ipv4 / TryIpv4Mut::try_ipv4_mut -> Ipv4,
+        TryIpv6::try_ipv6 / TryIpv6Mut::try_ipv6_mut -> Ipv6,
+        TryIp::try_ip / TryIpMut::try_ip_mut -> Net,
+        TryTcp::try_tcp / TryTcpMut::try_tcp_mut -> Tcp,
+        TryUdp::try_udp / TryUdpMut::try_udp_mut -> Udp,
+        TryIcmp4::try_icmp4 / TryIcmp4Mut::try_icmp4_mut -> Icmp4,
+        TryIcmp6::try_icmp6 / TryIcmp6Mut::try_icmp6_mut -> Icmp6,
+        TryTransport::try_transport / TryTransportMut::try_transport_mut -> Transport,
+        TryVxlan::try_vxlan / TryVxlanMut::try_vxlan_mut -> Vxlan,
     }
 }
 
-impl<T> TryIpv4 for T
-where
-    T: TryHeaders,
-{
-    fn try_ipv4(&self) -> Option<&Ipv4> {
-        self.headers().try_ipv4()
-    }
-}
-
-impl<T> TryIpv6 for T
-where
-    T: TryHeaders,
-{
-    fn try_ipv6(&self) -> Option<&Ipv6> {
-        self.headers().try_ipv6()
-    }
-}
-
-impl<T> TryIp for T
-where
-    T: TryHeaders,
-{
-    fn try_ip(&self) -> Option<&Net> {
-        self.headers().try_ip()
-    }
-}
-
-impl<T> TryTcp for T
-where
-    T: TryHeaders,
-{
-    fn try_tcp(&self) -> Option<&Tcp> {
-        self.headers().try_tcp()
-    }
-}
-
-impl<T> TryUdp for T
-where
-    T: TryHeaders,
-{
-    fn try_udp(&self) -> Option<&Udp> {
-        self.headers().try_udp()
-    }
-}
-
-impl<T> TryIcmp4 for T
-where
-    T: TryHeaders,
-{
-    fn try_icmp4(&self) -> Option<&Icmp4> {
-        self.headers().try_icmp4()
-    }
-}
-
-impl<T> TryIcmp6 for T
-where
-    T: TryHeaders,
-{
-    fn try_icmp6(&self) -> Option<&Icmp6> {
-        self.headers().try_icmp6()
-    }
-}
-
-impl<T> TryTransport for T
-where
-    T: TryHeaders,
-{
-    fn try_transport(&self) -> Option<&Transport> {
-        self.headers().try_transport()
-    }
-}
-
-impl<T> TryVxlan for T
-where
-    T: TryHeaders,
-{
-    fn try_vxlan(&self) -> Option<&Vxlan> {
-        self.headers().try_vxlan()
-    }
-}
-
-impl<T> TryEthMut for T
-where
-    T: TryHeadersMut,
-{
-    fn try_eth_mut(&mut self) -> Option<&mut Eth> {
-        self.headers_mut().try_eth_mut()
-    }
-}
-
-impl<T> TryIpv4Mut for T
-where
-    T: TryHeadersMut,
-{
-    fn try_ipv4_mut(&mut self) -> Option<&mut Ipv4> {
-        self.headers_mut().try_ipv4_mut()
-    }
-}
-
-impl<T> TryIpv6Mut for T
-where
-    T: TryHeadersMut,
-{
-    fn try_ipv6_mut(&mut self) -> Option<&mut Ipv6> {
-        self.headers_mut().try_ipv6_mut()
-    }
-}
-
-impl<T> TryIpMut for T
-where
-    T: TryHeadersMut,
-{
-    fn try_ip_mut(&mut self) -> Option<&mut Net> {
-        self.headers_mut().try_ip_mut()
-    }
-}
-
-impl<T> TryTcpMut for T
-where
-    T: TryHeadersMut,
-{
-    fn try_tcp_mut(&mut self) -> Option<&mut Tcp> {
-        self.headers_mut().try_tcp_mut()
-    }
-}
-
-impl<T> TryUdpMut for T
-where
-    T: TryHeadersMut,
-{
-    fn try_udp_mut(&mut self) -> Option<&mut Udp> {
-        self.headers_mut().try_udp_mut()
-    }
-}
-
-impl<T> TryIcmp4Mut for T
-where
-    T: TryHeadersMut,
-{
-    fn try_icmp4_mut(&mut self) -> Option<&mut Icmp4> {
-        self.headers_mut().try_icmp4_mut()
-    }
-}
-
-impl<T> TryIcmp6Mut for T
-where
-    T: TryHeadersMut,
-{
-    fn try_icmp6_mut(&mut self) -> Option<&mut Icmp6> {
-        self.headers_mut().try_icmp6_mut()
-    }
-}
+// TryIcmpAny delegation — irregular return type, kept hand-written.
 
 impl<T> TryIcmpAny for T
 where
@@ -1315,24 +1044,6 @@ where
 {
     fn try_icmp_any_mut(&mut self) -> Option<IcmpAnyMut<'_>> {
         self.headers_mut().try_icmp_any_mut()
-    }
-}
-
-impl<T> TryTransportMut for T
-where
-    T: TryHeadersMut,
-{
-    fn try_transport_mut(&mut self) -> Option<&mut Transport> {
-        self.headers_mut().try_transport_mut()
-    }
-}
-
-impl<T> TryVxlanMut for T
-where
-    T: TryHeadersMut,
-{
-    fn try_vxlan_mut(&mut self) -> Option<&mut Vxlan> {
-        self.headers_mut().try_vxlan_mut()
     }
 }
 
@@ -1619,10 +1330,8 @@ mod test {
         }
 
         pub(super) fn tcp() -> Tcp {
-            let mut tcp = Tcp::default();
-            tcp.set_source(123.try_into().unwrap())
-                .set_destination(456.try_into().unwrap())
-                .set_syn(true)
+            let mut tcp = Tcp::new(123.try_into().unwrap(), 456.try_into().unwrap());
+            tcp.set_syn(true)
                 .set_sequence_number(1)
                 .set_checksum(1234.into())
                 .unwrap();
@@ -1630,11 +1339,8 @@ mod test {
         }
 
         pub(super) fn udp() -> Udp {
-            let mut udp = Udp::default();
-            udp.set_source(123.try_into().unwrap())
-                .set_destination(456.try_into().unwrap())
-                .set_checksum(1234.into())
-                .unwrap();
+            let mut udp = Udp::new(123.try_into().unwrap(), 456.try_into().unwrap());
+            udp.set_checksum(1234.into()).unwrap();
             udp
         }
 
@@ -1976,22 +1682,22 @@ mod test {
         let comparisons = [
             Comparison {
                 good_ipv4: Ipv4Checksum::new(46718),
-                good_udp: UdpChecksum::new(31319),
+                good_udp: UdpChecksum::new(31303),
                 payload: &[],
             },
             Comparison {
                 good_ipv4: Ipv4Checksum::new(46718),
-                good_udp: UdpChecksum::new(31063),
+                good_udp: UdpChecksum::new(31047),
                 payload: &[1],
             },
             Comparison {
                 good_ipv4: Ipv4Checksum::new(46718),
-                good_udp: UdpChecksum::new(31061),
+                good_udp: UdpChecksum::new(31045),
                 payload: &[1, 2],
             },
             Comparison {
                 good_ipv4: Ipv4Checksum::new(46718),
-                good_udp: UdpChecksum::new(14863),
+                good_udp: UdpChecksum::new(14847),
                 payload: &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             },
         ];
@@ -2118,19 +1824,19 @@ mod test {
         }
         let comparisons = [
             Comparison {
-                good_udp: UdpChecksum::new(64172),
+                good_udp: UdpChecksum::new(64156),
                 payload: &[],
             },
             Comparison {
-                good_udp: UdpChecksum::new(63916),
+                good_udp: UdpChecksum::new(63900),
                 payload: &[1],
             },
             Comparison {
-                good_udp: UdpChecksum::new(63914),
+                good_udp: UdpChecksum::new(63898),
                 payload: &[1, 2],
             },
             Comparison {
-                good_udp: UdpChecksum::new(47712),
+                good_udp: UdpChecksum::new(47696),
                 payload: &[1, 2, 3, 6, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 15, 16],
             },
         ];
