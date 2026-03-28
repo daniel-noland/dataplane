@@ -12,7 +12,10 @@ use bollard::secret::{
     ContainerCreateBody, DeviceMapping, HostConfig, MountBindOptions,
     RestartPolicy, RestartPolicyNameEnum,
 };
-use n_vm_protocol::{ENV_IN_TEST_CONTAINER, ENV_MARKER_VALUE, VM_ROOT_SHARE_PATH};
+use n_vm_protocol::{
+    CONTAINER_IMAGE, CONTAINER_PLATFORM, ENV_IN_TEST_CONTAINER, ENV_MARKER_VALUE,
+    VM_ROOT_SHARE_PATH,
+};
 use tokio_stream::StreamExt;
 
 /// The result of running a test inside a Docker container.
@@ -109,13 +112,12 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
         let container = client.create_container(
             Some(CreateContainerOptions {
                 name: None,
-                platform: "x86-64".into(),
+                platform: CONTAINER_PLATFORM.into(),
             }),
             ContainerCreateBody {
                 entrypoint: None,
                 cmd: Some(args),
-                // TODO: this needs to be dynamic somehow.  Not sure how to do that yet.
-                image: Some("ghcr.io/githedgehog/testn/n-vm:v0.0.9".into()),
+                image: Some(CONTAINER_IMAGE.into()),
                 network_disabled: Some(true),
                 env: Some([
                     format!("{ENV_IN_TEST_CONTAINER}={ENV_MARKER_VALUE}"),
