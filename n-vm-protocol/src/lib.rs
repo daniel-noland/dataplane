@@ -12,6 +12,20 @@
 //! must agree across crate boundaries live here so that drift is caught at
 //! compile time rather than at runtime.
 
+// ── Container image ──────────────────────────────────────────────────
+
+/// Docker image used by the host tier to launch the test container.
+///
+/// This image contains cloud-hypervisor, virtiofsd, the `n-it` init system
+/// binary, and a minimal Linux kernel (`bzImage`).
+///
+/// TODO: make this configurable (e.g. via environment variable or builder
+/// pattern) so that CI and local development can use different images.
+pub const CONTAINER_IMAGE: &str = "ghcr.io/githedgehog/testn/n-vm:v0.0.9";
+
+/// Platform string passed to the Docker engine when creating the container.
+pub const CONTAINER_PLATFORM: &str = "x86-64";
+
 // ── Environment variables ────────────────────────────────────────────
 
 /// Environment variable set by the init system (`n-it`) inside the VM guest.
