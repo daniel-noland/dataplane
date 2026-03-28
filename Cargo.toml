@@ -26,6 +26,7 @@ members = [
     "n-it",
     "n-vm",
     "n-vm-macros",
+    "n-vm-protocol",
     "nat",
     "net",
     "pipeline",
@@ -76,6 +77,7 @@ mgmt = { path = "./mgmt", package = "dataplane-mgmt", features = [] }
 n-it = { path = "./n-it", package = "dataplane-n-it", features = [] }
 n-vm = { path = "./n-vm", package = "dataplane-n-vm", features = [] }
 n-vm-macros = { path = "./n-vm-macros", package = "dataplane-n-vm-macros", features = [] }
+n-vm-protocol = { path = "./n-vm-protocol", package = "dataplane-n-vm-protocol", features = [] }
 nat = { path = "./nat", package = "dataplane-nat", features = [] }
 net = { path = "./net", package = "dataplane-net", features = [] }
 pipeline = { path = "./pipeline", package = "dataplane-pipeline", features = [] }

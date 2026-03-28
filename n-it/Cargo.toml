@@ -7,6 +7,9 @@ version.workspace = true
 
 [dependencies]
 
+# internal
+n-vm-protocol = { workspace = true }
+
 # external
 capctl = { workspace = true, default-features = false, features = [] }
 nix = { workspace = true, default-features = false, features = ["signal", "mount", "reboot", "fs"] }

@@ -18,16 +18,16 @@ pub fn in_vm(
     quote! {
         #(#attrs)*
         #vis #sig {
-            match ::std::env::var("IN_VM") {
-                Ok(var) if var == "YES" => {
+            match ::std::env::var(::n_vm_protocol::ENV_IN_VM) {
+                Ok(var) if var == ::n_vm_protocol::ENV_MARKER_VALUE => {
                     {
                         #block
                     }
                     return;
                 }
                 _ => {
-                    if let Ok(val) = ::std::env::var("IN_TEST_CONTAINER")
-                        && val == "YES"
+                    if let Ok(val) = ::std::env::var(::n_vm_protocol::ENV_IN_TEST_CONTAINER)
+                        && val == ::n_vm_protocol::ENV_MARKER_VALUE
                     {
                         let runtime = ::tokio::runtime::Builder::new_current_thread()
                             .enable_io()
