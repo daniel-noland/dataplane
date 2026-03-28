@@ -48,7 +48,7 @@ mod hypervisor {
         #[serde(rename = "guest")]
         Guest,
         #[serde(rename = "virtio-device")]
-        VritioDevice,
+        VirtioDevice,
     }
 
     #[derive(Debug, Copy, Clone, serde::Deserialize)]
