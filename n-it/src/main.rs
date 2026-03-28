@@ -1,3 +1,4 @@
+use n_vm_protocol::{ENV_IN_VM, ENV_MARKER_VALUE, INIT_SYSTEM_VSOCK_PORT};
 use nix::errno::Errno;
 use nix::mount::{MntFlags, MsFlags, mount};
 use nix::sys::reboot::{RebootMode, reboot};
@@ -131,7 +132,7 @@ impl InitSystem {
             .stdin(Stdio::inherit())
             .stderr(console.try_clone().await.unwrap().into_std().await)
             .stdout(console.try_clone().await.unwrap().into_std().await)
-            .env("IN_VM", "YES")
+            .env(ENV_IN_VM, ENV_MARKER_VALUE)
             .env("PATH", "/bin")
             .env("LD_LIBRARY_PATH", "/lib")
             .env("RUST_BACKTRACE", "1")
@@ -476,8 +477,7 @@ impl<'a> MakeWriter<'a> for VsockWriter {
     }
 }
 
-// arbitrary port for tracing vsock connection
-const INIT_SYSTEM_VSOCK_PORT: u32 = 123_456;
+
 
 fn main() -> Infallible {
     let runtime = tokio::runtime::Builder::new_current_thread()

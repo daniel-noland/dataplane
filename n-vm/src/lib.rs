@@ -2,6 +2,13 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use n_vm_protocol::{
+    ENV_IN_TEST_CONTAINER, ENV_MARKER_VALUE, HYPERVISOR_API_SOCKET_PATH,
+    KERNEL_CONSOLE_SOCKET_PATH, VHOST_VSOCK_SOCKET_PATH, VIRTIOFSD_SOCKET_PATH,
+    VIRTIOFS_ROOT_TAG, VM_GUEST_CID, VM_ROOT_SHARE_PATH, VM_RUN_DIR,
+    vhost_vsock_listener_path,
+};
+
 use bollard::query_parameters::{
     CreateContainerOptions, InspectContainerOptions, RemoveContainerOptions, StartContainerOptions,
 };
@@ -98,9 +105,9 @@ async fn launch_virtiofsd(path: impl AsRef<str>) -> tokio::process::Child {
             path.as_ref().to_string(),
             "--readonly".to_string(),
             "--tag".to_string(),
-            "root".to_string(),
+            VIRTIOFS_ROOT_TAG.to_string(),
             "--socket-path".to_string(),
-            "/vm/virtiofsd.sock".to_string(),
+            VIRTIOFSD_SOCKET_PATH.to_string(),
             "--announce-submounts".to_string(),
             "--sandbox=none".to_string(),
             "--rlimit-nofile=0".to_string(),
@@ -157,8 +164,8 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
     let test_name = std::any::type_name::<F>().trim_start_matches("&");
     let full_bin_name = std::env::args().next().unwrap(); // TODO: use /proc/self/exe readlink
     let (_share_path, bin_name) = full_bin_name.rsplit_once("/").unwrap();
-    let virtiofsd = launch_virtiofsd("/vm.root").await;
-    let listen = tokio::net::UnixListener::bind("/vm/vhost.vsock_123456").unwrap();
+    let virtiofsd = launch_virtiofsd(VM_ROOT_SHARE_PATH).await;
+    let listen = tokio::net::UnixListener::bind(vhost_vsock_listener_path()).unwrap();
     let init_system_trace = tokio::spawn(async move {
         const CAPACITY_GUESS: usize = 32_768;
         let mut init_system_trace = Vec::with_capacity(CAPACITY_GUESS);
@@ -194,8 +201,8 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
             ..Default::default()
         },
         vsock: Some(VsockConfig {
-            cid: 3,
-            socket: "/vm/vhost.vsock".into(),
+            cid: VM_GUEST_CID as _,
+            socket: VHOST_VSOCK_SOCKET_PATH.into(),
             pci_segment: Some(0),
             ..Default::default()
         }),
@@ -255,11 +262,11 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
             },
         ]),
         fs: Some(vec![FsConfig {
-            tag: "root".into(),
-            socket: "/vm/virtiofsd.sock".into(),
+            tag: VIRTIOFS_ROOT_TAG.into(),
+            socket: VIRTIOFSD_SOCKET_PATH.into(),
             num_queues: 1,
             queue_size: 1024,
-            id: Some("root".into()),
+            id: Some(VIRTIOFS_ROOT_TAG.into()),
             ..Default::default()
         }]),
         console: Some(ConsoleConfig::new(Mode::Tty)),
@@ -267,7 +274,7 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
             // mode: Mode::File,
             mode: Mode::Socket,
             // file: Some("/vm/kernel.log".into()),
-            socket: Some("/vm/kernel.sock".into()),
+            socket: Some(KERNEL_CONSOLE_SOCKET_PATH.into()),
             ..Default::default()
         }),
         iommu: Some(false),
@@ -282,7 +289,7 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
         pvpanic: Some(true),
         landlock_enable: Some(true),
         landlock_rules: Some(vec![LandlockConfig {
-            path: "/vm".into(),
+            path: VM_RUN_DIR.into(),
             access: "rw".into(),
         }]),
         ..Default::default()
@@ -290,7 +297,7 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
 
     let (event_sender, event_receiver) = tokio::net::unix::pipe::pipe().unwrap();
     let event_sender = event_sender.into_blocking_fd().unwrap();
-    let vmm_socket_path = "/vm/hypervisor.sock";
+    let vmm_socket_path = HYPERVISOR_API_SOCKET_PATH;
 
     tokio::fs::try_exists("/dev/kvm").await.unwrap();
 
@@ -359,7 +366,7 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
         let mut loops = 0;
         while loops < 100 {
             loops += 1;
-            match tokio::fs::try_exists("/vm/kernel.sock").await {
+            match tokio::fs::try_exists(KERNEL_CONSOLE_SOCKET_PATH).await {
                 Ok(true) => break,
                 Ok(false) => {
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -369,7 +376,7 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
                 }
             }
         }
-        let mut stream = tokio::net::UnixStream::connect("/vm/kernel.sock")
+        let mut stream = tokio::net::UnixStream::connect(KERNEL_CONSOLE_SOCKET_PATH)
             .await
             .unwrap();
         let mut kernel_log = String::with_capacity(16_384);
@@ -570,7 +577,7 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerState {
                 image: Some("ghcr.io/githedgehog/testn/n-vm:v0.0.9".into()),
                 network_disabled: Some(true),
                 env: Some([
-                    "IN_TEST_CONTAINER=YES".into(),
+                    format!("{ENV_IN_TEST_CONTAINER}={ENV_MARKER_VALUE}"),
                     "RUST_BACKTRACE=1".into(),
                 ].into()),
                 user: Some(format!("{uid}:{gid}")),
