@@ -117,18 +117,14 @@ where
 }
 
 /// Errors that can occur while decoding a JSON stream.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum AsyncJsonStreamError {
     /// A JSON deserialization error.
-    Json(serde_json::Error),
+    #[error("JSON deserialization error: {0}")]
+    Json(#[from] serde_json::Error),
     /// An I/O error from the underlying reader.
-    Io(std::io::Error),
-}
-
-impl From<std::io::Error> for AsyncJsonStreamError {
-    fn from(err: std::io::Error) -> Self {
-        AsyncJsonStreamError::Io(err)
-    }
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl<'a> tokio_util::codec::Decoder for AsyncJsonStreamDecoder<'a, Event>

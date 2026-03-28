@@ -15,7 +15,7 @@ pub mod hypervisor;
 mod container;
 mod vm;
 
-pub use container::run_test_in_vm;
+pub use container::{ContainerTestResult, run_test_in_vm};
 pub use n_vm_macros::in_vm;
 pub use vm::{VmTestOutput, run_in_vm};
 
