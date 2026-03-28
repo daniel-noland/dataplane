@@ -11,10 +11,10 @@
       "version_upper_bound": null,
       "release_prefix": null,
       "submodules": false,
-      "version": "v0.23.1",
-      "revision": "fe2df77bce0b8c492a09e34d281f0fb62d1bea43",
-      "url": "https://api.github.com/repos/ipetkov/crane/tarball/refs/tags/v0.23.1",
-      "hash": "sha256-aIlv7FRXF9q70DNJPI237dEDAznSKaXmL5lfK/Id/bI="
+      "version": "v0.23.2",
+      "revision": "d01ed44f4c494d2e65a30c78249e00a4e2139619",
+      "url": "https://api.github.com/repos/ipetkov/crane/tarball/refs/tags/v0.23.2",
+      "hash": "sha256-BEp040fMklOW2+ttpNUKivlE0hzpv0AAP+0kG47uVCk="
     },
     "dpdk": {
       "type": "Git",
@@ -23,11 +23,11 @@
         "owner": "githedgehog",
         "repo": "dpdk"
       },
-      "branch": "pr/daniel-noland/cross-compile-fix",
+      "branch": "v26.03-rc3-hh",
       "submodules": false,
-      "revision": "6736a6e32f5b3a8d16b2bd0e84b73af32540de77",
-      "url": "https://github.com/githedgehog/dpdk/archive/6736a6e32f5b3a8d16b2bd0e84b73af32540de77.tar.gz",
-      "hash": "sha256-aVtrmUtFkkC2SsnfWJmRN/Klwfb/EGLG+YYtSLm5tBY="
+      "revision": "26f8ae0ea17e42c1fc30b037b21f9339c8c69bba",
+      "url": "https://github.com/githedgehog/dpdk/archive/26f8ae0ea17e42c1fc30b037b21f9339c8c69bba.tar.gz",
+      "hash": "sha256-bo7RRGj7HBCJcbo0xQ3iRPXvbQSFla2qbJSl2ANzE/M="
     },
     "dplane-plugin": {
       "type": "Git",
@@ -66,10 +66,10 @@
       "version_upper_bound": null,
       "release_prefix": null,
       "submodules": false,
-      "version": "v0.113.2",
-      "revision": "6d4438e4ddde8079f879e90f603080a1fd027ef8",
-      "url": "https://api.github.com/repos/githedgehog/fabric/tarball/refs/tags/v0.113.2",
-      "hash": "sha256-vGv9yXunQ+jTbsycZ3ppVpndSuCESBmPcUiLm2X0nfY=",
+      "version": "v0.115.0",
+      "revision": "45baa450be8c5d356dbd7e35b6efe258cfe6f626",
+      "url": "https://api.github.com/repos/githedgehog/fabric/tarball/refs/tags/v0.115.0",
+      "hash": "sha256-PxptY4Z+uDKegUWIct0wYKqdDiPX7jj5ZSC1L5+he8Y=",
       "frozen": true
     },
     "frr": {
@@ -81,9 +81,9 @@
       },
       "branch": "stable/10.5",
       "submodules": false,
-      "revision": "5013dd523001384b6fa0c14b7795a8eebafba523",
-      "url": "https://github.com/FRRouting/frr/archive/5013dd523001384b6fa0c14b7795a8eebafba523.tar.gz",
-      "hash": "sha256-7wpSzVrPeyLc972xq+JeOMd4Dw3e/nyHjbRqeOZkQBc="
+      "revision": "c119f24a7612a63823856b40b049e576d15f679f",
+      "url": "https://github.com/FRRouting/frr/archive/c119f24a7612a63823856b40b049e576d15f679f.tar.gz",
+      "hash": "sha256-0amvXXm+93WV1sc5X1cGdXnp95Hk1O5B05hu30eRUhc="
     },
     "frr-agent": {
       "type": "Git",
@@ -130,8 +130,8 @@
     "nixpkgs": {
       "type": "Channel",
       "name": "nixpkgs-unstable",
-      "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.05pre964972.9cf7092bdd60/nixexprs.tar.xz",
-      "hash": "sha256-SpvueJPdKD+U/Q2btT3e3rAYgbPQP6nbcYYfK3BJQDA="
+      "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.05pre968305.fdc7b8f7b30f/nixexprs.tar.xz",
+      "hash": "sha256-WLxi1vfcykjq9Yb2umqBJs6lVM6MpV2tXfcrAjroxUk="
     },
     "perftest": {
       "type": "Git",
@@ -142,9 +142,9 @@
       },
       "branch": "master",
       "submodules": false,
-      "revision": "ea1c778782df3ec09b5f8101017fc0140b51a63d",
-      "url": "https://github.com/linux-rdma/perftest/archive/ea1c778782df3ec09b5f8101017fc0140b51a63d.tar.gz",
-      "hash": "sha256-O29UkU0fwbGjyuT6Rbxs1imus1CHZxTLkiyuJtOnxBc="
+      "revision": "a9f846efb25f82a6e9443f45ea4e220292b72114",
+      "url": "https://github.com/linux-rdma/perftest/archive/a9f846efb25f82a6e9443f45ea4e220292b72114.tar.gz",
+      "hash": "sha256-Bq0qA5TCfcevbb4oxADRr0dJdxYGWLfT6YkYPU5uXM8="
     },
     "rdma-core": {
       "type": "Git",
@@ -153,11 +153,11 @@
         "owner": "githedgehog",
         "repo": "rdma-core"
       },
-      "branch": "fix-lto-61.0",
+      "branch": "fix-lto-62.0",
       "submodules": false,
-      "revision": "998375a38e27e66bc74ed7419a0b93d0066e8194",
-      "url": "https://github.com/githedgehog/rdma-core/archive/998375a38e27e66bc74ed7419a0b93d0066e8194.tar.gz",
-      "hash": "sha256-Qm5IhgRI5k+sDdBzyTIILg60jlmYroGWYyERSHKfuV4="
+      "revision": "0f7e45cebcdd16fede664ddfcc09662c75cd4b56",
+      "url": "https://github.com/githedgehog/rdma-core/archive/0f7e45cebcdd16fede664ddfcc09662c75cd4b56.tar.gz",
+      "hash": "sha256-sSU1AtxBihNMV8VFmTJnBpVUdoQtkpEZpsGsxnrjRfk="
     },
     "rust": {
       "type": "GitRelease",
@@ -170,10 +170,10 @@
       "version_upper_bound": null,
       "release_prefix": null,
       "submodules": false,
-      "version": "1.94.0",
-      "revision": "5518e0609fc902e41fcdb470cb3adca7376759e3",
-      "url": "https://api.github.com/repos/rust-lang/rust/tarball/refs/tags/1.94.0",
-      "hash": "sha256-Pq/9fcLHWFJnWousVBJfHkB6vzsyGjB7Ohdrn7Eik1A="
+      "version": "1.94.1",
+      "revision": "4c540d92e07b57f8a961905e3c391feaa0a8cc95",
+      "url": "https://api.github.com/repos/rust-lang/rust/tarball/refs/tags/1.94.1",
+      "hash": "sha256-+urozYqxqT4T2aKZfNLVhJmbQm4/zEJZkwkalGrswFU="
     },
     "rust-overlay": {
       "type": "Git",
@@ -184,9 +184,9 @@
       },
       "branch": "master",
       "submodules": false,
-      "revision": "c807e83cc2e32adc35f51138b3bdef722c0812ab",
-      "url": "https://github.com/oxalica/rust-overlay/archive/c807e83cc2e32adc35f51138b3bdef722c0812ab.tar.gz",
-      "hash": "sha256-ba3c+hS7KzEiwtZRGHagIAYdcmdY3rCSWVCyn64rx7s="
+      "revision": "a313afc75b85fc77ac154bf0e62c36f68361fd0b",
+      "url": "https://github.com/oxalica/rust-overlay/archive/a313afc75b85fc77ac154bf0e62c36f68361fd0b.tar.gz",
+      "hash": "sha256-258qgkMkYPkJ9qpIg63Wk8GoIbVjszkGGPU1wbVHYTk="
     }
   },
   "version": 7
