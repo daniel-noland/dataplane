@@ -272,7 +272,7 @@ impl InitSystem {
         return Some(());
     }
 
-    /// Unmounts all essential filesystems in reverse order of mounting.
+    /// Unmounts all [`ESSENTIAL_MOUNTS`] in reverse order.
     ///
     /// Syncs the filesystem before and after each unmount.  Uses
     /// `MNT_DETACH` to handle busy mount points, retrying on `EBUSY`.
@@ -282,10 +282,9 @@ impl InitSystem {
         debug!("syncing filesystems");
         sync();
         debug!("umounting filesystems");
-        // Unmount in reverse order of mounting
-        const MOUNTS_TO_UNMOUNT: [&str; 5] = ["/run", "/tmp", "/sys/fs/cgroup", "/sys", "/proc"];
-
-        for mount_point in MOUNTS_TO_UNMOUNT {
+        // Unmount in reverse order of mounting, derived from the same
+        // table used by mount_essential_filesystems().
+        for mount_point in ESSENTIAL_MOUNTS.iter().rev().map(|e| e.target) {
             debug!("umounting {mount_point}");
             sync();
             loop {
