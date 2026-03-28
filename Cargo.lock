@@ -1273,6 +1273,7 @@ dependencies = [
  "dataplane-flow-filter",
  "dataplane-id",
  "dataplane-mgmt",
+ "dataplane-n-vm",
  "dataplane-nat",
  "dataplane-net",
  "dataplane-pipeline",
@@ -1288,7 +1289,6 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mio",
- "n-vm",
  "netdev",
  "nix 0.31.2",
  "once_cell",
@@ -1472,11 +1472,11 @@ dependencies = [
  "bytecheck",
  "dataplane-dpdk-sysroot-helper",
  "dataplane-id",
+ "dataplane-n-vm",
  "dataplane-sysfs",
  "dataplane-test-utils",
  "fixin",
  "hwlocality",
- "n-vm",
  "num-derive",
  "num-traits",
  "pci-ids",
@@ -1616,6 +1616,7 @@ dependencies = [
  "dataplane-k8s-intf",
  "dataplane-k8s-less",
  "dataplane-lpm",
+ "dataplane-n-vm",
  "dataplane-nat",
  "dataplane-net",
  "dataplane-pipeline",
@@ -1631,7 +1632,6 @@ dependencies = [
  "ipnet",
  "linkme",
  "multi_index_map",
- "n-vm",
  "netdev",
  "pretty_assertions",
  "rtnetlink",
@@ -1641,6 +1641,49 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+]
+
+[[package]]
+name = "dataplane-n-it"
+version = "0.18.0"
+dependencies = [
+ "capctl",
+ "nix 0.31.2",
+ "tokio",
+ "tokio-vsock",
+ "tracing",
+ "tracing-subscriber",
+ "vsock",
+]
+
+[[package]]
+name = "dataplane-n-vm"
+version = "0.18.0"
+dependencies = [
+ "bollard",
+ "capctl",
+ "cloud-hypervisor-client",
+ "command-fds",
+ "dataplane-n-vm-macros",
+ "nix 0.31.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-serde",
+ "tokio-stream",
+ "tokio-util",
+ "tokio-vsock",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "dataplane-n-vm-macros"
+version = "0.18.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1786,7 +1829,7 @@ dependencies = [
 name = "dataplane-sysfs"
 version = "0.18.0"
 dependencies = [
- "n-vm",
+ "dataplane-n-vm",
  "nix 0.31.2",
  "procfs",
  "thiserror 2.0.18",
@@ -3789,38 +3832,6 @@ name = "munge_macro"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4568f25ccbd45ab5d5603dc34318c1ec56b117531781260002151b8530a9f931"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "n-vm"
-version = "0.0.9"
-source = "git+https://github.com/githedgehog/testn.git?tag=v0.0.9#299344af36ed019a20ca2c4c2e8a7a0bfdb6934d"
-dependencies = [
- "bollard",
- "capctl",
- "cloud-hypervisor-client",
- "command-fds",
- "n-vm-macros",
- "nix 0.30.1",
- "serde",
- "serde_json",
- "tokio",
- "tokio-serde",
- "tokio-stream",
- "tokio-util",
- "tokio-vsock",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "n-vm-macros"
-version = "0.0.9"
-source = "git+https://github.com/githedgehog/testn.git?tag=v0.0.9#299344af36ed019a20ca2c4c2e8a7a0bfdb6934d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7298,18 +7309,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.48"
+version = "0.8.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eed437bf9d6692032087e337407a86f04cd8d6a16a37199ed57949d415bd68e9"
+checksum = "efbb2a062be311f2ba113ce66f697a4dc589f85e78a4aea276200804cea0ed87"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.48"
+version = "0.8.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70e3cd084b1788766f53af483dd21f93881ff30d7320490ec3ef7526d203bad4"
+checksum = "0e8bc7269b54418e7aeeef514aa68f8690b8c0489a06b0136e5f57c4c5ccab89"
 dependencies = [
  "proc-macro2",
  "quote",
