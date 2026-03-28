@@ -406,7 +406,11 @@ pub mod test {
     }
 
     #[ignore = "temporarily disabled during vm test runner refactor"]
-    #[n_vm::in_vm]
+    // TODO: #[in_vm] does not support async functions (it creates its own tokio
+    // runtime at the container tier).  Convert this to a sync `#[test] fn` that
+    // builds its own runtime, or restructure so the async body runs inside the
+    // VM tier only.
+    // #[n_vm::in_vm]
     #[tokio::test]
     async fn test_sample_config() {
         get_trace_ctl()

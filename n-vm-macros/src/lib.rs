@@ -39,13 +39,24 @@
 
 extern crate proc_macro;
 
+use proc_macro::TokenStream;
 use quote::quote;
-use syn::parse_macro_input;
+use syn::{ReturnType, parse_macro_input};
 
 /// Attribute macro that rewrites a test function to run inside an ephemeral VM.
 ///
 /// See the [crate-level documentation](crate) for a full description of the
 /// three-tier dispatch mechanism and usage examples.
+///
+/// # Compile-time validation
+///
+/// The macro rejects functions that are:
+/// - **`async`** — the generated code creates its own tokio runtime at the
+///   container tier, so the decorated function must be synchronous.
+/// - **Parameterised** — the function is re-invoked by name as `fn()` inside
+///   the VM guest, so it cannot accept arguments.
+/// - **Non-unit return type** — the generated dispatch branches use bare
+///   `return;` statements, so the function must return `()`.
 ///
 /// # Panics
 ///
@@ -54,16 +65,48 @@ use syn::parse_macro_input;
 /// - The VM test output indicates failure (container tier).
 /// - The tokio runtime cannot be created.
 #[proc_macro_attribute]
-pub fn in_vm(
-    _attr: proc_macro::TokenStream,
-    input: proc_macro::TokenStream,
-) -> proc_macro::TokenStream {
-    let x = parse_macro_input!(input as syn::ItemFn);
-    let block = x.block;
-    let vis = x.vis;
-    let sig = x.sig.clone();
-    let attrs = x.attrs;
-    let ident = x.sig.ident.clone();
+pub fn in_vm(_attr: TokenStream, input: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(input as syn::ItemFn);
+
+    // ── Validate function signature ──────────────────────────────────
+
+    if func.sig.asyncness.is_some() {
+        return syn::Error::new_spanned(
+            func.sig.asyncness,
+            "#[in_vm] cannot be applied to async functions; \
+             the generated code creates its own tokio runtime at the container tier",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    if !func.sig.inputs.is_empty() {
+        return syn::Error::new_spanned(
+            &func.sig.inputs,
+            "#[in_vm] functions must take no parameters; \
+             the function is re-invoked by name as `fn()` inside the VM guest",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    if let ReturnType::Type(arrow, ref ty) = func.sig.output {
+        return syn::Error::new_spanned(
+            quote! { #arrow #ty },
+            "#[in_vm] functions must return `()`; \
+             the generated dispatch branches use bare `return;` statements",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // ── Code generation ──────────────────────────────────────────────
+
+    let block = &func.block;
+    let vis = &func.vis;
+    let sig = &func.sig;
+    let attrs = &func.attrs;
+    let ident = &func.sig.ident;
 
     quote! {
         #(#attrs)*
