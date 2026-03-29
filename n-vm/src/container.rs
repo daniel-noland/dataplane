@@ -9,10 +9,10 @@
 //! focused phases — each implemented as its own helper function so that the
 //! orchestrator requires only local reasoning about sequencing:
 //!
-//! 1. [`resolve_test_params`] — gather test identity, binary paths, device
-//!    groups, and process identity.
-//! 2. [`build_container_config`] — translate those parameters into a Docker
-//!    [`ContainerCreateBody`].
+//! 1. [`ContainerParams::resolve`] — gather test identity, binary paths,
+//!    device groups, and process identity.
+//! 2. [`ContainerParams::build_config`] — translate those parameters into a
+//!    Docker [`ContainerCreateBody`].
 //! 3. [`create_and_start_container`] — create and start the container.
 //! 4. [`stream_container_logs`] — forward container stdout/stderr to the
 //!    host.
@@ -77,8 +77,16 @@ pub struct ContainerTestResult {
 /// default derived from the module-level constants.
 ///
 /// All string fields are owned so that parameter resolution
-/// ([`resolve_test_params`]) can be cleanly separated from config
-/// construction ([`build_container_config`]) without lifetime coupling.
+/// ([`resolve`](Self::resolve)) can be cleanly separated from config
+/// construction ([`build_config`](Self::build_config)) without lifetime
+/// coupling.
+///
+/// # Usage
+///
+/// ```ignore
+/// let params = ContainerParams::resolve::<F>()?;
+/// let config = params.build_config();
+/// ```
 struct ContainerParams {
     /// Full path to the test binary (e.g. `/path/to/deps/my_test-abc123`).
     bin_path: String,
@@ -96,254 +104,249 @@ struct ContainerParams {
     device_groups: Vec<String>,
 }
 
-// ── Helpers: mount construction ──────────────────────────────────────
+impl ContainerParams {
+    // ── Construction ─────────────────────────────────────────────────
 
-/// Creates a read-only private bind mount from `source` to `target`.
-///
-/// Both mounts in the container configuration (the binary directory itself
-/// and its mirror under [`VM_ROOT_SHARE_PATH`]) share the same flags; this
-/// helper eliminates the duplication.
-fn read_only_bind_mount(source: &str, target: String) -> bollard::models::Mount {
-    bollard::models::Mount {
-        source: Some(source.into()),
-        target: Some(target),
-        typ: Some(bollard::secret::MountTypeEnum::BIND),
-        read_only: Some(true),
-        bind_options: Some(MountBindOptions {
-            propagation: Some(
-                bollard::secret::MountBindOptionsPropagationEnum::PRIVATE,
-            ),
-            non_recursive: Some(true),
-            create_mountpoint: Some(true),
-            ..Default::default()
-        }),
-        ..Default::default()
+    /// Resolves all parameters needed to configure the test container.
+    ///
+    /// This gathers:
+    /// - The test name from the type parameter `F` via
+    ///   [`std::any::type_name`].
+    /// - The test binary path and its parent directory from
+    ///   `/proc/self/exe`.
+    /// - The effective UID and GID of the calling process.
+    /// - The device group ownership via
+    ///   [`resolve_device_groups`](Self::resolve_device_groups).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ContainerError`] if any filesystem lookup or validation
+    /// step fails.
+    fn resolve<F: FnOnce()>() -> Result<Self, ContainerError> {
+        let identity = crate::test_identity::TestIdentity::resolve::<F>();
+        let test_name = identity.test_name;
+
+        let bin_path =
+            std::fs::read_link("/proc/self/exe").map_err(ContainerError::BinaryPathRead)?;
+
+        let bin_parent = bin_path
+            .parent()
+            .ok_or_else(|| ContainerError::NoParentDirectory {
+                path: bin_path.clone(),
+            })?;
+
+        let bin_dir =
+            std::fs::canonicalize(bin_parent).map_err(ContainerError::BinaryPathCanonicalize)?;
+
+        let bin_dir_str = bin_dir
+            .to_str()
+            .ok_or_else(|| ContainerError::NonUtf8Path {
+                path: bin_dir.clone(),
+            })?;
+
+        let bin_path_str = bin_path
+            .to_str()
+            .ok_or_else(|| ContainerError::NonUtf8Path {
+                path: bin_path.clone(),
+            })?;
+
+        let device_groups = Self::resolve_device_groups()?;
+
+        Ok(Self {
+            bin_path: bin_path_str.to_owned(),
+            bin_dir: bin_dir_str.to_owned(),
+            test_name: test_name.to_owned(),
+            uid: nix::unistd::getuid().as_raw(),
+            gid: nix::unistd::getgid().as_raw(),
+            device_groups,
+        })
     }
-}
 
-// ── Helpers: parameter resolution ────────────────────────────────────
+    /// Resolves the GIDs of the groups that own [`REQUIRED_DEVICES`] and
+    /// the Docker socket.
+    ///
+    /// The container process runs as the current user.  To access the
+    /// required device nodes without running as root, we add the owning
+    /// groups via Docker's `--group-add`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::DeviceNotAccessible`] if any required
+    /// device or the Docker socket cannot be `stat`'d.
+    fn resolve_device_groups() -> Result<Vec<String>, ContainerError> {
+        use std::os::unix::fs::MetadataExt;
 
-/// Resolves the GIDs of the groups that own [`REQUIRED_DEVICES`] and the
-/// Docker socket.
-///
-/// The container process runs as the current user.  To access the required
-/// device nodes without running as root, we add the owning groups via
-/// Docker's `--group-add`.
-///
-/// # Errors
-///
-/// Returns [`ContainerError::DeviceNotAccessible`] if any required device
-/// or the Docker socket cannot be `stat`'d.
-fn resolve_device_groups() -> Result<Vec<String>, ContainerError> {
-    use std::os::unix::fs::MetadataExt;
+        // Resolve the Docker socket path from DOCKER_HOST, if it points
+        // to a local Unix socket.  Non-Unix schemes (e.g. tcp://) have no
+        // local file to stat, so the Docker socket group is omitted.
+        //
+        // Uses `strip_prefix` (not `trim_start_matches`) to avoid
+        // stripping the prefix more than once (e.g.
+        // "unix://unix://foo" → "foo").
+        let docker_socket_path: Option<String> = match std::env::var("DOCKER_HOST") {
+            Ok(host) => match host.strip_prefix("unix://") {
+                Some(path) => Some(path.to_string()),
+                // Non-Unix schemes (e.g. tcp://) have no local socket.
+                None if host.contains("://") => None,
+                // Bare path with no scheme — treat as a Unix socket path.
+                None => Some(host),
+            },
+            Err(_) => Some("/var/run/docker.sock".into()),
+        };
 
-    // Resolve the Docker socket path from DOCKER_HOST, if it points to a
-    // local Unix socket.  Non-Unix schemes (e.g. tcp://) have no local
-    // file to stat, so the Docker socket group is omitted in that case.
-    //
-    // Uses `strip_prefix` (not `trim_start_matches`) to avoid stripping
-    // the prefix more than once (e.g. "unix://unix://foo" → "foo").
-    let docker_socket_path: Option<String> = match std::env::var("DOCKER_HOST") {
-        Ok(host) => match host.strip_prefix("unix://") {
-            Some(path) => Some(path.to_string()),
-            // Non-Unix schemes (e.g. tcp://) have no local socket to stat.
-            None if host.contains("://") => None,
-            // Bare path with no scheme — treat as a Unix socket path.
-            None => Some(host),
-        },
-        Err(_) => Some("/var/run/docker.sock".into()),
-    };
+        // Derive the list from REQUIRED_DEVICES (the same array used for
+        // --device mappings) plus the Docker socket (when local).  This
+        // prevents drift between the two lists — previously /dev/net/tun
+        // was in REQUIRED_DEVICES but absent here.
+        let required_files: Vec<String> = REQUIRED_DEVICES
+            .iter()
+            .map(|&s| s.to_string())
+            .chain(docker_socket_path)
+            .collect();
 
-    // Derive the list from REQUIRED_DEVICES (the same array used for
-    // --device mappings) plus the Docker socket (when local).  This
-    // prevents drift between the two lists — previously /dev/net/tun
-    // was in REQUIRED_DEVICES but absent here.
-    let required_files: Vec<String> = REQUIRED_DEVICES
-        .iter()
-        .map(|&s| s.to_string())
-        .chain(docker_socket_path)
-        .collect();
+        let mut groups: Vec<String> = required_files
+            .iter()
+            .map(|path| {
+                std::fs::metadata(path)
+                    .map(|m| m.gid().to_string())
+                    .map_err(|source| ContainerError::DeviceNotAccessible {
+                        path: path.clone(),
+                        source,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-    let mut groups: Vec<String> = required_files
-        .iter()
-        .map(|path| {
-            std::fs::metadata(path)
-                .map(|m| m.gid().to_string())
-                .map_err(|source| ContainerError::DeviceNotAccessible {
-                    path: path.clone(),
-                    source,
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        groups.sort_unstable();
+        groups.dedup();
+        Ok(groups)
+    }
 
-    groups.sort_unstable();
-    groups.dedup();
-    Ok(groups)
-}
+    // ── Configuration building ───────────────────────────────────────
 
-/// Resolves all parameters needed to configure the test container.
-///
-/// This gathers:
-/// - The test name from the type parameter `F` via [`std::any::type_name`].
-/// - The test binary path and its parent directory from `/proc/self/exe`.
-/// - The effective UID and GID of the calling process.
-/// - The device group ownership via [`resolve_device_groups`].
-///
-/// # Errors
-///
-/// Returns a [`ContainerError`] if any filesystem lookup or validation
-/// step fails.
-fn resolve_test_params<F: FnOnce()>() -> Result<ContainerParams, ContainerError> {
-    let identity = crate::test_identity::TestIdentity::resolve::<F>();
-    let test_name = identity.test_name;
-
-    let bin_path = std::fs::read_link("/proc/self/exe")
-        .map_err(ContainerError::BinaryPathRead)?;
-
-    let bin_parent = bin_path
-        .parent()
-        .ok_or_else(|| ContainerError::NoParentDirectory {
-            path: bin_path.clone(),
-        })?;
-
-    let bin_dir = std::fs::canonicalize(bin_parent)
-        .map_err(ContainerError::BinaryPathCanonicalize)?;
-
-    let bin_dir_str = bin_dir
-        .to_str()
-        .ok_or_else(|| ContainerError::NonUtf8Path {
-            path: bin_dir.clone(),
-        })?;
-
-    let bin_path_str = bin_path
-        .to_str()
-        .ok_or_else(|| ContainerError::NonUtf8Path {
-            path: bin_path.clone(),
-        })?;
-
-    let device_groups = resolve_device_groups()?;
-
-    Ok(ContainerParams {
-        bin_path: bin_path_str.to_owned(),
-        bin_dir: bin_dir_str.to_owned(),
-        test_name: test_name.to_owned(),
-        uid: nix::unistd::getuid().as_raw(),
-        gid: nix::unistd::getgid().as_raw(),
-        device_groups,
-    })
-}
-
-// ── Helpers: container configuration ─────────────────────────────────
-
-/// Builds the [`ContainerCreateBody`] for a test run.
-///
-/// This function separates the **what** (image, capabilities, devices,
-/// mounts, environment) from the **where** (test binary path, test name)
-/// so that the orchestration code in [`run_test_in_vm`] stays focused on
-/// lifecycle management.
-/// Builds Docker device mappings from [`REQUIRED_DEVICES`].
-///
-/// Each device is mapped at the same path inside the container with full
-/// read/write/mknod permissions.
-fn build_device_mappings() -> Vec<DeviceMapping> {
-    REQUIRED_DEVICES
-        .iter()
-        .map(|&path| DeviceMapping {
-            path_on_host: Some(path.into()),
-            path_in_container: Some(path.into()),
-            cgroup_permissions: Some("rwm".into()),
-        })
-        .collect()
-}
-
-/// Builds the test binary command line for the container entrypoint.
-///
-/// The command re-invokes the test binary with `--exact` matching so that
-/// only the specified test runs inside the container.
-fn build_test_command(bin_path: &str, test_name: &str) -> Vec<String> {
-    vec![
-        bin_path.into(),
-        test_name.into(),
-        "--exact".into(),
-        "--no-capture".into(),
-        "--format=terse".into(),
-    ]
-}
-
-/// Builds the bind mounts for the test binary directory.
-///
-/// Two mounts are created:
-/// - The binary directory at its original path (so argv\[0\] resolves).
-/// - A mirror under [`VM_ROOT_SHARE_PATH`] for virtiofs exposure to the VM.
-fn build_container_mounts(bin_dir: &str) -> Vec<bollard::models::Mount> {
-    vec![
-        read_only_bind_mount(bin_dir, bin_dir.to_string()),
-        read_only_bind_mount(
-            bin_dir,
-            format!("{VM_ROOT_SHARE_PATH}/{bin_dir}"),
-        ),
-    ]
-}
-
-/// Builds the tmpfs mounts for the container.
-///
-/// A single tmpfs is mounted at [`VM_RUN_DIR`] for VM runtime artifacts
-/// (sockets, logs, etc.), owned by the specified UID/GID.
-fn build_container_tmpfs(uid: u32, gid: u32) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
-    map.insert(
-        VM_RUN_DIR.into(),
-        format!("nodev,noexec,nosuid,uid={uid},gid={gid}"),
-    );
-    map
-}
-
-/// Builds the [`ContainerCreateBody`] for a test run.
-///
-/// This function composes the container configuration from focused
-/// sub-builders ([`build_device_mappings`], [`build_test_command`],
-/// [`build_container_mounts`], [`build_container_tmpfs`]), keeping the
-/// orchestration code focused on the overall structure rather than the
-/// details of each component.
-fn build_container_config(params: &ContainerParams) -> ContainerCreateBody {
-    let ContainerParams {
-        bin_path,
-        bin_dir,
-        test_name,
-        uid,
-        gid,
-        device_groups,
-    } = params;
-
-    ContainerCreateBody {
-        entrypoint: None,
-        cmd: Some(build_test_command(bin_path, test_name)),
-        image: Some(CONTAINER_IMAGE.into()),
-        network_disabled: Some(true),
-        env: Some(vec![
-            format!("{ENV_IN_TEST_CONTAINER}={ENV_MARKER_VALUE}"),
-            "RUST_BACKTRACE=1".into(),
-        ]),
-        user: Some(format!("{uid}:{gid}")),
-        host_config: Some(HostConfig {
-            devices: Some(build_device_mappings()),
-            group_add: Some(device_groups.clone()),
-            init: Some(true),
-            network_mode: Some("none".into()),
-            restart_policy: Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::NO),
+    /// Builds the [`ContainerCreateBody`] for this test invocation.
+    ///
+    /// This method composes the container configuration from focused
+    /// sub-builders ([`build_device_mappings`](Self::build_device_mappings),
+    /// [`build_test_command`](Self::build_test_command),
+    /// [`build_mounts`](Self::build_mounts),
+    /// [`build_tmpfs`](Self::build_tmpfs)), keeping the overall structure
+    /// readable while delegating component details.
+    fn build_config(&self) -> ContainerCreateBody {
+        ContainerCreateBody {
+            entrypoint: None,
+            cmd: Some(self.build_test_command()),
+            image: Some(CONTAINER_IMAGE.into()),
+            network_disabled: Some(true),
+            env: Some(vec![
+                format!("{ENV_IN_TEST_CONTAINER}={ENV_MARKER_VALUE}"),
+                "RUST_BACKTRACE=1".into(),
+            ]),
+            user: Some(format!("{uid}:{gid}", uid = self.uid, gid = self.gid)),
+            host_config: Some(HostConfig {
+                devices: Some(Self::build_device_mappings()),
+                group_add: Some(self.device_groups.clone()),
+                init: Some(true),
+                network_mode: Some("none".into()),
+                restart_policy: Some(RestartPolicy {
+                    name: Some(RestartPolicyNameEnum::NO),
+                    ..Default::default()
+                }),
+                auto_remove: Some(false),
+                readonly_rootfs: Some(true),
+                mounts: Some(self.build_mounts()),
+                tmpfs: Some(self.build_tmpfs()),
+                privileged: Some(false),
+                cap_add: Some(REQUIRED_CAPS.iter().map(|&c| c.into()).collect()),
+                cap_drop: Some(vec!["ALL".into()]),
                 ..Default::default()
             }),
-            auto_remove: Some(false),
-            readonly_rootfs: Some(true),
-            mounts: Some(build_container_mounts(bin_dir)),
-            tmpfs: Some(build_container_tmpfs(*uid, *gid)),
-            privileged: Some(false),
-            cap_add: Some(REQUIRED_CAPS.iter().map(|&c| c.into()).collect()),
-            cap_drop: Some(vec!["ALL".into()]),
             ..Default::default()
-        }),
-        ..Default::default()
+        }
+    }
+
+    /// Builds Docker device mappings from [`REQUIRED_DEVICES`].
+    ///
+    /// Each device is mapped at the same path inside the container with
+    /// full read/write/mknod permissions.
+    fn build_device_mappings() -> Vec<DeviceMapping> {
+        REQUIRED_DEVICES
+            .iter()
+            .map(|&path| DeviceMapping {
+                path_on_host: Some(path.into()),
+                path_in_container: Some(path.into()),
+                cgroup_permissions: Some("rwm".into()),
+            })
+            .collect()
+    }
+
+    /// Builds the test binary command line for the container entrypoint.
+    ///
+    /// The command re-invokes the test binary with `--exact` matching so
+    /// that only the specified test runs inside the container.
+    fn build_test_command(&self) -> Vec<String> {
+        vec![
+            self.bin_path.clone(),
+            self.test_name.clone(),
+            "--exact".into(),
+            "--no-capture".into(),
+            "--format=terse".into(),
+        ]
+    }
+
+    /// Builds the bind mounts for the test binary directory.
+    ///
+    /// Two mounts are created:
+    /// - The binary directory at its original path (so argv\[0\] resolves).
+    /// - A mirror under [`VM_ROOT_SHARE_PATH`] for virtiofs exposure to
+    ///   the VM.
+    fn build_mounts(&self) -> Vec<bollard::models::Mount> {
+        vec![
+            Self::read_only_bind_mount(&self.bin_dir, self.bin_dir.clone()),
+            Self::read_only_bind_mount(
+                &self.bin_dir,
+                format!("{VM_ROOT_SHARE_PATH}/{bin_dir}", bin_dir = self.bin_dir),
+            ),
+        ]
+    }
+
+    /// Builds the tmpfs mounts for the container.
+    ///
+    /// A single tmpfs is mounted at [`VM_RUN_DIR`] for VM runtime artifacts
+    /// (sockets, logs, etc.), owned by the specified UID/GID.
+    fn build_tmpfs(&self) -> std::collections::HashMap<String, String> {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            VM_RUN_DIR.into(),
+            format!(
+                "nodev,noexec,nosuid,uid={uid},gid={gid}",
+                uid = self.uid,
+                gid = self.gid,
+            ),
+        );
+        map
+    }
+
+    /// Creates a read-only private bind mount from `source` to `target`.
+    ///
+    /// Both mounts in the container configuration (the binary directory
+    /// itself and its mirror under [`VM_ROOT_SHARE_PATH`]) share the same
+    /// flags; this helper eliminates the duplication.
+    fn read_only_bind_mount(source: &str, target: String) -> bollard::models::Mount {
+        bollard::models::Mount {
+            source: Some(source.into()),
+            target: Some(target),
+            typ: Some(bollard::secret::MountTypeEnum::BIND),
+            read_only: Some(true),
+            bind_options: Some(MountBindOptions {
+                propagation: Some(
+                    bollard::secret::MountBindOptionsPropagationEnum::PRIVATE,
+                ),
+                non_recursive: Some(true),
+                create_mountpoint: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 }
 
@@ -531,9 +534,9 @@ impl Drop for ContainerGuard<'_> {
 /// normal `cargo test` invocation).  It:
 ///
 /// 1. Resolves the test identity, binary paths, and device group ownership
-///    via [`resolve_test_params`].
+///    via [`ContainerParams::resolve`].
 /// 2. Builds the Docker container configuration via
-///    [`build_container_config`].
+///    [`ContainerParams::build_config`].
 /// 3. Creates and starts the container via [`create_and_start_container`].
 /// 4. Streams container stdout/stderr to the host via
 ///    [`stream_container_logs`].
@@ -557,8 +560,8 @@ pub fn run_test_in_vm<F: FnOnce()>(
         .expect("failed to build tokio runtime for test container");
 
     runtime.block_on(async {
-        let params = resolve_test_params::<F>()?;
-        let config = build_container_config(&params);
+        let params = ContainerParams::resolve::<F>()?;
+        let config = params.build_config();
 
         let client = bollard::Docker::connect_with_unix_defaults()
             .map_err(ContainerError::DockerConnect)?;
