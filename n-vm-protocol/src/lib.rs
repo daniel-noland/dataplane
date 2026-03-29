@@ -58,8 +58,18 @@ pub struct VsockPort(u32);
 
 impl VsockPort {
     /// Creates a new [`VsockPort`] from a raw port number.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `port` is `u32::MAX` (`VMADDR_PORT_ANY`), which has
+    /// special kernel semantics (wildcard / "assign any port") and must
+    /// not be used as a concrete port number.
     #[must_use]
     pub const fn new(port: u32) -> Self {
+        assert!(
+            port != u32::MAX,
+            "VMADDR_PORT_ANY (u32::MAX) cannot be used as a concrete vsock port"
+        );
         Self(port)
     }
 
