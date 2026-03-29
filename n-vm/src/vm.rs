@@ -99,7 +99,10 @@ async fn wait_for_socket(path: impl AsRef<Path>) -> Result<(), VmError> {
     }
     Err(VmError::SocketTimeout {
         path: path.display().to_string(),
-        timeout_ms: SOCKET_POLL_MAX_ATTEMPTS as u64 * SOCKET_POLL_INTERVAL.as_millis() as u64,
+        timeout_ms: SOCKET_POLL_INTERVAL
+            .saturating_mul(SOCKET_POLL_MAX_ATTEMPTS)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
     })
 }
 
@@ -137,9 +140,7 @@ fn spawn_vsock_reader(channel: &VsockChannel) -> Result<JoinHandle<String>, VmEr
         loop {
             match connection.read_buf(&mut buf).await {
                 Ok(0) => break,
-                Ok(_) => {
-                    tokio::task::yield_now().await;
-                }
+                Ok(_) => {}
                 Err(e) => {
                     error!("error reading {label} vsock stream: {e}");
                     break;
