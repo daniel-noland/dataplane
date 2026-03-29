@@ -4,11 +4,18 @@
 //!
 //! - **Host tier** ([`run_test_in_vm`]) — launches a Docker container with the
 //!   required devices and capabilities.
-//! - **Container tier** ([`run_in_vm`]) — launches a cloud-hypervisor VM with
-//!   virtiofsd, monitors hypervisor events, and collects test output.
+//! - **Container tier** ([`run_in_vm`] / [`TestVm`]) — launches a
+//!   cloud-hypervisor VM with virtiofsd, monitors hypervisor events, and
+//!   collects test output.
 //!
 //! The innermost tier (the VM guest init system) is provided by the `n-it`
 //! crate.
+//!
+//! # Error handling
+//!
+//! The container-tier entry point [`run_in_vm`] returns [`Result`] with a
+//! dedicated error type ([`VmError`]) so that callers can distinguish
+//! infrastructure failures from test failures.
 //!
 //! # Protocol constants
 //!
@@ -17,12 +24,14 @@
 //! without requiring downstream crates to add `n-vm-protocol` as a direct
 //! dependency.
 
+pub mod error;
 pub mod hypervisor;
 
 mod container;
 mod vm;
 
 pub use container::{ContainerTestResult, run_test_in_vm};
+pub use error::VmError;
 pub use n_vm_macros::in_vm;
 pub use n_vm_protocol::{
     CLOUD_HYPERVISOR_BINARY_PATH, CONTAINER_IMAGE, CONTAINER_PLATFORM, ENV_IN_TEST_CONTAINER,
@@ -31,4 +40,4 @@ pub use n_vm_protocol::{
     VIRTIOFSD_BINARY_PATH, VIRTIOFSD_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VM_GUEST_CID,
     VM_ROOT_SHARE_PATH, VM_RUN_DIR, VsockChannel,
 };
-pub use vm::{VmTestOutput, run_in_vm};
+pub use vm::{TestVm, TestVmParams, VmTestOutput, run_in_vm};

@@ -152,7 +152,10 @@ pub fn in_vm(_attr: TokenStream, input: TokenStream) -> TokenStream {
                     let _init_span =
                         ::tracing::span!(::tracing::Level::INFO, "hypervisor");
                     let _guard = _init_span.enter();
-                    let output = ::n_vm::run_in_vm(#ident).await;
+                    let output = ::n_vm::run_in_vm(#ident).await
+                        .unwrap_or_else(|err| {
+                            ::std::panic!("VM infrastructure error: {err:#?}")
+                        });
                     ::std::eprintln!("{output}");
                     assert!(output.success, "VM test failed (see output above)");
                 });
