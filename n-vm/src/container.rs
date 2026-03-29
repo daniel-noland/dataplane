@@ -18,6 +18,8 @@ use n_vm_protocol::{
 };
 use tokio_stream::StreamExt;
 
+use crate::error::ContainerError;
+
 // ── Constants ────────────────────────────────────────────────────────
 
 /// Linux capabilities required inside the test container.
@@ -205,7 +207,15 @@ fn build_container_config(params: &ContainerParams<'_>) -> ContainerCreateBody {
 ///
 /// The type parameter `F` is used only to derive the test name via
 /// [`std::any::type_name`]; the function itself is never called in this tier.
-pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
+///
+/// # Errors
+///
+/// Returns [`ContainerError`] if any part of the container lifecycle fails
+/// (Docker connection, container creation/start, log streaming, inspection,
+/// or cleanup).
+pub fn run_test_in_vm<F: FnOnce()>(
+    _test_fn: F,
+) -> Result<ContainerTestResult, ContainerError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -217,12 +227,12 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
             .split_once("::")
             .expect("type_name did not contain '::' separator for test name");
         let bin_path = std::fs::read_link("/proc/self/exe")
-            .expect("failed to read /proc/self/exe symlink");
+            .map_err(ContainerError::BinaryPathRead)?;
         let bin_parent = bin_path
             .parent()
             .expect("test binary path has no parent directory");
         let bin_dir = std::fs::canonicalize(bin_parent)
-            .expect("failed to canonicalize test binary directory");
+            .map_err(ContainerError::BinaryPathCanonicalize)?;
         let bin_dir_str = bin_dir
             .to_str()
             .expect("test binary directory path is not valid UTF-8");
@@ -248,11 +258,13 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
             .iter()
             .map(|path| {
                 std::fs::metadata(path)
-                    .unwrap_or_else(|e| panic!("failed to stat required device {path}: {e}"))
-                    .gid()
-                    .to_string()
+                    .map(|m| m.gid().to_string())
+                    .map_err(|source| ContainerError::DeviceNotAccessible {
+                        path: path.clone(),
+                        source,
+                    })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         device_groups.sort_unstable();
         device_groups.dedup();
 
@@ -270,7 +282,7 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
 
         // ── Create and start the container ───────────────────────────
         let client = bollard::Docker::connect_with_unix_defaults()
-            .expect("failed to connect to Docker daemon");
+            .map_err(ContainerError::DockerConnect)?;
         let container = client
             .create_container(
                 Some(CreateContainerOptions {
@@ -280,11 +292,11 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
                 config,
             )
             .await
-            .expect("failed to create Docker container");
+            .map_err(ContainerError::ContainerCreate)?;
         client
             .start_container(&container.id, None::<StartContainerOptions>)
             .await
-            .expect("failed to start Docker container");
+            .map_err(ContainerError::ContainerStart)?;
 
         // ── Stream container logs to host stdout/stderr ──────────────
         let mut logs = client.logs(
@@ -310,7 +322,7 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
                     bollard::container::LogOutput::StdIn { .. } => unreachable!(),
                 },
                 Err(e) => {
-                    panic!("error reading container logs: {e:#?}");
+                    return Err(ContainerError::LogStream(e));
                 }
             }
         }
@@ -319,16 +331,16 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
         let state = client
             .inspect_container(&container.id, None::<InspectContainerOptions>)
             .await
-            .expect("failed to inspect container after exit")
+            .map_err(ContainerError::ContainerInspect)?
             .state
-            .expect("container inspection returned no state");
+            .ok_or(ContainerError::MissingState)?;
         client
             .remove_container(&container.id, None::<RemoveContainerOptions>)
             .await
-            .expect("failed to remove container");
+            .map_err(ContainerError::ContainerRemove)?;
 
-        ContainerTestResult {
+        Ok(ContainerTestResult {
             exit_code: state.exit_code,
-        }
+        })
     })
 }
