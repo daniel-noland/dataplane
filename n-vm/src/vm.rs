@@ -395,7 +395,16 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
 /// [`VsockChannel`]s, so they are cleanly separated from each other and
 /// from the cloud-hypervisor process's own diagnostic output.
 pub struct VmTestOutput {
-    /// Whether the test, hypervisor, and virtiofsd all exited successfully.
+    /// Whether the test passed and all infrastructure exited successfully.
+    ///
+    /// This is `true` only when **all** of the following hold:
+    ///
+    /// 1. The Rust test harness did not report failure in its stdout
+    ///    summary line (`test result: FAILED`).
+    /// 2. The cloud-hypervisor VM shut down cleanly (no guest panic, no
+    ///    event-stream errors).
+    /// 3. The cloud-hypervisor process exited with status 0.
+    /// 4. The virtiofsd process exited with status 0.
     pub success: bool,
     /// Captured stdout from the test process (via vsock).
     pub stdout: String,
@@ -692,8 +701,24 @@ impl TestVm {
             collect_process_output(virtiofsd, "virtiofsd").await;
 
         // ── Assemble result ──────────────────────────────────────────
+        //
+        // The Rust test harness (invoked with `--format=terse`) writes a
+        // summary line to stdout:
+        //
+        //   test result: ok. 1 passed; 0 failed; …
+        //   test result: FAILED. 0 passed; 1 failed; …
+        //
+        // We check for the failure marker so that a test-level failure is
+        // not masked by a clean infrastructure shutdown.  This is the most
+        // reliable signal available without modifying the init system to
+        // forward the test process's exit code over a dedicated channel.
+        let test_passed = !test_stdout.contains("test result: FAILED");
+
         VmTestOutput {
-            success: virtiofsd_exit_ok && hypervisor_verdict.is_success() && hypervisor_exit_ok,
+            success: test_passed
+                && virtiofsd_exit_ok
+                && hypervisor_verdict.is_success()
+                && hypervisor_exit_ok,
             stdout: test_stdout,
             stderr: test_stderr,
             console: kernel_log,
