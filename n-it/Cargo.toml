@@ -12,6 +12,7 @@ n-vm-protocol = { workspace = true }
 
 # external
 nix = { workspace = true, default-features = false, features = ["signal", "mount", "reboot", "fs"] }
+thiserror = { workspace = true, default-features = false, features = ["std"] }
 tokio = { workspace = true, default-features = false, features = ["rt", "process", "signal", "time", "macros", "fs", "sync", "net", "io-util"] }
 tokio-vsock = { workspace = true, default-features = false, features = [] }
 tracing = { workspace = true, default-features = false, features = ["attributes"] }

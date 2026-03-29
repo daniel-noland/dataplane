@@ -17,6 +17,25 @@ use tokio::time::{Duration, sleep};
 use tokio_vsock::VMADDR_CID_HOST;
 use tracing::{debug, error, trace, warn};
 
+use crate::error::{
+    BroadcastSignalError, BroadcastSignalOutcome, ListChildrenError, ReapOutcome, SpawnError,
+    TerminateOutcome,
+};
+
+/// Converts a [`vsock::VsockStream`] into a [`Stdio`] handle by
+/// transferring ownership of the underlying file descriptor.
+///
+/// This encapsulates the only `unsafe` operation in this module into a
+/// safe abstraction, per the project's [unsafe code guidelines].
+///
+/// [unsafe code guidelines]: ../../development/code/unsafe-code.md
+fn vsock_stream_to_stdio(stream: vsock::VsockStream) -> Stdio {
+    // SAFETY: `VsockStream::into_raw_fd()` returns a valid, owned file
+    // descriptor.  `Stdio::from_raw_fd()` takes ownership of it.  The
+    // fd is not used after this point.
+    unsafe { Stdio::from_raw_fd(stream.into_raw_fd()) }
+}
+
 /// Spawns the test binary as the main child process.
 ///
 /// Reads the binary path and test name from the kernel command line
@@ -28,12 +47,20 @@ use tracing::{debug, error, trace, warn};
 /// The container tier must have already bound Unix listeners at the
 /// corresponding vsock listener paths before the VM booted, so these
 /// connections succeed immediately.
-pub async fn spawn_main_process() -> Child {
+///
+/// # Errors
+///
+/// Returns a [`SpawnError`] if:
+/// - No test binary was specified on the command line.
+/// - A vsock connection for stdout or stderr cannot be established.
+/// - The child process fails to spawn.
+/// - The child exits before its PID can be read.
+pub async fn spawn_main_process() -> Result<Child, SpawnError> {
     debug!("spawning main process");
 
     let mut args = std::env::args();
     if args.len() < 2 {
-        fatal!("no main process specified to init process");
+        return Err(SpawnError::NoMainProcess);
     }
 
     args.next().expect("argv[0] missing"); // skip self
@@ -42,18 +69,23 @@ pub async fn spawn_main_process() -> Child {
     // has already bound Unix listeners at the corresponding paths, so
     // these connections succeed immediately.
     let stdout_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDOUT.port);
-    let stdout_stream = vsock::VsockStream::connect(&stdout_addr)
-        .unwrap_or_else(|e| fatal!("failed to connect stdout vsock: {e}"));
+    let stdout_stream = vsock::VsockStream::connect(&stdout_addr).map_err(|e| {
+        SpawnError::VsockConnect {
+            channel: "stdout",
+            source: e,
+        }
+    })?;
 
     let stderr_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDERR.port);
-    let stderr_stream = vsock::VsockStream::connect(&stderr_addr)
-        .unwrap_or_else(|e| fatal!("failed to connect stderr vsock: {e}"));
+    let stderr_stream = vsock::VsockStream::connect(&stderr_addr).map_err(|e| {
+        SpawnError::VsockConnect {
+            channel: "stderr",
+            source: e,
+        }
+    })?;
 
-    // SAFETY: `VsockStream::into_raw_fd()` returns a valid, owned file
-    // descriptor.  `Stdio::from_raw_fd()` takes ownership of it.  The
-    // fd is not used after this point.
-    let stdout_stdio = unsafe { Stdio::from_raw_fd(stdout_stream.into_raw_fd()) };
-    let stderr_stdio = unsafe { Stdio::from_raw_fd(stderr_stream.into_raw_fd()) };
+    let stdout_stdio = vsock_stream_to_stdio(stdout_stream);
+    let stderr_stdio = vsock_stream_to_stdio(stderr_stream);
 
     let child = Command::new(args.next().expect("argv[1] missing: no test binary specified"))
         .args(args)
@@ -65,83 +97,93 @@ pub async fn spawn_main_process() -> Child {
         .env("PATH", "/bin")
         .env("LD_LIBRARY_PATH", "/lib")
         .env("RUST_BACKTRACE", "1")
-        .spawn()
-        .unwrap_or_else(|e| fatal!("failed to spawn test process: {e}"));
+        .spawn()?;
 
     if let Some(pid) = child.id() {
         debug!("main process spawned with PID: {pid}");
     } else {
-        fatal!("unable to determine main PID");
+        return Err(SpawnError::NoPid);
     }
-    child
+    Ok(child)
 }
 
 /// Reaps all orphaned child processes via non-blocking `waitpid`.
 ///
-/// Returns `None` if all reaped processes exited cleanly, or `Some(())`
-/// if any process exited with a non-zero status or was killed by a signal.
-/// This distinction matters because leaked processes are treated as a test
-/// failure.
+/// Returns [`ReapOutcome::Clean`] if all reaped processes exited with
+/// status 0, or [`ReapOutcome::LeakedProcesses`] if any process exited
+/// with a non-zero status or was killed by a signal.
 #[tracing::instrument(level = "debug")]
-pub fn reap() -> Option<()> {
-    let mut success = true;
+pub fn reap() -> ReapOutcome {
+    let mut clean = true;
     const ANY_CHILD: Pid = Pid::from_raw(-1);
     loop {
         match waitpid(ANY_CHILD, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(pid, status)) => {
                 if status != 0 {
                     warn!("orphaned process {pid} exited with status {status}");
-                    success = false;
+                    clean = false;
                 }
             }
             Ok(WaitStatus::Signaled(pid, signal, _)) => {
                 warn!("orphaned process {pid} killed by signal {signal}");
-                success = false;
+                clean = false;
             }
             Ok(WaitStatus::StillAlive) => {
                 break;
             }
             Ok(status) => {
                 debug!("unexpected waitpid status in init: {status:?}");
-                success = false;
+                clean = false;
                 continue;
             }
             Err(e) => {
                 warn!("unexpected errno from waitpid in init: {e}");
+                break;
             }
         }
     }
-    if success { None } else { Some(()) }
+    if clean {
+        ReapOutcome::Clean
+    } else {
+        ReapOutcome::LeakedProcesses
+    }
 }
 
 /// Sends a signal to all processes except init (PID 1).
 ///
 /// Uses `kill(-1, signal)` which targets every process the caller has
-/// permission to signal.  Returns `Some(())` if at least one process
-/// received the signal, `None` if no processes were found (`ESRCH`).
+/// permission to signal.  Returns [`BroadcastSignalOutcome::Delivered`]
+/// if at least one process received the signal, or
+/// [`BroadcastSignalOutcome::NoProcesses`] if no processes were found
+/// (`ESRCH`).
 ///
-/// Calls [`fatal!`] on `EPERM` or unexpected errors, since an init
-/// system that cannot signal its children is in an unrecoverable state.
+/// # Errors
+///
+/// Returns a [`BroadcastSignalError`] on `EPERM` or unexpected errors,
+/// since an init system that cannot signal its children is in an
+/// unrecoverable state.
 #[tracing::instrument(level = "info")]
-pub fn send_signal_to_all_processes(signal: Signal) -> Option<()> {
-    // Using PID -1 means "all processes that the calling process has permission to send signals to"
+pub fn send_signal_to_all_processes(
+    signal: Signal,
+) -> Result<BroadcastSignalOutcome, BroadcastSignalError> {
+    // Using PID -1 means "all processes that the calling process has
+    // permission to send signals to".
     match kill(Pid::from_raw(-1), signal) {
         Ok(()) => {
             trace!("successfully sent {signal:?} to all processes");
-            Some(())
+            Ok(BroadcastSignalOutcome::Delivered)
         }
         Err(Errno::ESRCH) => {
-            // No processes found - this can happen if we're the only process left
+            // No processes found — this can happen if we're the only
+            // process left.
             trace!("no processes found to send {signal:?} to");
-            None
+            Ok(BroadcastSignalOutcome::NoProcesses)
         }
-        Err(Errno::EPERM) => {
-            // Permission denied for some processes - this is fatal to an init system
-            fatal!("permission denied when sending signal to all processes: signal {signal:?}");
-        }
-        Err(e) => {
-            fatal!("failed to send signal to all processes: {e}");
-        }
+        Err(Errno::EPERM) => Err(BroadcastSignalError::PermissionDenied { signal }),
+        Err(e) => Err(BroadcastSignalError::Failed {
+            signal,
+            source: e,
+        }),
     }
 }
 
@@ -166,74 +208,119 @@ pub fn forward_signal(pid: Pid, sig: Signal) {
 }
 
 /// Maximum number of SIGTERM rounds before giving up.
-const MAX_SIGTERM_ATTEMPTS: u8 = 50;
+pub const MAX_SIGTERM_ATTEMPTS: u8 = 50;
 
 /// Terminates all remaining child processes with SIGTERM.
 ///
 /// Sends up to [`MAX_SIGTERM_ATTEMPTS`] rounds of SIGTERM (with 10 ms
 /// sleeps between rounds), reaping exited processes after each round.
 ///
-/// Returns `None` if no child processes were remaining, or `Some(())`
-/// if processes were found (whether or not they all terminated
-/// successfully).
+/// Returns a [`TerminateOutcome`] describing whether child processes
+/// were found and whether they all terminated successfully.
 #[tracing::instrument(level = "info")]
-pub async fn terminate_remaining_processes() -> Option<()> {
-    if list_child_processes().await.is_empty() {
-        trace!("no child processes remaining");
-        return None;
+pub async fn terminate_remaining_processes() -> TerminateOutcome {
+    match list_child_processes().await {
+        Ok(children) if children.is_empty() => {
+            trace!("no child processes remaining");
+            return TerminateOutcome::NoneRemaining;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // If we can't even list children during shutdown, log it and
+            // assume the worst — try to terminate anyway.
+            error!("failed to list child processes during shutdown: {e}");
+        }
     }
-    if let Some(()) = reap() {
+
+    if !reap().is_clean() {
         warn!("test seems to be leaking processes");
     }
-    // Send SIGTERM to all processes
+
+    // Send SIGTERM to all processes.
     let mut sigs: u8 = 0;
     warn!("sending SIGTERM to all remaining processes");
-    while sigs <= MAX_SIGTERM_ATTEMPTS
-        && let Some(()) = send_signal_to_all_processes(Signal::SIGTERM)
-    {
+    loop {
+        if sigs > MAX_SIGTERM_ATTEMPTS {
+            break;
+        }
+
+        match send_signal_to_all_processes(Signal::SIGTERM) {
+            Ok(BroadcastSignalOutcome::NoProcesses) => {
+                debug!("no more processes to signal");
+                break;
+            }
+            Ok(BroadcastSignalOutcome::Delivered) => {}
+            Err(e) => {
+                // Permission denied or unexpected error from PID 1 is
+                // genuinely unrecoverable.
+                fatal!("unrecoverable error during shutdown signal broadcast: {e}");
+            }
+        }
+
         sigs += 1;
         sleep(Duration::from_millis(10)).await;
-        if let Some(()) = reap() {
+
+        if !reap().is_clean() {
             error!("test is leaking processes");
         }
-        if list_child_processes().await.is_empty() {
-            debug!("no child processes remaining");
-            return Some(());
+
+        match list_child_processes().await {
+            Ok(children) if children.is_empty() => {
+                debug!("all child processes terminated after {sigs} SIGTERM round(s)");
+                return TerminateOutcome::Terminated;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!("failed to list child processes during termination: {e}");
+            }
         }
     }
+
     error!("maximum SIGTERM attempts reached: test did not shut down correctly");
-    return Some(());
+    TerminateOutcome::ExhaustedRetries
 }
 
 /// Lists all direct child processes of init (PPID == 1) by scanning `/proc`.
-pub async fn list_child_processes() -> Vec<Pid> {
+///
+/// # Errors
+///
+/// Returns a [`ListChildrenError`] if `/proc` cannot be read or a child
+/// PID overflows `i32`.
+pub async fn list_child_processes() -> Result<Vec<Pid>, ListChildrenError> {
     let mut child_pids = tokio::fs::read_dir("/proc")
         .await
-        .unwrap_or_else(|e| fatal!("failed to read /proc: {e}"));
+        .map_err(ListChildrenError::ReadDir)?;
     let mut children = vec![];
     while let Some(process) = child_pids
         .next_entry()
         .await
-        .unwrap_or_else(|e| fatal!("failed to read /proc entry: {e}"))
+        .map_err(ListChildrenError::ReadEntry)?
     {
-        let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
+        let name = process.file_name();
+        let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+            // Non-numeric entries (e.g. /proc/self, /proc/net) are expected
+            // and silently skipped.
             continue;
         };
-        let stat = tokio::fs::read_to_string(format!("/proc/{}/stat", pid)).await;
+        let stat = tokio::fs::read_to_string(format!("/proc/{pid}/stat")).await;
         let Ok(stat) = stat else {
+            // The process may have exited between readdir and this read.
+            trace!("could not read /proc/{pid}/stat (process likely exited)");
             continue;
         };
-        let Some(ppid) = stat.split_whitespace().nth(3) else {
+        let Some(ppid_str) = stat.split_whitespace().nth(3) else {
+            trace!("/proc/{pid}/stat has unexpected format (missing field 3)");
             continue;
         };
-        let Ok(ppid) = ppid.parse::<u32>() else {
+        let Ok(ppid) = ppid_str.parse::<u32>() else {
+            trace!("/proc/{pid}/stat field 3 is not a valid u32: {ppid_str:?}");
             continue;
         };
         if ppid == 1 {
-            let pid = i32::try_from(pid)
-                .unwrap_or_else(|_| fatal!("child pid {pid} overflows i32"));
-            children.push(Pid::from_raw(pid));
+            let pid_i32 =
+                i32::try_from(pid).map_err(|_| ListChildrenError::PidOverflow { pid })?;
+            children.push(Pid::from_raw(pid_i32));
         }
     }
-    children
+    Ok(children)
 }
