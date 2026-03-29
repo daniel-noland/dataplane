@@ -194,17 +194,8 @@ fn resolve_device_groups() -> Result<Vec<String>, ContainerError> {
 /// Returns a [`ContainerError`] if any filesystem lookup or validation
 /// step fails.
 fn resolve_test_params<F: FnOnce()>() -> Result<ContainerParams, ContainerError> {
-    // type_name for a function item type always contains "::" because it
-    // is fully qualified (e.g. "crate::module::function").  If this
-    // invariant is violated, the Rust compiler changed its type_name
-    // format in an incompatible way.
-    // When `F` is a reference to a function item the output of
-    // `type_name` is prefixed with `"&"`.  Strip it for consistency
-    // with `run_in_vm` (vm.rs), which performs the same trimming.
-    let type_name = std::any::type_name::<F>().trim_start_matches('&');
-    let (_, test_name) = type_name.split_once("::").unwrap_or_else(|| {
-        unreachable!("std::any::type_name::<F>() did not contain '::': {type_name:?}")
-    });
+    let identity = crate::test_identity::TestIdentity::resolve::<F>();
+    let test_name = identity.test_name;
 
     let bin_path = std::fs::read_link("/proc/self/exe")
         .map_err(ContainerError::BinaryPathRead)?;

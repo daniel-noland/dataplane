@@ -33,6 +33,7 @@ pub mod hypervisor;
 
 mod abort_on_drop;
 mod container;
+mod test_identity;
 mod vm;
 
 pub use container::{ContainerTestResult, run_test_in_vm};
