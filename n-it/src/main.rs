@@ -32,6 +32,7 @@ mod utils;
 
 mod child;
 mod mount;
+mod signal;
 
 mod init;
 mod vsock_writer;
