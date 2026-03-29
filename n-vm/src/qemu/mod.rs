@@ -21,13 +21,13 @@
 //!
 //! # Architecture differences from cloud-hypervisor
 //!
-//! | Concern | cloud-hypervisor | QEMU |
-//! |---------|------------------|------|
-//! | Boot model | `create_vm` + `boot_vm` REST | Boots on process start |
-//! | Control | REST API over Unix socket | QMP (JSON-RPC) over Unix socket |
-//! | Events | `--event-monitor fd=N` pipe | QMP async events |
-//! | Shutdown | `shutdown_vm()` + `shutdown_vmm()` | `system_powerdown` + `quit` |
-//! | Config | JSON `VmConfig` body | Command-line arguments |
+//! | Concern    | cloud-hypervisor                   | QEMU                            |
+//! |------------|------------------------------------|---------------------------------|
+//! | Boot model | `create_vm` + `boot_vm` REST       | Boots on process start          |
+//! | Control    | REST API over Unix socket          | QMP (JSON-RPC) over Unix socket |
+//! | Events     | `--event-monitor fd=N` pipe        | QMP async events                |
+//! | Shutdown   | `shutdown_vm()` + `shutdown_vmm()` | `system_powerdown` + `quit`     |
+//! | Config     | JSON `VmConfig` body               | Command-line arguments          |
 //!
 //! # vsock bridging
 //!
