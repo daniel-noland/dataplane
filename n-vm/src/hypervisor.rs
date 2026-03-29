@@ -24,6 +24,8 @@ use tokio_stream::StreamExt;
 use tokio_util::bytes::{Buf, BytesMut};
 use tracing::warn;
 
+pub use crate::backend::HypervisorVerdict;
+
 /// The component that emitted a hypervisor event.
 #[derive(Debug, Copy, Clone, Deserialize)]
 pub enum Source {
@@ -98,30 +100,6 @@ where
 {
     let opt = Option::deserialize(deserializer)?;
     Ok(opt.unwrap_or_default())
-}
-
-/// Verdict from the hypervisor event watcher indicating how the VM
-/// session ended.
-///
-/// This replaces a bare `bool` return, making call sites self-documenting
-/// and preventing accidental inversion of the success/failure logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HypervisorVerdict {
-    /// The VMM emitted a clean `Shutdown` event with no preceding guest
-    /// panic or event-stream errors.
-    CleanShutdown,
-    /// The VM session ended abnormally -- a guest panic was detected, the
-    /// event stream contained deserialization errors, or the stream ended
-    /// without a clean shutdown event.
-    Failure,
-}
-
-impl HypervisorVerdict {
-    /// Returns `true` if the VM shut down cleanly.
-    #[must_use]
-    pub fn is_success(self) -> bool {
-        matches!(self, Self::CleanShutdown)
-    }
 }
 
 /// Computes the [`HypervisorVerdict`] from a collected event log and a

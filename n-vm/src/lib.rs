@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Open Network Fabric Authors
+
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
@@ -7,12 +10,21 @@
 //!
 //! - **Host tier** ([`run_test_in_vm`]) -- launches a Docker container with the
 //!   required devices and capabilities.
-//! - **Container tier** ([`run_in_vm`] / [`TestVm`]) -- launches a
-//!   cloud-hypervisor VM with virtiofsd, monitors hypervisor events, and
+//! - **Container tier** ([`run_in_vm`] / [`TestVm`]) -- launches a VM via
+//!   a pluggable [`HypervisorBackend`], monitors lifecycle events, and
 //!   collects test output.
 //!
 //! The innermost tier (the VM guest init system) is provided by the `n-it`
 //! crate.
+//!
+//! # Hypervisor backends
+//!
+//! The [`backend`] module defines the [`HypervisorBackend`] trait that
+//! abstracts over different hypervisors.  The
+//! [`cloud_hypervisor`] module provides the default implementation
+//! ([`CloudHypervisor`]).  [`TestVm`] is generic over the backend, and
+//! the convenience function [`run_in_vm`] currently hardcodes the
+//! [`CloudHypervisor`] backend.
 //!
 //! # Error handling
 //!
@@ -27,6 +39,8 @@
 //! without requiring downstream crates to add `n-vm-protocol` as a direct
 //! dependency.
 
+pub mod backend;
+pub mod cloud_hypervisor;
 pub mod dispatch;
 pub mod error;
 pub mod hypervisor;
@@ -36,6 +50,8 @@ mod container;
 mod test_identity;
 mod vm;
 
+pub use backend::{HypervisorBackend, HypervisorVerdict, LaunchedHypervisor};
+pub use cloud_hypervisor::CloudHypervisor;
 pub use container::{ContainerTestResult, run_test_in_vm};
 pub use dispatch::{is_in_test_container, is_in_vm, run_container_tier, run_host_tier};
 pub use error::{ContainerError, VmError};
