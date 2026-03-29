@@ -52,7 +52,7 @@ const ESSENTIAL_MOUNTS: &[MountEntry] = &[
 /// Maximum number of `EBUSY` retries per mount point before giving up.
 ///
 /// At 1 ms per retry this gives each mount point up to ~1 second to
-/// become idle — more than enough for well-behaved tests.
+/// become idle -- more than enough for well-behaved tests.
 const UMOUNT_MAX_EBUSY_RETRIES: u32 = 1_000;
 
 /// Mounts the essential virtual filesystems required by the guest OS.
@@ -241,7 +241,7 @@ mod tests {
             let parent = entry.target;
             for later in &ESSENTIAL_MOUNTS[i + 1..] {
                 if later.target.starts_with(parent) && later.target != parent {
-                    // A child of `parent` appears later — this is correct.
+                    // A child of `parent` appears later -- this is correct.
                     // The reverse unmount order will process the child first.
                     //
                     // Now verify the *inverse* is not also true (which would

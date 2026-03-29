@@ -63,7 +63,7 @@ pub struct SignalSpec {
 /// be marked as failed.  **Benign signals** are forwarded without
 /// affecting the test outcome.
 ///
-/// `SIGCHLD` is intentionally omitted — leaked child processes are
+/// `SIGCHLD` is intentionally omitted -- leaked child processes are
 /// detected after the main test process exits, during the shutdown
 /// sequence.
 ///
@@ -137,7 +137,7 @@ impl SignalSet {
                 loop {
                     handler.recv().await;
                     // If the receiver has been dropped the orchestrator is
-                    // shutting down — stop forwarding.
+                    // shutting down -- stop forwarding.
                     if tx.send(spec).is_err() {
                         break;
                     }
@@ -282,7 +282,7 @@ mod tests {
         );
     }
 
-    /// SIGCHLD is intentionally excluded from the table — child reaping
+    /// SIGCHLD is intentionally excluded from the table -- child reaping
     /// is handled after the main test process exits, not via the signal
     /// dispatch loop.  This test ensures it is never accidentally added.
     #[test]
