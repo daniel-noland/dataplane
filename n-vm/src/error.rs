@@ -8,9 +8,9 @@
 //!
 //! Each tier of the nested test environment has its own error enum:
 //!
-//! - [`VmError`] — failures in the **container → VM** tier
+//! - [`VmError`] -- failures in the **container -> VM** tier
 //!   ([`run_in_vm`](crate::run_in_vm) / [`TestVm`](crate::vm::TestVm)).
-//! - [`ContainerError`] — failures in the **host → container** tier
+//! - [`ContainerError`] -- failures in the **host -> container** tier
 //!   ([`run_test_in_vm`](crate::run_test_in_vm)).
 //!
 //! Cloud-hypervisor API errors are captured as `String` descriptions
@@ -121,10 +121,6 @@ pub enum VmError {
     },
 
     /// The cloud-hypervisor API rejected the `create_vm` request.
-    ///
-    /// The `reason` field contains the stringified API error because the
-    /// generated client crate's error type does not implement
-    /// [`std::error::Error`].
     #[error("failed to create VM via hypervisor API: {reason}")]
     VmCreate {
         /// Stringified error from the cloud-hypervisor API client.
@@ -132,8 +128,6 @@ pub enum VmError {
     },
 
     /// The cloud-hypervisor API rejected the `boot_vm` request.
-    ///
-    /// See [`VmCreate`](Self::VmCreate) for why this uses a `String`.
     #[error("failed to boot VM via hypervisor API: {reason}")]
     VmBoot {
         /// Stringified error from the cloud-hypervisor API client.
