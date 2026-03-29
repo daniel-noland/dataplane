@@ -27,18 +27,169 @@ use std::path::PathBuf;
 
 // == Container image ==
 
-/// Docker image used by the host tier to launch the test container.
+/// Default Docker image used by the host tier to launch the test container.
 ///
 /// This image contains the hypervisor binaries (cloud-hypervisor, and
 /// eventually QEMU), virtiofsd, the `n-it` init system binary, and a
 /// minimal Linux kernel (`bzImage`).
 ///
-/// TODO: make this configurable (e.g. via environment variable or builder
-/// pattern) so that CI and local development can use different images.
-pub const CONTAINER_IMAGE: &str = "ghcr.io/githedgehog/testn/n-vm:v0.0.9";
+/// This default is used when neither [`ENV_CONTAINER_IMAGE`] nor
+/// [`ENV_TEST_ROOT`] is set.  When [`ENV_TEST_ROOT`] is set the test
+/// infrastructure runs in *scratch mode* (see [`ScratchRoots`]), and
+/// this constant is ignored.
+pub const CONTAINER_IMAGE_DEFAULT: &str = "ghcr.io/githedgehog/testn/n-vm:v0.0.9";
+
+/// Environment variable that overrides the Docker image used for the
+/// test container.
+///
+/// When set, its value is used as the image name instead of
+/// [`CONTAINER_IMAGE_DEFAULT`].  This is a simpler alternative to full
+/// scratch mode for cases where a custom pre-built image is desired.
+///
+/// This variable is ignored when [`ENV_TEST_ROOT`] is set (scratch mode
+/// takes precedence).
+pub const ENV_CONTAINER_IMAGE: &str = "N_VM_CONTAINER_IMAGE";
 
 /// Platform string passed to the Docker engine when creating the container.
 pub const CONTAINER_PLATFORM: &str = "linux/amd64";
+
+// == Scratch container mode ==
+//
+// In scratch mode the test infrastructure replaces the pre-built
+// container image with a `scratch` (empty) Docker image and
+// volume-mounts nix-built directory trees into it.  This eliminates
+// version drift between the nix store paths baked into test binary
+// rpaths and the libraries shipped in the container image.
+//
+// Two root directories are required:
+//
+// - **testroot** -- container-tier tools (hypervisor binaries,
+//   virtiofsd, kernel image).  Subdirectories are mounted at their
+//   standard container paths (`/bin`, `/lib`, etc.).
+//
+// - **vmroot** -- VM guest root filesystem shared via virtiofsd.
+//   Contains the `n-it` init binary, glibc/libgcc runtime libraries,
+//   and a `/nix -> /nix` symlink so guest processes can resolve nix
+//   store rpaths through virtiofsd's `--no-sandbox` mode.
+//
+// The host's `/nix/store` is mounted read-only into the container so
+// that the symlinks produced by nix's `symlinkJoin` resolve correctly.
+//
+// See `development/ideam.md` for the full design rationale.
+
+/// Environment variable pointing to the resolved `testroot` directory.
+///
+/// When set, the test infrastructure switches to *scratch mode*: it
+/// launches a minimal (empty) Docker image and volume-mounts this
+/// directory's contents at the standard container paths (`/bin`, `/lib`,
+/// etc.), along with a read-only `/nix/store` bind mount from the host.
+///
+/// The value must be an absolute path to the nix-built `testroot`
+/// symlink (or the store path it resolves to).
+pub const ENV_TEST_ROOT: &str = "N_VM_TEST_ROOT";
+
+/// Environment variable pointing to the resolved `vmroot` directory.
+///
+/// In scratch mode this directory is volume-mounted at
+/// [`VM_ROOT_SHARE_PATH`] inside the container.  virtiofsd then
+/// exposes it as the VM guest's root filesystem.
+///
+/// The value must be an absolute path to the nix-built `vmroot`
+/// symlink (or the store path it resolves to).
+pub const ENV_VM_ROOT: &str = "N_VM_VM_ROOT";
+
+/// Resolved scratch-mode root directories.
+///
+/// This struct is returned by [`ScratchRoots::from_env`] when both
+/// [`ENV_TEST_ROOT`] and [`ENV_VM_ROOT`] are set.  It carries the
+/// resolved (canonicalized) paths so that the container configuration
+/// code does not need to repeat the resolution logic.
+#[derive(Debug, Clone)]
+pub struct ScratchRoots {
+    /// Absolute path to the `testroot` directory (container-tier tools).
+    pub test_root: PathBuf,
+    /// Absolute path to the `vmroot` directory (VM guest root filesystem).
+    pub vm_root: PathBuf,
+}
+
+impl ScratchRoots {
+    /// Attempts to resolve scratch-mode roots from the environment.
+    ///
+    /// Returns `Some(ScratchRoots)` when both [`ENV_TEST_ROOT`] and
+    /// [`ENV_VM_ROOT`] are set and point to existing directories.
+    /// Returns `None` if either variable is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a variable is set but the path does not exist
+    /// or cannot be canonicalized.
+    pub fn from_env() -> Result<Option<Self>, ScratchRootError> {
+        let test_root_raw = match std::env::var(ENV_TEST_ROOT) {
+            Ok(v) if !v.is_empty() => v,
+            _ => return Ok(None),
+        };
+        let vm_root_raw = match std::env::var(ENV_VM_ROOT) {
+            Ok(v) if !v.is_empty() => v,
+            _ => return Ok(None),
+        };
+
+        let test_root =
+            std::fs::canonicalize(&test_root_raw).map_err(|source| ScratchRootError {
+                var: ENV_TEST_ROOT,
+                path: PathBuf::from(&test_root_raw),
+                source,
+            })?;
+        let vm_root = std::fs::canonicalize(&vm_root_raw).map_err(|source| ScratchRootError {
+            var: ENV_VM_ROOT,
+            path: PathBuf::from(&vm_root_raw),
+            source,
+        })?;
+
+        Ok(Some(Self { test_root, vm_root }))
+    }
+}
+
+/// Error returned when a scratch-mode environment variable is set but
+/// the path it references cannot be resolved.
+#[derive(Debug)]
+pub struct ScratchRootError {
+    /// The environment variable name that was set.
+    pub var: &'static str,
+    /// The raw path value from the environment.
+    pub path: PathBuf,
+    /// The underlying I/O error from canonicalization.
+    pub source: std::io::Error,
+}
+
+impl std::fmt::Display for ScratchRootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "scratch root {} = {:?} is not accessible",
+            self.var, self.path
+        )
+    }
+}
+
+impl std::error::Error for ScratchRootError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Returns the Docker image name to use for the test container.
+///
+/// Resolution order:
+/// 1. If [`ENV_CONTAINER_IMAGE`] is set, its value is returned.
+/// 2. Otherwise, [`CONTAINER_IMAGE_DEFAULT`] is returned.
+///
+/// Callers should check [`ScratchRoots::from_env`] *first*.  If scratch
+/// mode is active the image name is irrelevant (a locally-created empty
+/// image is used instead).
+#[must_use]
+pub fn container_image() -> String {
+    std::env::var(ENV_CONTAINER_IMAGE).unwrap_or_else(|_| CONTAINER_IMAGE_DEFAULT.to_owned())
+}
 
 // == Environment variables ==
 
