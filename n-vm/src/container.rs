@@ -137,19 +137,31 @@ fn read_only_bind_mount(source: &str, target: String) -> bollard::models::Mount 
 fn resolve_device_groups() -> Result<Vec<String>, ContainerError> {
     use std::os::unix::fs::MetadataExt;
 
-    let docker_host = std::env::var("DOCKER_HOST")
-        .unwrap_or("/var/run/docker.sock".into())
-        .trim_start_matches("unix://")
-        .to_string();
+    // Resolve the Docker socket path from DOCKER_HOST, if it points to a
+    // local Unix socket.  Non-Unix schemes (e.g. tcp://) have no local
+    // file to stat, so the Docker socket group is omitted in that case.
+    //
+    // Uses `strip_prefix` (not `trim_start_matches`) to avoid stripping
+    // the prefix more than once (e.g. "unix://unix://foo" → "foo").
+    let docker_socket_path: Option<String> = match std::env::var("DOCKER_HOST") {
+        Ok(host) => match host.strip_prefix("unix://") {
+            Some(path) => Some(path.to_string()),
+            // Non-Unix schemes (e.g. tcp://) have no local socket to stat.
+            None if host.contains("://") => None,
+            // Bare path with no scheme — treat as a Unix socket path.
+            None => Some(host),
+        },
+        Err(_) => Some("/var/run/docker.sock".into()),
+    };
 
     // Derive the list from REQUIRED_DEVICES (the same array used for
-    // --device mappings) plus the Docker socket.  This prevents drift
-    // between the two lists — previously /dev/net/tun was in
-    // REQUIRED_DEVICES but absent here.
+    // --device mappings) plus the Docker socket (when local).  This
+    // prevents drift between the two lists — previously /dev/net/tun
+    // was in REQUIRED_DEVICES but absent here.
     let required_files: Vec<String> = REQUIRED_DEVICES
         .iter()
         .map(|&s| s.to_string())
-        .chain(std::iter::once(docker_host))
+        .chain(docker_socket_path)
         .collect();
 
     let mut groups: Vec<String> = required_files
