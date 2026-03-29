@@ -30,6 +30,9 @@ use tokio_vsock::VMADDR_CID_HOST;
 #[macro_use]
 mod utils;
 
+mod child;
+mod mount;
+
 mod init;
 mod vsock_writer;
 
