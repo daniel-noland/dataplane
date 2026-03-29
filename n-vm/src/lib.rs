@@ -47,4 +47,4 @@ pub use n_vm_protocol::{
     VIRTIOFSD_BINARY_PATH, VIRTIOFSD_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VM_GUEST_CID,
     VM_ROOT_SHARE_PATH, VM_RUN_DIR, VsockChannel,
 };
-pub use vm::{TestVm, TestVmParams, VmTestOutput, run_in_vm};
+pub use vm::{ProcessOutput, TestVm, TestVmParams, VmTestOutput, run_in_vm};

@@ -271,29 +271,60 @@ fn spawn_kernel_log_reader() -> AbortOnDrop<String> {
 
 // ── Helper: process output collection ────────────────────────────────
 
+/// Collected stdout and stderr from a child process.
+///
+/// This replaces the previous `(bool, String, String)` tuple return from
+/// `collect_process_output`, making call sites self-documenting and
+/// enabling reuse as a sub-struct inside [`VmTestOutput`].
+pub struct ProcessOutput {
+    /// Whether the process exited successfully (status code 0).
+    ///
+    /// Set to `false` if the process exited with a non-zero status or if
+    /// its output could not be collected due to an I/O error.
+    pub success: bool,
+    /// Captured stdout as a lossy UTF-8 string.
+    pub stdout: String,
+    /// Captured stderr as a lossy UTF-8 string.
+    ///
+    /// On I/O failure during collection, this contains a diagnostic
+    /// message instead of the actual process output.
+    pub stderr: String,
+}
+
+impl ProcessOutput {
+    /// Formats the stdout and stderr sections with the given label prefix
+    /// for inclusion in [`VmTestOutput`]'s `Display` output.
+    fn fmt_sections(&self, f: &mut std::fmt::Formatter<'_>, label: &str) -> std::fmt::Result {
+        writeln!(f, "--------------- {label} stdout ---------------")?;
+        writeln!(f, "{}", self.stdout)?;
+        writeln!(f, "--------------- {label} stderr ---------------")?;
+        writeln!(f, "{}", self.stderr)
+    }
+}
+
 /// Waits for a child process to exit and collects its stdout/stderr as
 /// UTF-8 strings.
 ///
-/// Returns `(exit_ok, stdout, stderr)`.  On I/O failure the process is
-/// treated as failed and the error is placed in the stderr string so that
-/// it still appears in [`VmTestOutput`]'s `Display` output.
+/// On I/O failure the process is treated as failed and the error is placed
+/// in the stderr string so that it still appears in [`VmTestOutput`]'s
+/// `Display` output.
 async fn collect_process_output(
     child: tokio::process::Child,
     label: &str,
-) -> (bool, String, String) {
+) -> ProcessOutput {
     match child.wait_with_output().await {
-        Ok(output) => (
-            output.status.success(),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ),
+        Ok(output) => ProcessOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
         Err(err) => {
             error!("failed to collect {label} output: {err}");
-            (
-                false,
-                String::new(),
-                format!("!!!OUTPUT UNAVAILABLE: {err}!!!"),
-            )
+            ProcessOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: format!("!!!OUTPUT UNAVAILABLE: {err}!!!"),
+            }
         }
     }
 }
@@ -491,24 +522,19 @@ pub struct VmTestOutput {
     /// 3. The cloud-hypervisor process exited with status 0.
     /// 4. The virtiofsd process exited with status 0.
     pub success: bool,
-    /// Captured stdout from the test process (via vsock).
-    pub stdout: String,
-    /// Captured stderr from the test process (via vsock).
-    pub stderr: String,
+    /// Captured stdout and stderr from the test process (via vsock).
+    pub test: ProcessOutput,
     /// Kernel serial console output (from the guest's `ttyS0`).
     pub console: String,
     /// Tracing output from the `n-it` init system, streamed via vsock.
     pub init_trace: String,
-    /// Captured stdout from the cloud-hypervisor process itself.
-    pub hypervisor_stdout: String,
-    /// Captured stderr from the cloud-hypervisor process itself.
-    pub hypervisor_stderr: String,
-    /// Captured stdout from the virtiofsd process.
-    pub virtiofsd_stdout: String,
-    /// Captured stderr from the virtiofsd process.
-    pub virtiofsd_stderr: String,
+    /// Captured stdout, stderr, and exit status of the cloud-hypervisor
+    /// process itself.
+    pub hypervisor: ProcessOutput,
     /// Cloud-hypervisor lifecycle events collected during the VM's lifetime.
     pub hypervisor_events: Vec<hypervisor::Event>,
+    /// Captured stdout, stderr, and exit status of the virtiofsd process.
+    pub virtiofsd: ProcessOutput,
 }
 
 impl std::fmt::Display for VmTestOutput {
@@ -522,22 +548,13 @@ impl std::fmt::Display for VmTestOutput {
                 event.timestamp, event.source, event.event, event.properties
             )?;
         }
-        writeln!(f, "--------------- cloud-hypervisor stdout ---------------")?;
-        writeln!(f, "{}", self.hypervisor_stdout)?;
-        writeln!(f, "--------------- cloud-hypervisor stderr ---------------")?;
-        writeln!(f, "{}", self.hypervisor_stderr)?;
-        writeln!(f, "--------------- virtiofsd stdout ---------------")?;
-        writeln!(f, "{}", self.virtiofsd_stdout)?;
-        writeln!(f, "--------------- virtiofsd stderr ---------------")?;
-        writeln!(f, "{}", self.virtiofsd_stderr)?;
+        self.hypervisor.fmt_sections(f, "cloud-hypervisor")?;
+        self.virtiofsd.fmt_sections(f, "virtiofsd")?;
         writeln!(f, "--------------- linux console ---------------")?;
         writeln!(f, "{}", self.console)?;
         writeln!(f, "--------------- init system ---------------")?;
         writeln!(f, "{}", self.init_trace)?;
-        writeln!(f, "--------------- test stdout ---------------")?;
-        writeln!(f, "{}", self.stdout)?;
-        writeln!(f, "--------------- test stderr ---------------")?;
-        writeln!(f, "{}", self.stderr)?;
+        self.test.fmt_sections(f, "test")?;
         Ok(())
     }
 }
@@ -720,14 +737,12 @@ impl TestVm {
             debug!("vmm shutdown: {err}");
         }
 
-        let (hypervisor_exit_ok, hypervisor_stdout, hypervisor_stderr) =
-            collect_process_output(hypervisor, "cloud-hypervisor").await;
+        let hypervisor_output = collect_process_output(hypervisor, "cloud-hypervisor").await;
 
         // The kernel serial socket closes when the hypervisor exits.
         let kernel_log = join_or_fallback(kernel_log, "kernel log").await;
 
-        let (virtiofsd_exit_ok, virtiofsd_stdout, virtiofsd_stderr) =
-            collect_process_output(virtiofsd, "virtiofsd").await;
+        let virtiofsd_output = collect_process_output(virtiofsd, "virtiofsd").await;
 
         // ── Assemble result ──────────────────────────────────────────
         //
@@ -743,20 +758,28 @@ impl TestVm {
         // forward the test process's exit code over a dedicated channel.
         let test_passed = !test_stdout.contains("test result: FAILED");
 
-        VmTestOutput {
-            success: test_passed
-                && virtiofsd_exit_ok
-                && hypervisor_verdict.is_success()
-                && hypervisor_exit_ok,
+        let test_output = ProcessOutput {
+            // The test process runs inside the VM — its exit code is not
+            // directly observable from the container tier.  We rely on the
+            // test harness summary line (checked via test_passed above) and
+            // on n-it's behavior of aborting on test failure (which triggers
+            // a guest panic detected by hypervisor_verdict).
+            success: test_passed,
             stdout: test_stdout,
             stderr: test_stderr,
+        };
+
+        VmTestOutput {
+            success: test_output.success
+                && virtiofsd_output.success
+                && hypervisor_verdict.is_success()
+                && hypervisor_output.success,
+            test: test_output,
             console: kernel_log,
             init_trace,
-            hypervisor_stdout,
-            hypervisor_stderr,
-            virtiofsd_stdout,
-            virtiofsd_stderr,
+            hypervisor: hypervisor_output,
             hypervisor_events,
+            virtiofsd: virtiofsd_output,
         }
     }
 }
