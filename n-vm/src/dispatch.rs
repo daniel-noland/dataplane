@@ -133,12 +133,12 @@ pub fn run_container_tier<F: FnOnce()>(test_fn: F) {
 /// - The container exits with a non-zero code.
 /// - The container does not report an exit code at all.
 pub fn run_host_tier<F: FnOnce()>(test_fn: F) {
-    eprintln!("•─────⋅☾☾☾☾BEGIN NESTED TEST ENVIRONMENT☽☽☽☽⋅─────•");
+    eprintln!("===== BEGIN NESTED TEST ENVIRONMENT =====");
 
     let container_state = crate::run_test_in_vm(test_fn)
         .unwrap_or_else(|err| panic!("test container infrastructure error: {err:#?}"));
 
-    eprintln!("•─────⋅☾☾☾☾ END NESTED TEST ENVIRONMENT ☽☽☽☽⋅─────•");
+    eprintln!("=====  END NESTED TEST ENVIRONMENT  =====");
 
     match container_state.exit_code {
         Some(0) => {}
