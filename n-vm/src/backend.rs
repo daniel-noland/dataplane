@@ -107,13 +107,123 @@ pub struct LaunchedHypervisor<B: HypervisorBackend> {
 ///
 /// # Adding a new backend
 ///
-/// 1. Create a new module (e.g. `qemu.rs`).
-/// 2. Define a unit struct implementing this trait.
-/// 3. Implement the [`launch`](Self::launch) and
-///    [`shutdown`](Self::shutdown) methods.
-/// 4. Wire the backend into [`TestVm`](crate::vm::TestVm) (currently
-///    hardcoded to
-///    [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor)).
+/// Use the [`cloud_hypervisor`](crate::cloud_hypervisor) module as a
+/// reference implementation.  The steps below outline the minimum work
+/// required; see the cloud-hypervisor backend for concrete examples of
+/// each step.
+///
+/// ## 1. Create the backend module
+///
+/// Create a new module directory (e.g. `src/qemu/mod.rs`) with at least:
+///
+/// - A **unit struct** (e.g. `pub struct Qemu;`) that serves as the type
+///   tag for the backend.
+/// - An **error submodule** (`error.rs`) defining a backend-specific
+///   error enum (e.g. `QemuError`).  Only failure modes unique to the
+///   backend belong here; generic errors like KVM accessibility and
+///   process spawning already have variants in
+///   [`VmError`](crate::error::VmError).
+/// - An **event submodule** (if needed) for the backend's event/monitor
+///   protocol (e.g. QMP for QEMU).
+///
+/// ## 2. Define associated types
+///
+/// Implement `HypervisorBackend` on the unit struct.  The two associated
+/// types require some thought:
+///
+/// - **`EventLog`** -- a type that collects lifecycle events during the
+///   VM's lifetime.  Must implement [`Display`](std::fmt::Display) (for
+///   test failure diagnostics), [`Debug`], [`Default`] (for the fallback
+///   path when the event watcher task panics), and [`Send`].
+///
+/// - **`Controller`** -- a handle for lifecycle control (e.g. a QMP
+///   socket connection, a REST API client).  Must be [`Send`] because it
+///   is held across `.await` points.  Typically wrapped in
+///   `Arc<tokio::sync::Mutex<_>>` if the underlying client is not `Sync`.
+///
+/// ## 3. Implement `launch`
+///
+/// The [`launch`](Self::launch) method must:
+///
+/// 1. Run pre-flight checks.  Use the shared
+///    [`check_kvm_accessible()`](crate::vm::check_kvm_accessible) utility
+///    for the `/dev/kvm` check.
+/// 2. Set up any monitoring channels (pipes, sockets, etc.) that the
+///    hypervisor process needs.
+/// 3. Spawn the hypervisor binary with `kill_on_drop(true)`, piped
+///    stdout/stderr, and null stdin.
+/// 4. Wait for the hypervisor to become ready.  Use the shared
+///    [`wait_for_socket()`](crate::vm::wait_for_socket) utility if the
+///    readiness signal is a socket appearing on the filesystem.
+/// 5. Spawn a background event-monitoring task wrapped in
+///    [`AbortOnDrop`](crate::abort_on_drop::AbortOnDrop) that resolves
+///    to `(Self::EventLog, HypervisorVerdict)`.
+/// 6. Return a [`LaunchedHypervisor`] with the child process, event
+///    watcher, and controller.
+///
+/// Backend-specific errors should be defined in the backend's error
+/// module and converted to [`VmError::Backend`](crate::error::VmError::Backend)
+/// via a `From` impl:
+///
+/// ```ignore
+/// impl From<QemuError> for VmError {
+///     fn from(err: QemuError) -> Self {
+///         VmError::Backend(Box::new(err))
+///     }
+/// }
+/// ```
+///
+/// ## 4. Implement `shutdown`
+///
+/// The [`shutdown`](Self::shutdown) method is best-effort: log errors but
+/// do not propagate them.  The VM has usually already powered off by the
+/// time this is called (the init system calls `reboot(RB_POWER_OFF)`),
+/// so failures are expected and harmless.
+///
+/// ## 5. Wire into the proc macro
+///
+/// The `#[in_vm]` proc macro (in `n-vm-macros`) generates a call to
+/// [`run_container_tier`](crate::dispatch::run_container_tier) with an
+/// explicit backend type parameter:
+///
+/// ```ignore
+/// ::n_vm::run_container_tier::<::n_vm::CloudHypervisor, _>(test_fn);
+/// ```
+///
+/// To make the new backend available:
+///
+/// 1. Re-export the backend struct from `lib.rs` (e.g.
+///    `pub use qemu::Qemu;`).
+/// 2. Update the proc macro to support backend selection -- either by
+///    changing the hardcoded type or by accepting an optional attribute
+///    argument (e.g. `#[in_vm(qemu)]`).
+///
+/// ## 6. Register in `lib.rs`
+///
+/// Add the backend module as a public module and re-export the backend
+/// struct so that downstream crates and the proc macro can reference it
+/// via `::n_vm::Qemu`.
+///
+/// ## Shared utilities
+///
+/// The following utilities in [`vm`](crate::vm) are available to all
+/// backends:
+///
+/// - [`check_kvm_accessible()`](crate::vm::check_kvm_accessible) --
+///   pre-flight `/dev/kvm` check.
+/// - [`wait_for_socket()`](crate::vm::wait_for_socket) -- poll for a
+///   socket to appear on the filesystem after process spawn.
+///
+/// ## Key differences: cloud-hypervisor vs QEMU
+///
+/// | Concern | cloud-hypervisor | QEMU |
+/// |---------|-----------------|------|
+/// | Boot model | Separate `create_vm` + `boot_vm` REST calls | Boots on process start |
+/// | Control protocol | REST API over Unix socket | QMP (JSON-RPC) over Unix socket |
+/// | Event monitoring | `--event-monitor fd=N` pipe | QMP async events |
+/// | Shutdown | `shutdown_vm()` + `shutdown_vmm()` REST | `system_powerdown` + `quit` QMP |
+/// | vsock | `VsockConfig` in `VmConfig` JSON | `-device vhost-vsock-pci,guest-cid=N` CLI |
+/// | Hugepages | `MemoryConfig.hugepages` field | `-object memory-backend-file,mem-path=/dev/hugepages` |
 #[expect(
     async_fn_in_trait,
     reason = "this trait is only used within the crate; auto-trait bounds on the \
