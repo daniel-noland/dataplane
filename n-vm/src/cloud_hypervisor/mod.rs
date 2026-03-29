@@ -302,7 +302,7 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
         }),
         cpus: Some(build_cpu_config()),
         memory: Some(build_memory_config()),
-        net: Some(build_network_configs()),
+        net: Some(build_network_configs(params.iommu)),
         fs: Some(build_fs_config()),
         // The virtio-console is disabled: test stdout/stderr travel
         // over dedicated VsockChannels (TEST_STDOUT / TEST_STDERR).
@@ -312,7 +312,7 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
             socket: Some(KERNEL_CONSOLE_SOCKET_PATH.into()),
             ..Default::default()
         }),
-        iommu: Some(false),
+        iommu: Some(params.iommu),
         watchdog: Some(true),
         platform: Some(build_platform_config(params)),
         pvpanic: Some(true),
@@ -388,7 +388,18 @@ fn build_memory_config() -> MemoryConfig {
 /// - **mgmt** -- management network on PCI segment 0 (1500 MTU).
 /// - **fabric1** / **fabric2** -- fabric-facing interfaces on PCI
 ///   segment 1 (9500 MTU jumbo frames).
-fn build_network_configs() -> Vec<NetConfig> {
+///
+/// When `iommu` is `true`, the fabric interfaces (PCI segment 1) have
+/// their per-device `iommu` flag set so that cloud-hypervisor places
+/// them behind the virtual IOMMU.
+/// The management interface remains on PCI segment 0, which is outside
+/// the IOMMU segments configured in [`build_platform_config`].
+fn build_network_configs(iommu: bool) -> Vec<NetConfig> {
+    // Per-device IOMMU flag for devices on the IOMMU-protected PCI
+    // segment.  `None` leaves the field at its default (no IOMMU),
+    // `Some(true)` opts the device into DMA remapping.
+    let fabric_iommu = if iommu { Some(true) } else { None };
+
     vec![
         NetConfig {
             tap: Some("mgmt".into()),
@@ -410,6 +421,7 @@ fn build_network_configs() -> Vec<NetConfig> {
             id: Some("fabric1".into()),
             pci_segment: Some(1),
             queue_size: Some(FABRIC_QUEUE_SIZE),
+            iommu: fabric_iommu,
             ..Default::default()
         },
         NetConfig {
@@ -421,6 +433,7 @@ fn build_network_configs() -> Vec<NetConfig> {
             id: Some("fabric2".into()),
             pci_segment: Some(1),
             queue_size: Some(FABRIC_QUEUE_SIZE),
+            iommu: fabric_iommu,
             ..Default::default()
         },
     ]
@@ -441,7 +454,24 @@ fn build_fs_config() -> Vec<FsConfig> {
 
 /// Builds the platform metadata configuration, embedding the test binary
 /// name and test name in OEM strings for identification.
+///
+/// When `params.iommu` is `true`, PCI segment 1 (the fabric-facing
+/// segment) is placed behind the virtual IOMMU with a 48-bit address
+/// width.
+/// Segment 0 (management, vsock, virtiofs, serial) remains outside the
+/// IOMMU so that these infrastructure devices are not subject to DMA
+/// remapping overhead.
 fn build_platform_config(params: &TestVmParams<'_>) -> PlatformConfig {
+    // Only populate IOMMU segment and address-width fields when the
+    // caller has requested vIOMMU support.  Leaving them as `None` when
+    // iommu is disabled avoids sending unnecessary (and potentially
+    // confusing) configuration to the hypervisor.
+    let (iommu_segments, iommu_address_width) = if params.iommu {
+        (Some(vec![1]), Some(48))
+    } else {
+        (None, None)
+    };
+
     PlatformConfig {
         serial_number: Some("dataplane-test".into()),
         uuid: Some("dff9c8dd-492d-4148-a007-7931f94db852".into()), // arbitrary uuid4
@@ -450,6 +480,8 @@ fn build_platform_config(params: &TestVmParams<'_>) -> PlatformConfig {
             format!("test={}", params.test_name),
         ]),
         num_pci_segments: Some(2),
+        iommu_segments,
+        iommu_address_width,
         ..Default::default()
     }
 }
@@ -600,13 +632,13 @@ mod tests {
 
     #[test]
     fn network_config_has_three_interfaces() {
-        let nets = build_network_configs();
+        let nets = build_network_configs(false);
         assert_eq!(nets.len(), 3);
     }
 
     #[test]
     fn mgmt_interface_is_on_pci_segment_zero_with_standard_mtu() {
-        let nets = build_network_configs();
+        let nets = build_network_configs(false);
         let mgmt = nets
             .iter()
             .find(|n| n.id.as_deref() == Some("mgmt"))
@@ -618,7 +650,7 @@ mod tests {
 
     #[test]
     fn fabric_interfaces_are_on_pci_segment_one_with_jumbo_mtu() {
-        let nets = build_network_configs();
+        let nets = build_network_configs(false);
         for name in &["fabric1", "fabric2"] {
             let iface = nets
                 .iter()
@@ -636,7 +668,7 @@ mod tests {
 
     #[test]
     fn all_interfaces_have_unique_mac_addresses() {
-        let nets = build_network_configs();
+        let nets = build_network_configs(false);
         let macs: Vec<_> = nets.iter().filter_map(|n| n.mac.as_deref()).collect();
         assert_eq!(macs.len(), 3, "all interfaces should have MAC addresses");
         let mut deduped = macs.clone();
@@ -651,7 +683,7 @@ mod tests {
 
     #[test]
     fn all_interfaces_have_unique_tap_names() {
-        let nets = build_network_configs();
+        let nets = build_network_configs(false);
         let taps: Vec<_> = nets.iter().filter_map(|n| n.tap.as_deref()).collect();
         assert_eq!(taps.len(), 3, "all interfaces should have tap names");
         let mut deduped = taps.clone();
@@ -733,7 +765,100 @@ mod tests {
         assert_eq!(
             config.iommu,
             Some(false),
-            "iommu should be disabled at VM level"
+            "iommu should be disabled when not requested"
+        );
+    }
+
+    // ── vIOMMU configuration ─────────────────────────────────────────
+
+    /// Helper that returns [`TestVmParams`] with vIOMMU enabled.
+    fn sample_params_iommu() -> TestVmParams<'static> {
+        TestVmParams {
+            iommu: true,
+            ..sample_params()
+        }
+    }
+
+    #[test]
+    fn vm_config_enables_iommu_when_requested() {
+        let params = sample_params_iommu();
+        let config = build_vm_config(&params);
+        assert_eq!(
+            config.iommu,
+            Some(true),
+            "iommu should be enabled when requested"
+        );
+    }
+
+    #[test]
+    fn platform_config_has_iommu_segments_when_enabled() {
+        let params = sample_params_iommu();
+        let platform = build_platform_config(&params);
+        assert_eq!(
+            platform.iommu_segments,
+            Some(vec![1]),
+            "PCI segment 1 (fabric) should be behind the vIOMMU"
+        );
+        assert_eq!(
+            platform.iommu_address_width,
+            Some(48),
+            "IOMMU address width should be 48 bits"
+        );
+    }
+
+    #[test]
+    fn platform_config_has_no_iommu_segments_when_disabled() {
+        let params = sample_params();
+        let platform = build_platform_config(&params);
+        assert_eq!(
+            platform.iommu_segments, None,
+            "iommu_segments should be None when iommu is disabled"
+        );
+        assert_eq!(
+            platform.iommu_address_width, None,
+            "iommu_address_width should be None when iommu is disabled"
+        );
+    }
+
+    #[test]
+    fn fabric_interfaces_have_iommu_when_enabled() {
+        let nets = build_network_configs(true);
+        let fabric1 = &nets[1];
+        let fabric2 = &nets[2];
+        assert_eq!(
+            fabric1.iommu,
+            Some(true),
+            "fabric1 should have per-device iommu enabled"
+        );
+        assert_eq!(
+            fabric2.iommu,
+            Some(true),
+            "fabric2 should have per-device iommu enabled"
+        );
+    }
+
+    #[test]
+    fn mgmt_interface_has_no_iommu_even_when_enabled() {
+        let nets = build_network_configs(true);
+        let mgmt = &nets[0];
+        assert_eq!(
+            mgmt.iommu, None,
+            "mgmt interface on segment 0 should not have per-device iommu"
+        );
+    }
+
+    #[test]
+    fn fabric_interfaces_have_no_iommu_when_disabled() {
+        let nets = build_network_configs(false);
+        let fabric1 = &nets[1];
+        let fabric2 = &nets[2];
+        assert_eq!(
+            fabric1.iommu, None,
+            "fabric1 should not have per-device iommu when disabled"
+        );
+        assert_eq!(
+            fabric2.iommu, None,
+            "fabric2 should not have per-device iommu when disabled"
         );
     }
 
