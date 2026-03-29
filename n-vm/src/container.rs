@@ -768,3 +768,267 @@ pub fn run_test_in_vm<F: FnOnce()>(
         cleanup_result
     })
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a representative [`ContainerParams`] for use in config
+    /// builder tests without hitting the filesystem or process table.
+    fn sample_params() -> ContainerParams {
+        ContainerParams {
+            bin_path: PathBuf::from("/target/debug/deps/my_test-abc123"),
+            bin_dir: PathBuf::from("/target/debug/deps"),
+            test_name: "tests::my_test".into(),
+            uid: nix::unistd::Uid::from_raw(1000),
+            gid: nix::unistd::Gid::from_raw(1000),
+            device_groups: vec![
+                nix::unistd::Gid::from_raw(36),
+                nix::unistd::Gid::from_raw(108),
+            ],
+        }
+    }
+
+    // ── build_config (top-level) ─────────────────────────────────────
+
+    #[test]
+    fn config_uses_container_image() {
+        let config = sample_params().build_config();
+        assert_eq!(config.image.as_deref(), Some(CONTAINER_IMAGE));
+    }
+
+    #[test]
+    fn config_disables_networking() {
+        let config = sample_params().build_config();
+        assert_eq!(config.network_disabled, Some(true));
+        let host = config.host_config.as_ref().expect("host_config");
+        assert_eq!(host.network_mode.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn config_sets_environment_variables() {
+        let config = sample_params().build_config();
+        let env = config.env.as_ref().expect("env should be set");
+        let expected = format!("{ENV_IN_TEST_CONTAINER}={ENV_MARKER_VALUE}");
+        assert!(
+            env.contains(&expected),
+            "env should contain {expected}: {env:?}",
+        );
+        assert!(
+            env.iter().any(|e| e == "RUST_BACKTRACE=1"),
+            "env should enable RUST_BACKTRACE: {env:?}",
+        );
+    }
+
+    #[test]
+    fn config_sets_user_and_groups() {
+        let params = sample_params();
+        let config = params.build_config();
+        assert_eq!(config.user.as_deref(), Some("1000:1000"));
+        let host = config.host_config.as_ref().expect("host_config");
+        let groups = host.group_add.as_ref().expect("group_add");
+        assert!(groups.contains(&"36".to_string()));
+        assert!(groups.contains(&"108".to_string()));
+    }
+
+    #[test]
+    fn config_is_unprivileged_with_minimal_caps() {
+        let config = sample_params().build_config();
+        let host = config.host_config.as_ref().expect("host_config");
+        assert_eq!(host.privileged, Some(false));
+        assert_eq!(
+            host.cap_drop.as_deref(),
+            Some(&["ALL".to_string()][..]),
+            "should drop ALL capabilities first",
+        );
+        let caps = host.cap_add.as_ref().expect("cap_add");
+        for required in &REQUIRED_CAPS {
+            assert!(
+                caps.iter().any(|c| c == *required),
+                "missing required capability: {required}",
+            );
+        }
+    }
+
+    #[test]
+    fn config_has_readonly_rootfs() {
+        let config = sample_params().build_config();
+        let host = config.host_config.as_ref().expect("host_config");
+        assert_eq!(host.readonly_rootfs, Some(true));
+    }
+
+    #[test]
+    fn config_does_not_auto_remove_and_never_restarts() {
+        let config = sample_params().build_config();
+        let host = config.host_config.as_ref().expect("host_config");
+        assert_eq!(host.auto_remove, Some(false));
+        let restart = host.restart_policy.as_ref().expect("restart_policy");
+        assert_eq!(restart.name, Some(RestartPolicyNameEnum::NO));
+    }
+
+    // ── build_device_mappings ────────────────────────────────────────
+
+    #[test]
+    fn device_mappings_cover_all_required_devices() {
+        let mappings = ContainerParams::build_device_mappings();
+        assert_eq!(mappings.len(), REQUIRED_DEVICES.len());
+        for device in &REQUIRED_DEVICES {
+            let found = mappings.iter().any(|m| {
+                m.path_on_host.as_deref() == Some(*device)
+                    && m.path_in_container.as_deref() == Some(*device)
+            });
+            assert!(found, "missing device mapping for {device}");
+        }
+    }
+
+    #[test]
+    fn device_mappings_have_full_permissions() {
+        let mappings = ContainerParams::build_device_mappings();
+        for mapping in &mappings {
+            assert_eq!(
+                mapping.cgroup_permissions.as_deref(),
+                Some("rwm"),
+                "device {:?} should have rwm permissions",
+                mapping.path_on_host,
+            );
+        }
+    }
+
+    // ── build_test_command ───────────────────────────────────────────
+
+    #[test]
+    fn test_command_starts_with_binary_path() {
+        let params = sample_params();
+        let cmd = params.build_test_command();
+        assert_eq!(cmd[0], "/target/debug/deps/my_test-abc123");
+    }
+
+    #[test]
+    fn test_command_passes_test_name_with_exact() {
+        let params = sample_params();
+        let cmd = params.build_test_command();
+        assert_eq!(cmd[1], "tests::my_test");
+        assert!(cmd.contains(&"--exact".to_string()));
+        assert!(cmd.contains(&"--no-capture".to_string()));
+        assert!(cmd.contains(&"--format=terse".to_string()));
+    }
+
+    // ── build_mounts ─────────────────────────────────────────────────
+
+    #[test]
+    fn mounts_include_bin_dir_at_original_path() {
+        let params = sample_params();
+        let mounts = params.build_mounts();
+        let direct = mounts.iter().find(|m| {
+            m.target.as_deref() == Some("/target/debug/deps")
+        });
+        assert!(direct.is_some(), "should mount bin_dir at its original path");
+        let direct = direct.unwrap();
+        assert_eq!(direct.source.as_deref(), Some("/target/debug/deps"));
+        assert_eq!(direct.read_only, Some(true));
+    }
+
+    #[test]
+    fn mounts_include_bin_dir_mirror_under_vm_root_share() {
+        let params = sample_params();
+        let mounts = params.build_mounts();
+        let bin_dir = params.bin_dir_str();
+        let expected_target = format!("{VM_ROOT_SHARE_PATH}/{bin_dir}");
+        let mirror = mounts.iter().find(|m| {
+            m.target.as_deref() == Some(expected_target.as_str())
+        });
+        assert!(
+            mirror.is_some(),
+            "should mount bin_dir mirror under VM_ROOT_SHARE_PATH: expected target {expected_target}",
+        );
+        let mirror = mirror.unwrap();
+        assert_eq!(mirror.source.as_deref(), Some("/target/debug/deps"));
+        assert_eq!(mirror.read_only, Some(true));
+    }
+
+    #[test]
+    fn all_mounts_are_private_non_recursive_bind_mounts() {
+        let params = sample_params();
+        let mounts = params.build_mounts();
+        for mount in &mounts {
+            assert_eq!(
+                mount.typ,
+                Some(bollard::secret::MountTypeEnum::BIND),
+            );
+            let opts = mount.bind_options.as_ref().expect("bind_options");
+            assert_eq!(
+                opts.propagation,
+                Some(bollard::secret::MountBindOptionsPropagationEnum::PRIVATE),
+            );
+            assert_eq!(opts.non_recursive, Some(true));
+            assert_eq!(opts.create_mountpoint, Some(true));
+        }
+    }
+
+    // ── build_tmpfs ──────────────────────────────────────────────────
+
+    #[test]
+    fn tmpfs_mounts_vm_run_dir_with_security_flags() {
+        let params = sample_params();
+        let tmpfs = params.build_tmpfs();
+        assert_eq!(tmpfs.len(), 1);
+        let opts = tmpfs.get(VM_RUN_DIR).expect("should have VM_RUN_DIR entry");
+        assert!(opts.contains("nodev"), "tmpfs should be nodev: {opts}");
+        assert!(opts.contains("noexec"), "tmpfs should be noexec: {opts}");
+        assert!(opts.contains("nosuid"), "tmpfs should be nosuid: {opts}");
+        assert!(opts.contains("uid=1000"), "tmpfs should set uid: {opts}");
+        assert!(opts.contains("gid=1000"), "tmpfs should set gid: {opts}");
+    }
+
+    // ── read_only_bind_mount ─────────────────────────────────────────
+
+    #[test]
+    fn read_only_bind_mount_sets_expected_fields() {
+        let mount = ContainerParams::read_only_bind_mount(
+            "/src/dir",
+            "/dst/dir".to_string(),
+        );
+        assert_eq!(mount.source.as_deref(), Some("/src/dir"));
+        assert_eq!(mount.target.as_deref(), Some("/dst/dir"));
+        assert_eq!(mount.read_only, Some(true));
+        assert_eq!(mount.typ, Some(bollard::secret::MountTypeEnum::BIND));
+    }
+
+    // ── REQUIRED_CAPS / REQUIRED_DEVICES table validation ────────────
+
+    #[test]
+    fn required_caps_has_no_duplicates() {
+        let mut sorted = REQUIRED_CAPS.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            REQUIRED_CAPS.len(),
+            "REQUIRED_CAPS contains duplicates",
+        );
+    }
+
+    #[test]
+    fn required_devices_has_no_duplicates() {
+        let mut sorted = REQUIRED_DEVICES.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            REQUIRED_DEVICES.len(),
+            "REQUIRED_DEVICES contains duplicates",
+        );
+    }
+
+    #[test]
+    fn required_devices_are_all_absolute_paths() {
+        for device in &REQUIRED_DEVICES {
+            assert!(
+                device.starts_with('/'),
+                "device path should be absolute: {device}",
+            );
+        }
+    }
+}
