@@ -637,10 +637,15 @@ impl TestVm {
         } = self;
 
         // ── Collect vsock / task output ──────────────────────────────
+        // The vsock readers complete when the guest-side streams close
+        // (test process exits → stdout/stderr close; n-it exits →
+        // init_trace closes).
         let init_trace = join_or_fallback(init_trace, "init system trace").await;
         let test_stdout = join_or_fallback(test_stdout, "test stdout").await;
         let test_stderr = join_or_fallback(test_stderr, "test stderr").await;
 
+        // The event watcher completes when the hypervisor emits a
+        // terminal event (Shutdown / Panic) or the pipe closes.
         let (hypervisor_events, hypervisor_verdict) = match event_watcher.await {
             Ok(result) => result,
             Err(err) => {
@@ -649,20 +654,26 @@ impl TestVm {
             }
         };
 
-        let (hypervisor_exit_ok, hypervisor_stdout, hypervisor_stderr) =
-            collect_process_output(hypervisor, "cloud-hypervisor").await;
-
-        let kernel_log = join_or_fallback(kernel_log, "kernel log").await;
-
         // ── Shut down ────────────────────────────────────────────────
-        // Best-effort shutdown: the VM/VMM may already have exited, so we
-        // log errors at debug level rather than propagating them.
+        // Best-effort shutdown BEFORE waiting for the hypervisor process
+        // to exit.  In the normal path the VM has already powered off
+        // (n-it calls reboot(RB_POWER_OFF) or aborts), so these calls
+        // will fail harmlessly.  But if the guest init hangs or the
+        // shutdown path fails, these calls break the deadlock that would
+        // otherwise occur when `collect_process_output` waits for the
+        // hypervisor process to exit.
         if let Err(err) = client.lock().await.shutdown_vm().await as Result<(), _> {
             debug!("vm shutdown: {err}");
         }
         if let Err(err) = client.lock().await.shutdown_vmm().await as Result<(), _> {
             debug!("vmm shutdown: {err}");
         }
+
+        let (hypervisor_exit_ok, hypervisor_stdout, hypervisor_stderr) =
+            collect_process_output(hypervisor, "cloud-hypervisor").await;
+
+        // The kernel serial socket closes when the hypervisor exits.
+        let kernel_log = join_or_fallback(kernel_log, "kernel log").await;
 
         let (virtiofsd_exit_ok, virtiofsd_stdout, virtiofsd_stderr) =
             collect_process_output(virtiofsd, "virtiofsd").await;
