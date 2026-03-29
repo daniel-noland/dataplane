@@ -210,6 +210,16 @@ pub struct TestVmParams<'a> {
     pub bin_name: &'a str,
     /// Fully-qualified test name (e.g. `module::test_name`).
     pub test_name: &'a str,
+    /// Whether to present a virtual IOMMU device to the guest.
+    ///
+    /// When `true`, the hypervisor backend will configure a virtual IOMMU
+    /// (virtio-iommu for cloud-hypervisor, Intel IOMMU for QEMU) and
+    /// place virtio devices behind it.  This exercises the same DMA
+    /// remapping paths that DPDK/VFIO encounters in production.
+    ///
+    /// When `false` (the default), no virtual IOMMU is configured and
+    /// devices use direct DMA.
+    pub iommu: bool,
 }
 
 // ── VmTestOutput ─────────────────────────────────────────────────────
@@ -554,6 +564,7 @@ impl<B: HypervisorBackend> TestVm<B> {
 /// [`TestVm::collect`].
 pub async fn run_in_vm<B: HypervisorBackend, F: FnOnce()>(
     _: F,
+    iommu: bool,
 ) -> Result<VmTestOutput<B>, VmError> {
     let identity = crate::test_identity::TestIdentity::resolve::<F>();
     let test_name = identity.test_name;
@@ -570,6 +581,7 @@ pub async fn run_in_vm<B: HypervisorBackend, F: FnOnce()>(
         full_bin_path: Path::new(&full_bin_path),
         bin_name,
         test_name,
+        iommu,
     };
 
     let vm = TestVm::<B>::launch(&params).await?;

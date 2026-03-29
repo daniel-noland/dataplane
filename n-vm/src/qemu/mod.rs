@@ -674,6 +674,7 @@ mod tests {
             full_bin_path: Path::new("/deps/my_test-abc123"),
             bin_name: "my_test-abc123",
             test_name: "module::test_name",
+            iommu: false,
         }
     }
 

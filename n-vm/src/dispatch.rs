@@ -6,13 +6,18 @@
 //! Both [`run_container_tier`] and [`run_host_tier`] are generic over a
 //! [`HypervisorBackend`](crate::backend::HypervisorBackend) so that the
 //! proc macro can select the backend at code-generation time.  The
-//! `#[in_vm]` macro selects the backend based on an optional argument:
+//! `#[in_vm]` macro selects the backend and VM options based on optional
+//! arguments:
 //!
 //! - `#[in_vm]` -- uses
 //!   [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor)
-//!   (the default).
+//!   (the default), no vIOMMU.
 //! - `#[in_vm(cloud_hypervisor)]` -- same as above, explicitly.
 //! - `#[in_vm(qemu)]` -- uses [`Qemu`](crate::qemu::Qemu).
+//! - `#[in_vm(iommu)]` -- default backend with a virtual IOMMU device.
+//! - `#[in_vm(qemu, iommu)]` -- QEMU with a virtual IOMMU device.
+//! - `#[in_vm(cloud_hypervisor, iommu)]` -- cloud-hypervisor with a
+//!   virtual IOMMU device.
 //!
 //! The [`in_vm`](crate::in_vm) attribute macro rewrites a test function into a
 //! three-tier dispatch (host -> container -> VM guest).  Rather than generating
@@ -88,6 +93,11 @@ fn init_tracing() {
 /// default, or [`Qemu`](crate::qemu::Qemu) when `#[in_vm(qemu)]` is
 /// used.
 ///
+/// The `iommu` parameter controls whether the hypervisor backend
+/// presents a virtual IOMMU device to the guest.
+/// When `true`, devices are placed behind the vIOMMU, exercising the
+/// DMA remapping paths that DPDK/VFIO encounters in production.
+///
 /// The type parameter `F` is used only to derive the test name via
 /// [`std::any::type_name`]; the function value itself is never called in
 /// this tier.
@@ -98,7 +108,7 @@ fn init_tracing() {
 /// - The tokio runtime cannot be created.
 /// - The VM infrastructure returns an error.
 /// - The test running inside the VM reports failure.
-pub fn run_container_tier<B: HypervisorBackend, F: FnOnce()>(test_fn: F) {
+pub fn run_container_tier<B: HypervisorBackend, F: FnOnce()>(test_fn: F, iommu: bool) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -113,7 +123,7 @@ pub fn run_container_tier<B: HypervisorBackend, F: FnOnce()>(test_fn: F) {
         let init_span = tracing::span!(tracing::Level::INFO, "hypervisor");
         let _guard = init_span.enter();
 
-        let output = crate::run_in_vm::<B, _>(test_fn)
+        let output = crate::run_in_vm::<B, _>(test_fn, iommu)
             .await
             .unwrap_or_else(|err| panic!("VM infrastructure error: {err:#?}"));
 

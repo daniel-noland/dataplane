@@ -31,9 +31,13 @@
 //! over the backend.  The `#[in_vm]` proc macro selects the backend
 //! based on an optional argument:
 //!
-//! - `#[in_vm]` -- uses [`CloudHypervisor`] (the default).
+//! - `#[in_vm]` -- uses [`CloudHypervisor`] (the default), no vIOMMU.
 //! - `#[in_vm(cloud_hypervisor)]` -- same as above, explicitly.
 //! - `#[in_vm(qemu)]` -- uses [`Qemu`].
+//! - `#[in_vm(iommu)]` -- default backend with a virtual IOMMU device.
+//! - `#[in_vm(qemu, iommu)]` -- QEMU with a virtual IOMMU device.
+//! - `#[in_vm(cloud_hypervisor, iommu)]` -- cloud-hypervisor with a
+//!   virtual IOMMU device.
 //!
 //! Callers can also substitute any backend that implements
 //! [`HypervisorBackend`] by invoking the generic functions directly.
