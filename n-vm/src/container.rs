@@ -5,19 +5,11 @@
 //! capabilities required to boot a cloud-hypervisor VM, then re-executes the
 //! test binary inside it.
 //!
-//! The public entry point is [`run_test_in_vm`], which orchestrates five
-//! focused phases — each implemented as its own helper function so that the
-//! orchestrator requires only local reasoning about sequencing:
-//!
-//! 1. [`resolve_test_params`] — gather test identity, binary paths, device
-//!    groups, and process identity.
-//! 2. [`build_container_config`] — translate those parameters into a Docker
-//!    [`ContainerCreateBody`].
-//! 3. [`create_and_start_container`] — create and start the container.
-//! 4. [`stream_container_logs`] — forward container stdout/stderr to the
-//!    host.
-//! 5. [`collect_and_cleanup`] — inspect the exit status and remove the
-//!    container.
+//! The public entry point is [`run_test_in_vm`], which resolves the test
+//! identity and binary paths ([`ContainerParams::resolve`]), builds a
+//! Docker [`ContainerCreateBody`] ([`ContainerParams::build_config`]),
+//! then creates, runs, and cleans up the container via
+//! [`ContainerGuard`].
 
 use std::path::PathBuf;
 
