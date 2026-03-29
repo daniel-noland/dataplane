@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::process::Stdio;
 
-use n_vm_protocol::{ENV_IN_VM, ENV_MARKER_VALUE, TEST_STDERR_VSOCK_PORT, TEST_STDOUT_VSOCK_PORT};
+use n_vm_protocol::{ENV_IN_VM, ENV_MARKER_VALUE, VsockChannel};
 use tokio_vsock::VMADDR_CID_HOST;
 use nix::errno::Errno;
 use nix::mount::{MntFlags, MsFlags, mount};
@@ -94,8 +94,8 @@ impl InitSystem {
     /// Reads the binary path and test name from the kernel command line
     /// arguments (passed via `init=`), sets `IN_VM=YES` so the `#[in_vm]`
     /// macro executes the test body directly, and redirects stdout/stderr to
-    /// dedicated vsock streams ([`TEST_STDOUT_VSOCK_PORT`] and
-    /// [`TEST_STDERR_VSOCK_PORT`]).
+    /// dedicated vsock streams ([`VsockChannel::TEST_STDOUT`] and
+    /// [`VsockChannel::TEST_STDERR`]).
     ///
     /// The container tier must have already bound Unix listeners at the
     /// corresponding vsock listener paths before the VM booted, so these
@@ -113,11 +113,11 @@ impl InitSystem {
         // Connect vsock streams for stdout and stderr.  The container tier
         // has already bound Unix listeners at the corresponding paths, so
         // these connections succeed immediately.
-        let stdout_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, TEST_STDOUT_VSOCK_PORT);
+        let stdout_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDOUT.port);
         let stdout_stream = vsock::VsockStream::connect(&stdout_addr)
             .unwrap_or_else(|e| fatal!("failed to connect stdout vsock: {e}"));
 
-        let stderr_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, TEST_STDERR_VSOCK_PORT);
+        let stderr_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDERR.port);
         let stderr_stream = vsock::VsockStream::connect(&stderr_addr)
             .unwrap_or_else(|e| fatal!("failed to connect stderr vsock: {e}"));
 

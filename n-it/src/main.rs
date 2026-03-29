@@ -23,7 +23,7 @@ use std::convert::Infallible;
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use n_vm_protocol::INIT_SYSTEM_VSOCK_PORT;
+use n_vm_protocol::VsockChannel;
 use tokio_vsock::VMADDR_CID_HOST;
 
 // NOTE: `utils` must be declared before modules that use the `fatal!` macro.
@@ -53,7 +53,7 @@ fn main() -> Infallible {
         });
     runtime.block_on(async {
         eprintln!("init system runtime started: connecting to tracing vsock");
-        let tracing_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, INIT_SYSTEM_VSOCK_PORT);
+        let tracing_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::INIT_TRACE.port);
         let tracing_vsock = VsockWriter::new(
             vsock::VsockStream::connect(&tracing_addr).unwrap_or_else(|e| {
                 eprintln!("FATAL: failed to connect tracing vsock to host: {e}");
