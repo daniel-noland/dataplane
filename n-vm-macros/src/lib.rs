@@ -104,9 +104,9 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
         .into();
     }
 
-    if let ReturnType::Type(arrow, ref ty) = func.sig.output {
+    if !matches!(func.sig.output, ReturnType::Default) {
         return syn::Error::new_spanned(
-            quote! { #arrow #ty },
+            &func.sig.output,
             "#[in_vm] functions must return `()`; \
              the generated dispatch branches use bare `return;` statements",
         )
