@@ -132,6 +132,48 @@ impl HypervisorVerdict {
     }
 }
 
+// ── Verdict computation ──────────────────────────────────────────────
+
+/// Computes the [`HypervisorVerdict`] from a collected event log and a
+/// flag indicating whether any stream-level deserialization errors occurred
+/// during collection.
+///
+/// This is a **pure function** extracted from [`watch`] so that verdict
+/// logic can be unit-tested with hand-crafted event sequences without
+/// needing a pipe or tokio runtime.
+///
+/// The verdict is [`CleanShutdown`](HypervisorVerdict::CleanShutdown)
+/// only if **all** of the following hold:
+///
+/// 1. A `(Vmm, Shutdown)` event was received.
+/// 2. No `(Guest, Panic)` event preceded the shutdown in the event log.
+/// 3. No stream-level deserialization errors occurred (indicated by
+///    `had_stream_errors`).
+///
+/// Otherwise the verdict is [`Failure`](HypervisorVerdict::Failure).
+pub fn compute_verdict(events: &[Event], had_stream_errors: bool) -> HypervisorVerdict {
+    let mut tainted = had_stream_errors;
+
+    for event in events {
+        match (event.source, event.event) {
+            (Source::Vmm, EventType::Shutdown) => {
+                return if tainted {
+                    HypervisorVerdict::Failure
+                } else {
+                    HypervisorVerdict::CleanShutdown
+                };
+            }
+            (Source::Guest, EventType::Panic) => {
+                tainted = true;
+            }
+            _ => {}
+        }
+    }
+
+    // Stream ended without a VMM Shutdown event.
+    HypervisorVerdict::Failure
+}
+
 // ── Async JSON stream decoder ────────────────────────────────────────
 
 /// A [`tokio_util::codec::Decoder`] that incrementally deserializes
@@ -199,14 +241,60 @@ impl tokio_util::codec::Decoder for AsyncJsonStreamDecoder {
 
 // ── Hypervisor event watcher ─────────────────────────────────────────
 
+/// Duration to continue draining events after a guest panic is detected.
+///
+/// This gives the VMM time to emit subsequent lifecycle events (e.g.
+/// Shutdown, Deleted) that aid diagnosis.
+const POST_PANIC_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Drains remaining events from the stream for up to
+/// [`POST_PANIC_DRAIN_TIMEOUT`], appending them to `hlog`.
+///
+/// Called after a guest panic is detected so that subsequent lifecycle
+/// events (e.g. VMM Shutdown, Deleted) are captured for diagnostics.
+async fn drain_after_panic(
+    reader: &mut tokio_util::codec::FramedRead<
+        tokio::net::unix::pipe::Receiver,
+        AsyncJsonStreamDecoder,
+    >,
+    hlog: &mut Vec<Event>,
+) {
+    let drain_deadline = tokio::time::sleep(POST_PANIC_DRAIN_TIMEOUT);
+    tokio::pin!(drain_deadline);
+    loop {
+        tokio::select! {
+            event = reader.next() => {
+                match event {
+                    Some(Ok(value)) => {
+                        hlog.push(value);
+                    }
+                    Some(Err(e)) => {
+                        warn!(
+                            "hypervisor event error during post-panic drain: {e:#?}"
+                        );
+                    }
+                    None => break,
+                }
+            }
+            () = &mut drain_deadline => {
+                break;
+            }
+        }
+    }
+}
+
 /// Consumes the hypervisor event stream and returns the collected events
 /// along with a [`HypervisorVerdict`].
 ///
-/// Returns [`HypervisorVerdict::CleanShutdown`] if the VMM emits a clean
-/// `Shutdown` event with no preceding errors, or
-/// [`HypervisorVerdict::Failure`] if a guest panic is detected, the event
-/// stream contains deserialization errors, or the stream ends without a
-/// clean shutdown.
+/// Event collection terminates when:
+/// - A `(Vmm, Shutdown)` event is received (normal completion).
+/// - A `(Guest, Panic)` event is received (remaining events are drained
+///   for up to [`POST_PANIC_DRAIN_TIMEOUT`]).
+/// - The stream ends (pipe closed).
+///
+/// The verdict is computed by [`compute_verdict`] from the collected
+/// events and a flag tracking whether any stream-level deserialization
+/// errors occurred.
 pub async fn watch(
     receiver: tokio::net::unix::pipe::Receiver,
 ) -> (Vec<Event>, HypervisorVerdict) {
@@ -214,66 +302,143 @@ pub async fn watch(
 
     let mut reader = tokio_util::codec::FramedRead::new(receiver, decoder);
     let mut hlog = Vec::with_capacity(32);
-
-    let mut clean = true;
+    let mut had_stream_errors = false;
 
     loop {
-        let event = reader.next().await;
-        match event {
+        match reader.next().await {
             Some(Ok(value)) => {
-                hlog.push(value.clone());
-                match (value.source, value.event) {
-                    (Source::Vmm, EventType::Shutdown) => {
-                        let verdict = if clean {
-                            HypervisorVerdict::CleanShutdown
-                        } else {
-                            HypervisorVerdict::Failure
-                        };
-                        return (hlog, verdict);
+                let is_shutdown = matches!(
+                    (value.source, value.event),
+                    (Source::Vmm, EventType::Shutdown)
+                );
+                let is_panic = matches!(
+                    (value.source, value.event),
+                    (Source::Guest, EventType::Panic)
+                );
+                hlog.push(value);
+
+                if is_shutdown || is_panic {
+                    if is_panic {
+                        drain_after_panic(&mut reader, &mut hlog).await;
                     }
-                    (Source::Guest, EventType::Panic) => {
-                        // Don't break immediately — drain remaining events
-                        // for a short period so that subsequent lifecycle
-                        // events (e.g. VMM Shutdown, Deleted) are captured
-                        // for diagnostics.
-                        let drain_deadline = tokio::time::sleep(Duration::from_millis(500));
-                        tokio::pin!(drain_deadline);
-                        loop {
-                            tokio::select! {
-                                event = reader.next() => {
-                                    match event {
-                                        Some(Ok(value)) => {
-                                            hlog.push(value);
-                                        }
-                                        Some(Err(e)) => {
-                                            warn!(
-                                                "hypervisor event error during post-panic drain: {e:#?}"
-                                            );
-                                        }
-                                        None => break,
-                                    }
-                                }
-                                () = &mut drain_deadline => {
-                                    break;
-                                }
-                            }
-                        }
-                        return (hlog, HypervisorVerdict::Failure);
-                    }
-                    _ => {}
-                };
+                    break;
+                }
             }
             Some(Err(e)) => {
                 // Deserialization errors may hide critical events (e.g.
                 // a guest panic encoded in a malformed JSON object), so
-                // they downgrade the verdict to Failure.
+                // they are tracked and fed into the verdict computation.
                 warn!("hypervisor event deserialization error (marking as failure): {e:#?}");
-                clean = false;
+                had_stream_errors = true;
             }
             None => {
                 break;
             }
         }
     }
-    (hlog, HypervisorVerdict::Failure)
+
+    let verdict = compute_verdict(&hlog, had_stream_errors);
+    (hlog, verdict)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a minimal [`Event`] with the given source and type.
+    fn event(source: Source, event: EventType) -> Event {
+        Event {
+            timestamp: Duration::from_secs(0),
+            source,
+            event,
+            properties: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn clean_shutdown_without_errors() {
+        let events = vec![
+            event(Source::Vmm, EventType::Starting),
+            event(Source::Vmm, EventType::Booting),
+            event(Source::Vmm, EventType::Shutdown),
+        ];
+        assert_eq!(
+            compute_verdict(&events, false),
+            HypervisorVerdict::CleanShutdown,
+        );
+    }
+
+    #[test]
+    fn shutdown_with_stream_errors_is_failure() {
+        let events = vec![
+            event(Source::Vmm, EventType::Starting),
+            event(Source::Vmm, EventType::Shutdown),
+        ];
+        assert_eq!(
+            compute_verdict(&events, true),
+            HypervisorVerdict::Failure,
+        );
+    }
+
+    #[test]
+    fn panic_before_shutdown_is_failure() {
+        let events = vec![
+            event(Source::Vmm, EventType::Starting),
+            event(Source::Guest, EventType::Panic),
+            event(Source::Vmm, EventType::Shutdown),
+        ];
+        assert_eq!(
+            compute_verdict(&events, false),
+            HypervisorVerdict::Failure,
+        );
+    }
+
+    #[test]
+    fn panic_without_shutdown_is_failure() {
+        let events = vec![
+            event(Source::Vmm, EventType::Starting),
+            event(Source::Guest, EventType::Panic),
+        ];
+        assert_eq!(
+            compute_verdict(&events, false),
+            HypervisorVerdict::Failure,
+        );
+    }
+
+    #[test]
+    fn stream_ended_without_shutdown_is_failure() {
+        let events = vec![
+            event(Source::Vmm, EventType::Starting),
+            event(Source::Vmm, EventType::Booting),
+        ];
+        assert_eq!(
+            compute_verdict(&events, false),
+            HypervisorVerdict::Failure,
+        );
+    }
+
+    #[test]
+    fn empty_event_log_is_failure() {
+        assert_eq!(
+            compute_verdict(&[], false),
+            HypervisorVerdict::Failure,
+        );
+    }
+
+    #[test]
+    fn events_after_shutdown_are_ignored_for_verdict() {
+        // Events collected after the shutdown (e.g. Deleted) should not
+        // affect the verdict — the shutdown event is the decision point.
+        let events = vec![
+            event(Source::Vmm, EventType::Starting),
+            event(Source::Vmm, EventType::Shutdown),
+            event(Source::Guest, EventType::Panic), // after shutdown
+        ];
+        assert_eq!(
+            compute_verdict(&events, false),
+            HypervisorVerdict::CleanShutdown,
+        );
+    }
 }
