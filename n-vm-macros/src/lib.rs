@@ -70,7 +70,16 @@ use syn::{ReturnType, parse_macro_input};
 /// - The VM test output indicates failure (container tier).
 /// - The tokio runtime cannot be created.
 #[proc_macro_attribute]
-pub fn in_vm(_attr: TokenStream, input: TokenStream) -> TokenStream {
+pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[in_vm] does not accept any arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+
     let func = parse_macro_input!(input as syn::ItemFn);
 
     // ── Validate function signature ──────────────────────────────────
