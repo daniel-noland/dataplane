@@ -47,29 +47,93 @@ pub const ENV_MARKER_VALUE: &str = "YES";
 
 // ── Vsock ────────────────────────────────────────────────────────────
 
-/// The vsock port used by the init system to stream tracing data back to the
-/// host.
+/// A typed vsock communication channel between the VM guest and the
+/// container host.
 ///
-/// This must match between the `n-it` init system (which connects to the host
-/// on this port) and `n-vm::run_in_vm` (which listens for the connection).
-pub const INIT_SYSTEM_VSOCK_PORT: u32 = 123_456;
+/// Each channel represents a unidirectional data stream from the VM guest
+/// to the container tier, identified by a vsock port number.  The container
+/// tier binds a Unix socket at [`listener_path`](Self::listener_path)
+/// *before* booting the VM, and the guest connects to the corresponding
+/// port via [`vsock::VsockStream`].
+///
+/// # Adding a new channel
+///
+/// Define a new `const` on this type.  Both sides (guest and container)
+/// automatically pick up the port and listener path through the same
+/// [`VsockChannel`] value, so there is exactly one place to update.
+///
+/// # Examples
+///
+/// Container side (bind before VM boot):
+///
+/// ```ignore
+/// let path = VsockChannel::TEST_STDOUT.listener_path();
+/// let listener = tokio::net::UnixListener::bind(&path)?;
+/// ```
+///
+/// Guest side (connect after boot):
+///
+/// ```ignore
+/// use tokio_vsock::VMADDR_CID_HOST;
+/// let addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDOUT.port);
+/// let stream = vsock::VsockStream::connect(&addr)?;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsockChannel {
+    /// The vsock port number for this channel.
+    pub port: u32,
+    /// A human-readable label used in log messages and error reports.
+    pub label: &'static str,
+}
 
-/// The vsock port used by the init system to forward the test process's
-/// **stdout** back to the container tier.
-///
-/// The init system connects a [`vsock::VsockStream`] on this port and passes
-/// the resulting fd as the child process's stdout.  The container tier binds
-/// a Unix listener at [`test_stdout_vsock_listener_path()`] *before* booting
-/// the VM so that the connection succeeds immediately.
-pub const TEST_STDOUT_VSOCK_PORT: u32 = 123_457;
+impl VsockChannel {
+    /// Channel for the init system's tracing data.
+    ///
+    /// The `n-it` init system connects to the host on this channel and
+    /// streams structured [`tracing`] output so that the container tier
+    /// can include it in [`VmTestOutput::init_trace`](../n_vm/struct.VmTestOutput.html).
+    pub const INIT_TRACE: Self = Self {
+        port: 123_456,
+        label: "init-trace",
+    };
 
-/// The vsock port used by the init system to forward the test process's
-/// **stderr** back to the container tier.
-///
-/// See [`TEST_STDOUT_VSOCK_PORT`] for the general mechanism — this port
-/// carries stderr instead of stdout, giving the host proper separation of
-/// the two streams (unlike the old `hvc0` approach which merged them).
-pub const TEST_STDERR_VSOCK_PORT: u32 = 123_458;
+    /// Channel for the test process's **stdout**.
+    ///
+    /// The init system connects a vsock stream on this channel and passes
+    /// the resulting fd as the child process's stdout.  The container tier
+    /// binds a Unix listener at [`listener_path`](Self::listener_path)
+    /// *before* booting the VM so that the connection succeeds immediately.
+    pub const TEST_STDOUT: Self = Self {
+        port: 123_457,
+        label: "test-stdout",
+    };
+
+    /// Channel for the test process's **stderr**.
+    ///
+    /// See [`TEST_STDOUT`](Self::TEST_STDOUT) for the general mechanism —
+    /// this channel carries stderr instead of stdout, giving the host
+    /// proper separation of the two streams.
+    pub const TEST_STDERR: Self = Self {
+        port: 123_458,
+        label: "test-stderr",
+    };
+
+    /// Returns the Unix socket path the container tier must bind for this
+    /// channel.
+    ///
+    /// cloud-hypervisor creates a `<vhost_socket>_<port>` file for each
+    /// vsock port that a guest connects to.  The host-side listener must
+    /// bind to this path *before* the VM boots.
+    pub fn listener_path(&self) -> String {
+        format!("{VHOST_VSOCK_SOCKET_PATH}_{}", self.port)
+    }
+}
+
+impl std::fmt::Display for VsockChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (vsock port {})", self.label, self.port)
+    }
+}
 
 /// The vsock context identifier (CID) assigned to the VM guest.
 pub const VM_GUEST_CID: u64 = 3;
@@ -119,30 +183,3 @@ pub const VIRTIOFSD_BINARY_PATH: &str = "/bin/virtiofsd";
 
 /// Path to the cloud-hypervisor binary inside the container.
 pub const CLOUD_HYPERVISOR_BINARY_PATH: &str = "/bin/cloud-hypervisor";
-
-// ── Derived paths ────────────────────────────────────────────────────
-
-/// Returns the vhost-vsock listener socket path that includes the vsock port.
-///
-/// cloud-hypervisor creates a `<socket>_<port>` file for each vsock port that
-/// a guest connects to.  The host-side listener must bind to this path
-/// *before* the VM boots.
-pub fn vhost_vsock_listener_path() -> String {
-    format!("{VHOST_VSOCK_SOCKET_PATH}_{INIT_SYSTEM_VSOCK_PORT}")
-}
-
-/// Returns the Unix socket path the container tier must bind for the test
-/// process's **stdout** vsock stream.
-///
-/// See [`vhost_vsock_listener_path()`] for the naming convention.
-pub fn test_stdout_vsock_listener_path() -> String {
-    format!("{VHOST_VSOCK_SOCKET_PATH}_{TEST_STDOUT_VSOCK_PORT}")
-}
-
-/// Returns the Unix socket path the container tier must bind for the test
-/// process's **stderr** vsock stream.
-///
-/// See [`vhost_vsock_listener_path()`] for the naming convention.
-pub fn test_stderr_vsock_listener_path() -> String {
-    format!("{VHOST_VSOCK_SOCKET_PATH}_{TEST_STDERR_VSOCK_PORT}")
-}

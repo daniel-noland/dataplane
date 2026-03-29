@@ -25,8 +25,7 @@ use n_vm_protocol::{
     CLOUD_HYPERVISOR_BINARY_PATH, HYPERVISOR_API_SOCKET_PATH, INIT_BINARY_PATH,
     KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH, VHOST_VSOCK_SOCKET_PATH,
     VIRTIOFSD_BINARY_PATH, VIRTIOFSD_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VM_GUEST_CID,
-    VM_ROOT_SHARE_PATH, VM_RUN_DIR, test_stderr_vsock_listener_path,
-    test_stdout_vsock_listener_path, vhost_vsock_listener_path,
+    VM_ROOT_SHARE_PATH, VM_RUN_DIR, VsockChannel,
 };
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
@@ -261,7 +260,7 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
             ..Default::default()
         }]),
         // The virtio-console is disabled: test stdout/stderr travel over
-        // dedicated vsock streams (TEST_STDOUT_VSOCK_PORT / TEST_STDERR_VSOCK_PORT).
+        // dedicated VsockChannels (TEST_STDOUT / TEST_STDERR).
         console: Some(ConsoleConfig::new(Mode::Off)),
         serial: Some(ConsoleConfig {
             mode: Mode::Socket,
@@ -395,16 +394,16 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
     // All three listeners must be bound *before* the VM boots so that the
     // guest-side vsock connections succeed immediately.
     let init_system_trace = spawn_vsock_reader(
-        vhost_vsock_listener_path(),
-        "init-trace",
+        VsockChannel::INIT_TRACE.listener_path(),
+        VsockChannel::INIT_TRACE.label,
     );
     let test_stdout = spawn_vsock_reader(
-        test_stdout_vsock_listener_path(),
-        "test-stdout",
+        VsockChannel::TEST_STDOUT.listener_path(),
+        VsockChannel::TEST_STDOUT.label,
     );
     let test_stderr = spawn_vsock_reader(
-        test_stderr_vsock_listener_path(),
-        "test-stderr",
+        VsockChannel::TEST_STDERR.listener_path(),
+        VsockChannel::TEST_STDERR.label,
     );
 
     // ── Build VM configuration ───────────────────────────────────────
