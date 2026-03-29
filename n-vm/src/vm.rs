@@ -204,7 +204,7 @@ impl ProcessOutput {
 /// ```
 pub struct TestVmParams<'a> {
     /// Full path to the test binary (e.g. `/path/to/deps/my_test-abc123`).
-    pub full_bin_path: &'a str,
+    pub full_bin_path: &'a Path,
     /// Short binary name (filename component only, e.g. `my_test-abc123`).
     pub bin_name: &'a str,
     /// Fully-qualified test name (e.g. `module::test_name`).
@@ -236,7 +236,7 @@ impl<'a> TestVmParams<'a> {
                  hugepages=16 \
                  init={INIT_BINARY_PATH} \
                  -- {full_bin_path} {test_name} --exact --no-capture --format=terse",
-                full_bin_path = self.full_bin_path,
+                full_bin_path = self.full_bin_path.display(),
                 test_name = self.test_name,
             )),
             ..Default::default()
@@ -543,7 +543,7 @@ impl TestVm {
     /// Spawns a virtiofsd process that shares `path` into the VM as a
     /// read-only virtiofs mount.
     async fn launch_virtiofsd(
-        path: impl AsRef<str>,
+        path: impl AsRef<Path>,
     ) -> Result<tokio::process::Child, VmError> {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
@@ -876,7 +876,7 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> Result<VmTestOutput, VmError> {
         })?;
 
     let params = TestVmParams {
-        full_bin_path: &full_bin_path,
+        full_bin_path: Path::new(&full_bin_path),
         bin_name,
         test_name,
     };
