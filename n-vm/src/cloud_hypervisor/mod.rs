@@ -155,14 +155,11 @@ impl HypervisorBackend for CloudHypervisor {
             cloud_hypervisor_client::socket_based_api_client(HYPERVISOR_API_SOCKET_PATH),
         ));
 
-        client
-            .lock()
-            .await
-            .create_vm(config)
-            .await
-            .map_err(|e| CloudHypervisorError::VmCreate {
+        client.lock().await.create_vm(config).await.map_err(|e| {
+            CloudHypervisorError::VmCreate {
                 reason: format!("{e:?}"),
-            })?;
+            }
+        })?;
 
         let event_watcher = AbortOnDrop::spawn(async {
             let (events, verdict) = events::watch(event_receiver).await;

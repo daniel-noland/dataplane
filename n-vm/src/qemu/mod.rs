@@ -59,7 +59,7 @@ use std::time::Duration;
 
 use n_vm_protocol::{
     HYPERVISOR_API_SOCKET_PATH, INIT_BINARY_PATH, KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH,
-    QEMU_BINARY_PATH, VIRTIOFSD_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VM_GUEST_CID, VsockChannel,
+    QEMU_BINARY_PATH, VIRTIOFS_ROOT_TAG, VIRTIOFSD_SOCKET_PATH, VM_GUEST_CID, VsockChannel,
 };
 use tokio::io::AsyncReadExt;
 use tracing::{debug, error, warn};
@@ -297,10 +297,8 @@ async fn watch_events(mut stream: QmpEventStream) -> (Vec<qapi_qmp::Event>, Hype
     loop {
         match stream.next_event().await {
             Ok(Some(event)) => {
-                let is_shutdown =
-                    matches!(event, qapi_qmp::Event::SHUTDOWN { .. });
-                let is_panic =
-                    matches!(event, qapi_qmp::Event::GUEST_PANICKED { .. });
+                let is_shutdown = matches!(event, qapi_qmp::Event::SHUTDOWN { .. });
+                let is_panic = matches!(event, qapi_qmp::Event::GUEST_PANICKED { .. });
                 log.push(event);
 
                 if is_shutdown || is_panic {
@@ -402,11 +400,7 @@ async fn spawn_qemu_process(
 
     let args = build_qemu_args(params);
 
-    debug!(
-        "spawning QEMU: {} {}",
-        QEMU_BINARY_PATH,
-        args.join(" ")
-    );
+    debug!("spawning QEMU: {} {}", QEMU_BINARY_PATH, args.join(" "));
 
     let child = tokio::process::Command::new(QEMU_BINARY_PATH)
         .args(&args)
@@ -717,7 +711,10 @@ mod tests {
     fn memory_args_use_hugepages_with_sharing() {
         let mut args = Vec::new();
         push_memory_args(&mut args);
-        let obj = args.iter().find(|a| a.starts_with("memory-backend-file")).unwrap();
+        let obj = args
+            .iter()
+            .find(|a| a.starts_with("memory-backend-file"))
+            .unwrap();
         assert!(obj.contains("size=512M"), "{obj}");
         assert!(obj.contains("mem-path=/dev/hugepages"), "{obj}");
         assert!(obj.contains("share=on"), "{obj}");
@@ -794,7 +791,10 @@ mod tests {
     fn fs_args_use_virtiofs_tag_and_socket() {
         let mut args = Vec::new();
         push_fs_args(&mut args);
-        let chardev = args.iter().find(|a| a.starts_with("socket,id=virtiofs0")).unwrap();
+        let chardev = args
+            .iter()
+            .find(|a| a.starts_with("socket,id=virtiofs0"))
+            .unwrap();
         assert!(chardev.contains(VIRTIOFSD_SOCKET_PATH), "{chardev}");
         let device = args
             .iter()
@@ -894,7 +894,10 @@ mod tests {
     fn qmp_args_create_control_socket() {
         let mut args = Vec::new();
         push_qmp_args(&mut args);
-        let chardev = args.iter().find(|a| a.starts_with("socket,id=qmp0")).unwrap();
+        let chardev = args
+            .iter()
+            .find(|a| a.starts_with("socket,id=qmp0"))
+            .unwrap();
         assert!(chardev.contains(HYPERVISOR_API_SOCKET_PATH), "{chardev}");
         assert!(chardev.contains("server=on"), "{chardev}");
         assert!(chardev.contains("wait=off"), "{chardev}");
@@ -907,10 +910,7 @@ mod tests {
     fn platform_args_embed_binary_and_test_name() {
         let mut args = Vec::new();
         push_platform_args(&mut args, &sample_params());
-        let oem = args
-            .iter()
-            .find(|a| a.starts_with("type=11,"))
-            .unwrap();
+        let oem = args.iter().find(|a| a.starts_with("type=11,")).unwrap();
         assert!(oem.contains("exe=my_test-abc123"), "{oem}");
         assert!(oem.contains("test=module::test_name"), "{oem}");
     }
@@ -972,17 +972,11 @@ mod tests {
                     guest: true,
                     reason: qapi_qmp::ShutdownCause::guest_shutdown,
                 },
-                timestamp: serde_json::from_str(
-                    r#"{"seconds": 1, "microseconds": 0}"#,
-                )
-                .unwrap(),
+                timestamp: serde_json::from_str(r#"{"seconds": 1, "microseconds": 0}"#).unwrap(),
             },
             qapi_qmp::Event::STOP {
                 data: qapi_qmp::STOP {},
-                timestamp: serde_json::from_str(
-                    r#"{"seconds": 2, "microseconds": 0}"#,
-                )
-                .unwrap(),
+                timestamp: serde_json::from_str(r#"{"seconds": 2, "microseconds": 0}"#).unwrap(),
             },
         ]);
         let output = format!("{log}");
