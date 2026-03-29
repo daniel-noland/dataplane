@@ -13,17 +13,17 @@
 //! The `#[in_vm]` macro implements a three-tier dispatch based on environment
 //! variables (defined in `n_vm_protocol` and re-exported from `n_vm`):
 //!
-//! 1. **Host** (no env vars set) — the default when `cargo test` is invoked.
+//! 1. **Host** (no env vars set) -- the default when `cargo test` is invoked.
 //!    Delegates to [`n_vm::dispatch::run_host_tier`] which launches a Docker
 //!    container with the required devices and capabilities, then re-executes
 //!    the same test binary inside it.
 //!
-//! 2. **Container** (`IN_TEST_CONTAINER=YES`) — inside the Docker container.
+//! 2. **Container** (`IN_TEST_CONTAINER=YES`) -- inside the Docker container.
 //!    Delegates to [`n_vm::dispatch::run_container_tier`] which boots a
 //!    cloud-hypervisor VM, shares the test binary into the guest via
 //!    virtiofs, and re-executes the test inside the VM.
 //!
-//! 3. **VM guest** (`IN_VM=YES`) — inside the virtual machine, running under
+//! 3. **VM guest** (`IN_VM=YES`) -- inside the virtual machine, running under
 //!    the `n-it` init system.  The original test body executes directly.
 //!
 //! All runtime policy (tokio runtime construction, tracing configuration,
@@ -62,11 +62,11 @@ use syn::{ReturnType, parse_macro_input};
 /// # Compile-time validation
 ///
 /// The macro rejects functions that are:
-/// - **`async`** — the generated code creates its own tokio runtime at the
+/// - **`async`** -- the generated code creates its own tokio runtime at the
 ///   container tier, so the decorated function must be synchronous.
-/// - **Parameterised** — the function is re-invoked by name as `fn()` inside
+/// - **Parameterised** -- the function is re-invoked by name as `fn()` inside
 ///   the VM guest, so it cannot accept arguments.
-/// - **Non-unit return type** — the generated dispatch branches use bare
+/// - **Non-unit return type** -- the generated dispatch branches use bare
 ///   `return;` statements, so the function must return `()`.
 ///
 /// # Panics
@@ -145,13 +145,13 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
                 return;
             }
 
-            // ── Tier 2: Docker container → VM ────────────────────────
+            // ── Tier 2: Docker container -> VM ───────────────────────
             if ::n_vm::is_in_test_container() {
                 ::n_vm::run_container_tier(#ident);
                 return;
             }
 
-            // ── Tier 1: Host → Docker container ──────────────────────
+            // ── Tier 1: Host -> Docker container ─────────────────────
             ::n_vm::run_host_tier(#ident);
         }
     }
