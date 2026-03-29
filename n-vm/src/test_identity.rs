@@ -31,6 +31,10 @@
 pub(crate) struct TestIdentity {
     /// The fully-qualified type name after `&`-stripping.
     ///
+    /// Not currently read outside tests, but provided for future callers
+    /// that may need the full path (e.g. for logging or diagnostics).
+    #[allow(dead_code)]
+    ///
     /// This is the raw output of `std::any::type_name::<F>()` with any
     /// leading `&` removed.  It is a `&'static str` because `type_name`
     /// returns a `&'static str`.
@@ -107,11 +111,17 @@ mod tests {
         );
     }
 
+    /// Helper that infers the concrete function item type from a value,
+    /// mirroring how the `#[in_vm]` macro passes the function identifier.
+    fn resolve_for<F>(_: F) -> TestIdentity {
+        TestIdentity::resolve::<F>()
+    }
+
     #[test]
     fn resolve_with_concrete_function_item() {
         // When F is a concrete function item type (not `fn()`), type_name
         // returns the fully-qualified path of the function.
-        let id = TestIdentity::resolve::<fn() {dummy_test_function}>();
+        let id = resolve_for(dummy_test_function);
         assert!(
             id.test_name.ends_with("dummy_test_function"),
             "test_name should end with 'dummy_test_function': {:?}",
