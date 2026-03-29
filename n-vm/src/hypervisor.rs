@@ -121,15 +121,27 @@ impl tokio_util::codec::Decoder for AsyncJsonStreamDecoder {
     type Error = AsyncJsonStreamError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let buf = src.as_ref().to_vec();
-        let mut stream: StreamDeserializer<'_, serde_json::de::SliceRead<'_>, Event> =
-            serde_json::Deserializer::from_slice(&buf).into_iter::<Event>();
-        let next = stream.next();
-        let bytes_consumed = stream.byte_offset();
+        // Scope the immutable borrow of `src` (via `as_ref()`) so that we
+        // can call `src.advance()` afterward without a borrow conflict.
+        let (next, bytes_consumed) = {
+            let mut stream: StreamDeserializer<'_, serde_json::de::SliceRead<'_>, Event> =
+                serde_json::Deserializer::from_slice(src.as_ref()).into_iter::<Event>();
+            let next = stream.next();
+            (next, stream.byte_offset())
+        };
         match next {
             Some(Ok(value)) => {
                 src.advance(bytes_consumed);
                 Ok(Some(value))
+            }
+            // An EOF error means the buffer contains a partial JSON object
+            // that is still being written to the pipe.  Return `Ok(None)`
+            // to tell the framing layer to wait for more data rather than
+            // treating it as a fatal parse error.
+            Some(Err(err))
+                if err.classify() == serde_json::error::Category::Eof =>
+            {
+                Ok(None)
             }
             Some(Err(err)) => Err(AsyncJsonStreamError::Json(err)),
             None => Ok(None),
