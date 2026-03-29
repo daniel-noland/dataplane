@@ -20,7 +20,7 @@ fn test_which_does_not_run_in_vm() {
     assert_eq!(2 + 2, 4);
 }
 
-#[cfg(false)] // deactivated until needed as control
+#[ignore = "deactivated until needed as control"]
 #[should_panic]
 #[test]
 fn test_which_does_not_run_in_vm_control() {
