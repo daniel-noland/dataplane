@@ -45,6 +45,7 @@ pub mod backend;
 pub mod cloud_hypervisor;
 pub mod dispatch;
 pub mod error;
+pub mod qemu;
 
 mod abort_on_drop;
 mod container;
@@ -53,6 +54,7 @@ mod vm;
 
 pub use backend::{HypervisorBackend, HypervisorVerdict, LaunchedHypervisor};
 pub use cloud_hypervisor::CloudHypervisor;
+pub use qemu::Qemu;
 pub use container::{ContainerTestResult, run_test_in_vm};
 pub use dispatch::{is_in_test_container, is_in_vm, run_container_tier, run_host_tier};
 pub use error::{ContainerError, VmError};
