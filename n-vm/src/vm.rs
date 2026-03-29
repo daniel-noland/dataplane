@@ -3,6 +3,11 @@
 //! This module handles launching virtiofsd, configuring and booting a
 //! cloud-hypervisor VM, collecting output from all subsystems, and returning
 //! a unified [`VmTestOutput`].
+//!
+//! Test process stdout and stderr are forwarded from the VM guest to the
+//! container tier via dedicated vsock streams (one port per stream), giving
+//! the host clean separation of the two channels.  The cloud-hypervisor
+//! virtio-console (`hvc0`) is disabled — all test output travels over vsock.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -20,9 +25,11 @@ use n_vm_protocol::{
     CLOUD_HYPERVISOR_BINARY_PATH, HYPERVISOR_API_SOCKET_PATH, INIT_BINARY_PATH,
     KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH, VHOST_VSOCK_SOCKET_PATH,
     VIRTIOFSD_BINARY_PATH, VIRTIOFSD_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VM_GUEST_CID,
-    VM_ROOT_SHARE_PATH, VM_RUN_DIR, vhost_vsock_listener_path,
+    VM_ROOT_SHARE_PATH, VM_RUN_DIR, test_stderr_vsock_listener_path,
+    test_stdout_vsock_listener_path, vhost_vsock_listener_path,
 };
 use tokio::io::AsyncReadExt;
+use tokio::task::JoinHandle;
 use tracing::{debug, error};
 
 use crate::hypervisor;
@@ -62,6 +69,45 @@ async fn wait_for_socket(path: impl AsRef<Path>) {
         path.display(),
         SOCKET_POLL_MAX_ATTEMPTS as u64 * SOCKET_POLL_INTERVAL.as_millis() as u64,
     );
+}
+
+// ── Helper: vsock reader ─────────────────────────────────────────────
+
+/// Initial buffer capacity for vsock reader tasks.
+const VSOCK_READER_CAPACITY: usize = 32_768;
+
+/// Binds a Unix listener at `path`, then spawns a task that accepts a single
+/// connection and reads it to EOF, returning the collected bytes as a `String`.
+///
+/// This pattern is shared by the init-system tracing channel, test stdout,
+/// and test stderr — all of which are vsock streams that the VM guest
+/// connects to via `vhost_vsock`.
+///
+/// The listener must be bound *before* the VM boots so that the guest-side
+/// `vsock::VsockStream::connect()` succeeds immediately.
+fn spawn_vsock_reader(path: String, label: &'static str) -> JoinHandle<String> {
+    let listen = tokio::net::UnixListener::bind(&path)
+        .unwrap_or_else(|e| panic!("failed to bind {label} vsock listener at {path}: {e}"));
+    tokio::spawn(async move {
+        let mut buf = Vec::with_capacity(VSOCK_READER_CAPACITY);
+        let (mut connection, _) = listen
+            .accept()
+            .await
+            .unwrap_or_else(|e| panic!("failed to accept {label} vsock connection: {e}"));
+        loop {
+            match connection.read_buf(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => {
+                    error!("error reading {label} vsock stream: {e}");
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    })
 }
 
 // ── Helper: virtiofsd ────────────────────────────────────────────────
@@ -114,6 +160,9 @@ struct TestVmParams<'a> {
 /// CPU topology, memory size, network layout) from the **where** (test
 /// binary path, test name) so that the orchestration code in
 /// [`run_in_vm`] stays focused on lifecycle management.
+///
+/// The virtio-console is disabled (`Mode::Off`) because test stdout/stderr
+/// are forwarded via dedicated vsock streams instead.
 fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
     let TestVmParams {
         full_bin_path,
@@ -211,7 +260,9 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
             id: Some(VIRTIOFS_ROOT_TAG.into()),
             ..Default::default()
         }]),
-        console: Some(ConsoleConfig::new(Mode::Tty)),
+        // The virtio-console is disabled: test stdout/stderr travel over
+        // dedicated vsock streams (TEST_STDOUT_VSOCK_PORT / TEST_STDERR_VSOCK_PORT).
+        console: Some(ConsoleConfig::new(Mode::Off)),
         serial: Some(ConsoleConfig {
             mode: Mode::Socket,
             socket: Some(KERNEL_CONSOLE_SOCKET_PATH.into()),
@@ -248,17 +299,25 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
 /// test's own stdout/stderr).  Its [`Display`](std::fmt::Display) implementation
 /// formats everything into labelled sections for easy reading in test failure
 /// output.
+///
+/// Test stdout and stderr are collected via dedicated vsock streams, so they
+/// are cleanly separated from each other and from the cloud-hypervisor
+/// process's own diagnostic output.
 pub struct VmTestOutput {
     /// Whether the test, hypervisor, and virtiofsd all exited successfully.
     pub success: bool,
-    /// Captured stdout from the cloud-hypervisor process.
+    /// Captured stdout from the test process (via vsock).
     pub stdout: String,
-    /// Captured stderr from the cloud-hypervisor process.
+    /// Captured stderr from the test process (via vsock).
     pub stderr: String,
     /// Kernel serial console output (from the guest's `ttyS0`).
     pub console: String,
     /// Tracing output from the `n-it` init system, streamed via vsock.
     pub init_trace: String,
+    /// Captured stdout from the cloud-hypervisor process itself.
+    pub hypervisor_stdout: String,
+    /// Captured stderr from the cloud-hypervisor process itself.
+    pub hypervisor_stderr: String,
     /// Captured stdout from the virtiofsd process.
     pub virtiofsd_stdout: String,
     /// Captured stderr from the virtiofsd process.
@@ -278,6 +337,10 @@ impl std::fmt::Display for VmTestOutput {
                 event.timestamp, event.source, event.event, event.properties
             )?;
         }
+        writeln!(f, "--------------- cloud-hypervisor stdout ---------------")?;
+        writeln!(f, "{}", self.hypervisor_stdout)?;
+        writeln!(f, "--------------- cloud-hypervisor stderr ---------------")?;
+        writeln!(f, "{}", self.hypervisor_stderr)?;
         writeln!(f, "--------------- virtiofsd stdout ---------------")?;
         writeln!(f, "{}", self.virtiofsd_stdout)?;
         writeln!(f, "--------------- virtiofsd stderr ---------------")?;
@@ -302,10 +365,12 @@ impl std::fmt::Display for VmTestOutput {
 /// by `#[in_vm]` when `IN_TEST_CONTAINER=YES`.  It:
 ///
 /// 1. Launches virtiofsd to share the container's root filesystem into the VM.
-/// 2. Binds a Unix socket for the init system's vsock tracing stream.
+/// 2. Binds Unix sockets for the init system's vsock tracing stream and for
+///    the test process's stdout and stderr vsock streams.
 /// 3. Configures and boots a cloud-hypervisor VM with the test binary as the
 ///    init payload argument.
-/// 4. Collects hypervisor events, kernel console output, and init system traces.
+/// 4. Collects hypervisor events, kernel console output, init system traces,
+///    and test stdout/stderr.
 /// 5. Shuts down the VM and returns a [`VmTestOutput`] with the results.
 ///
 /// The type parameter `F` is used only to derive the test name via
@@ -326,30 +391,21 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
     // ── Launch virtiofsd ─────────────────────────────────────────────
     let virtiofsd = launch_virtiofsd(VM_ROOT_SHARE_PATH).await;
 
-    // ── Bind vsock listener for init system tracing ──────────────────
-    let listen = tokio::net::UnixListener::bind(vhost_vsock_listener_path())
-        .expect("failed to bind vsock listener unix socket");
-    let init_system_trace = tokio::spawn(async move {
-        const CAPACITY_GUESS: usize = 32_768;
-        let mut buf = Vec::with_capacity(CAPACITY_GUESS);
-        let (mut connection, _) = listen
-            .accept()
-            .await
-            .expect("failed to accept init system vsock connection");
-        loop {
-            match connection.read_buf(&mut buf).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    tokio::task::yield_now().await;
-                }
-                Err(e) => {
-                    error!("error reading init system vsock stream: {e}");
-                    break;
-                }
-            }
-        }
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+    // ── Bind vsock listeners ─────────────────────────────────────────
+    // All three listeners must be bound *before* the VM boots so that the
+    // guest-side vsock connections succeed immediately.
+    let init_system_trace = spawn_vsock_reader(
+        vhost_vsock_listener_path(),
+        "init-trace",
+    );
+    let test_stdout = spawn_vsock_reader(
+        test_stdout_vsock_listener_path(),
+        "test-stdout",
+    );
+    let test_stderr = spawn_vsock_reader(
+        test_stderr_vsock_listener_path(),
+        "test-stderr",
+    );
 
     // ── Build VM configuration ───────────────────────────────────────
     let config = build_vm_config(&TestVmParams {
@@ -437,6 +493,14 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
         Ok(log) => log,
         Err(err) => format!("unable to join init system task: {err}"),
     };
+    let test_stdout = match test_stdout.await {
+        Ok(log) => log,
+        Err(err) => format!("unable to join test stdout task: {err}"),
+    };
+    let test_stderr = match test_stderr.await {
+        Ok(log) => log,
+        Err(err) => format!("unable to join test stderr task: {err}"),
+    };
     let (hypervisor_events, hypervisor_verdict) = hypervisor_watch
         .await
         .expect("hypervisor event watcher task panicked");
@@ -474,10 +538,12 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
         success: virtiofsd.status.success()
             && hypervisor_verdict
             && hypervisor_output.status.success(),
-        stdout: String::from_utf8_lossy(&hypervisor_output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&hypervisor_output.stderr).into_owned(),
+        stdout: test_stdout,
+        stderr: test_stderr,
         console: kernel_log,
         init_trace,
+        hypervisor_stdout: String::from_utf8_lossy(&hypervisor_output.stdout).into_owned(),
+        hypervisor_stderr: String::from_utf8_lossy(&hypervisor_output.stderr).into_owned(),
         virtiofsd_stdout: String::from_utf8_lossy(virtiofsd.stdout.as_slice()).into_owned(),
         virtiofsd_stderr: String::from_utf8_lossy(virtiofsd.stderr.as_slice()).into_owned(),
         hypervisor_events,
