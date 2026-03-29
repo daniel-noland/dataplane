@@ -31,6 +31,7 @@ pub mod dispatch;
 pub mod error;
 pub mod hypervisor;
 
+mod abort_on_drop;
 mod container;
 mod vm;
 

@@ -53,6 +53,7 @@ use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
+use crate::abort_on_drop::AbortOnDrop;
 use crate::error::VmError;
 use crate::hypervisor::{self, HypervisorVerdict};
 
@@ -117,7 +118,7 @@ async fn wait_for_socket(path: impl AsRef<Path>) -> Result<(), VmError> {
 ///
 /// The listener must be bound *before* the VM boots so that the guest-side
 /// `vsock::VsockStream::connect()` succeeds immediately.
-fn spawn_vsock_reader(channel: &VsockChannel) -> Result<JoinHandle<String>, VmError> {
+fn spawn_vsock_reader(channel: &VsockChannel) -> Result<AbortOnDrop<String>, VmError> {
     let path = channel.listener_path();
     let label = channel.label;
     let listen = tokio::net::UnixListener::bind(&path).map_err(|source| VmError::VsockBind {
@@ -125,7 +126,7 @@ fn spawn_vsock_reader(channel: &VsockChannel) -> Result<JoinHandle<String>, VmEr
         path: path.clone(),
         source,
     })?;
-    Ok(tokio::spawn(async move {
+    Ok(AbortOnDrop::spawn(async move {
         let mut buf = Vec::with_capacity(VSOCK_READER_CAPACITY);
         let mut connection = match listen.accept().await {
             Ok((stream, _)) => stream,
@@ -183,6 +184,89 @@ async fn launch_virtiofsd(path: impl AsRef<str>) -> Result<tokio::process::Child
         .kill_on_drop(true)
         .spawn()
         .map_err(VmError::VirtiofsdSpawn)
+}
+
+// ── Helper: hypervisor process ───────────────────────────────────────
+
+/// Creates the event-monitor pipe, verifies `/dev/kvm`, spawns the
+/// cloud-hypervisor binary, and waits for the API socket to appear.
+///
+/// Returns the child process handle and the event-monitor pipe receiver
+/// (which is consumed by [`hypervisor::watch`]).
+async fn spawn_hypervisor() -> Result<(tokio::process::Child, tokio::net::unix::pipe::Receiver), VmError> {
+    let (event_sender, event_receiver) =
+        tokio::net::unix::pipe::pipe().map_err(VmError::EventPipe)?;
+    let event_sender = event_sender
+        .into_blocking_fd()
+        .map_err(VmError::EventSenderFd)?;
+
+    match tokio::fs::try_exists("/dev/kvm").await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(VmError::KvmNotAccessible(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "/dev/kvm does not exist",
+            )));
+        }
+        Err(err) => {
+            return Err(VmError::KvmNotAccessible(err));
+        }
+    }
+
+    let hypervisor = tokio::process::Command::new(CLOUD_HYPERVISOR_BINARY_PATH)
+        .args([
+            "--api-socket",
+            format!("path={HYPERVISOR_API_SOCKET_PATH}").as_str(),
+            "--event-monitor",
+            format!("fd={EVENT_MONITOR_FD}").as_str(),
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .fd_mappings(vec![FdMapping {
+            parent_fd: event_sender,
+            child_fd: EVENT_MONITOR_FD,
+        }])
+        .map_err(|e| VmError::FdMapping(format!("{e:?}")))?
+        .spawn()
+        .map_err(VmError::HypervisorSpawn)?;
+
+    // The first VMM event becoming readable indicates the hypervisor
+    // has started.  We then poll until the API socket appears on the
+    // filesystem.
+    event_receiver
+        .readable()
+        .await
+        .map_err(VmError::EventMonitorNotReadable)?;
+    wait_for_socket(HYPERVISOR_API_SOCKET_PATH).await?;
+
+    Ok((hypervisor, event_receiver))
+}
+
+// ── Helper: kernel console reader ────────────────────────────────────
+
+/// Spawns a background task that connects to the kernel serial console
+/// socket and reads it to EOF.
+///
+/// The console socket is created by cloud-hypervisor after the VM boots,
+/// so the task polls for its existence before attempting to connect.
+fn spawn_kernel_log_reader() -> AbortOnDrop<String> {
+    AbortOnDrop::spawn(async move {
+        if let Err(e) = wait_for_socket(KERNEL_CONSOLE_SOCKET_PATH).await {
+            return format!("!!!KERNEL LOG UNAVAILABLE: socket not ready: {e}!!!");
+        }
+        match tokio::net::UnixStream::connect(KERNEL_CONSOLE_SOCKET_PATH).await {
+            Ok(mut stream) => {
+                let mut log = String::with_capacity(16_384);
+                if let Err(e) = stream.read_to_string(&mut log).await {
+                    warn!("error reading kernel console: {e}");
+                }
+                log
+            }
+            Err(e) => format!("!!!KERNEL LOG UNAVAILABLE: connect failed: {e}!!!"),
+        }
+    })
 }
 
 // ── Helper: process output collection ────────────────────────────────
@@ -486,146 +570,81 @@ pub struct TestVm {
     /// generated client takes `&self`).
     client: Arc<tokio::sync::Mutex<dyn DefaultApi>>,
     /// Background task watching hypervisor lifecycle events.
-    event_watcher: JoinHandle<(Vec<hypervisor::Event>, HypervisorVerdict)>,
+    ///
+    /// Wrapped in [`AbortOnDrop`] so the task is automatically aborted if
+    /// the `TestVm` is dropped without calling [`collect`](Self::collect)
+    /// (e.g. due to a panic in surrounding code).
+    event_watcher: AbortOnDrop<(Vec<hypervisor::Event>, HypervisorVerdict)>,
     /// Background task collecting init system tracing output via vsock.
-    init_trace: JoinHandle<String>,
+    init_trace: AbortOnDrop<String>,
     /// Background task collecting test process stdout via vsock.
-    test_stdout: JoinHandle<String>,
+    test_stdout: AbortOnDrop<String>,
     /// Background task collecting test process stderr via vsock.
-    test_stderr: JoinHandle<String>,
+    test_stderr: AbortOnDrop<String>,
     /// Background task collecting kernel serial console output.
-    kernel_log: JoinHandle<String>,
+    kernel_log: AbortOnDrop<String>,
 }
 
 impl TestVm {
     /// Prepares the environment and boots the VM.
     ///
-    /// This method:
+    /// This method orchestrates five focused phases, each delegated to a
+    /// helper function:
     ///
-    /// 1. Launches virtiofsd to share the container filesystem.
-    /// 2. Binds vsock listeners for all [`VsockChannel`]s.
-    /// 3. Spawns cloud-hypervisor with the event-monitor pipe.
-    /// 4. Creates and boots the VM via the hypervisor API.
-    /// 5. Spawns background tasks for event monitoring, kernel console
-    ///    reading, and vsock stream collection.
+    /// 1. [`launch_virtiofsd`] — share the container filesystem into the VM.
+    /// 2. [`spawn_vsock_reader`] — bind vsock listeners for all channels.
+    /// 3. [`spawn_hypervisor`] — create the event pipe, verify `/dev/kvm`,
+    ///    spawn cloud-hypervisor, and wait for the API socket.
+    /// 4. Create and boot the VM via the hypervisor REST API.
+    /// 5. [`spawn_kernel_log_reader`] — start collecting kernel console output.
     ///
-    /// On failure, all resources created so far are dropped (which kills
-    /// child processes and aborts spawned tasks via `kill_on_drop(true)`).
+    /// All background tasks are wrapped in [`AbortOnDrop`], so if any phase
+    /// fails (or the method panics), previously spawned tasks are
+    /// automatically aborted when their handles drop.  Child processes use
+    /// `kill_on_drop(true)` for the same guarantee.
     pub async fn launch(params: &TestVmParams<'_>) -> Result<Self, VmError> {
-        // ── Launch virtiofsd ─────────────────────────────────────────
+        // ── Phase 1: Launch virtiofsd ────────────────────────────────
         let virtiofsd = launch_virtiofsd(VM_ROOT_SHARE_PATH).await?;
 
-        // ── Bind vsock listeners ─────────────────────────────────────
+        // ── Phase 2: Bind vsock listeners ────────────────────────────
         // All listeners must be bound *before* the VM boots so that the
         // guest-side vsock connections succeed immediately.
         let init_trace = spawn_vsock_reader(&VsockChannel::INIT_TRACE)?;
         let test_stdout = spawn_vsock_reader(&VsockChannel::TEST_STDOUT)?;
         let test_stderr = spawn_vsock_reader(&VsockChannel::TEST_STDERR)?;
 
-        // ── Build VM configuration ───────────────────────────────────
+        // ── Phase 3: Spawn cloud-hypervisor ──────────────────────────
+        let (hypervisor, event_receiver) = spawn_hypervisor().await?;
+
+        // ── Phase 4: Create and boot the VM ──────────────────────────
         let config = build_vm_config(params);
 
-        // ── Spawn cloud-hypervisor ───────────────────────────────────
-        let (event_sender, event_receiver) =
-            tokio::net::unix::pipe::pipe().map_err(VmError::EventPipe)?;
-        let event_sender = event_sender
-            .into_blocking_fd()
-            .map_err(VmError::EventSenderFd)?;
-
-        match tokio::fs::try_exists("/dev/kvm").await {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(VmError::KvmNotAccessible(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "/dev/kvm does not exist",
-                )));
-            }
-            Err(err) => {
-                return Err(VmError::KvmNotAccessible(err));
-            }
-        }
-
-        let hypervisor = tokio::process::Command::new(CLOUD_HYPERVISOR_BINARY_PATH)
-            .args([
-                "--api-socket",
-                format!("path={HYPERVISOR_API_SOCKET_PATH}").as_str(),
-                "--event-monitor",
-                format!("fd={EVENT_MONITOR_FD}").as_str(),
-            ])
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .fd_mappings(vec![FdMapping {
-                parent_fd: event_sender,
-                child_fd: EVENT_MONITOR_FD,
-            }])
-            .map_err(|e| VmError::FdMapping(format!("{e:?}")))?
-            .spawn()
-            .map_err(VmError::HypervisorSpawn)?;
-
-        // ── Wait for the hypervisor API socket ───────────────────────
-        // The first VMM event becoming readable indicates the hypervisor
-        // has started.  We then poll until the API socket appears on the
-        // filesystem.
-        event_receiver
-            .readable()
-            .await
-            .map_err(VmError::EventMonitorNotReadable)?;
-        wait_for_socket(HYPERVISOR_API_SOCKET_PATH).await?;
-
-        // ── Create and boot the VM ───────────────────────────────────
         let client = Arc::new(tokio::sync::Mutex::new(
             cloud_hypervisor_client::socket_based_api_client(HYPERVISOR_API_SOCKET_PATH),
         ));
 
-        if let Err(e) = client
+        client
             .lock()
             .await
             .create_vm(config)
             .await
-        {
-            init_trace.abort();
-            test_stdout.abort();
-            test_stderr.abort();
-            return Err(VmError::VmCreate {
+            .map_err(|e| VmError::VmCreate {
                 reason: format!("{e:?}"),
-            });
-        }
+            })?;
 
-        let event_watcher = tokio::spawn(hypervisor::watch(event_receiver));
+        let event_watcher = AbortOnDrop::spawn(hypervisor::watch(event_receiver));
 
-        let kernel_log = tokio::task::spawn(async move {
-            if let Err(e) = wait_for_socket(KERNEL_CONSOLE_SOCKET_PATH).await {
-                return format!("!!!KERNEL LOG UNAVAILABLE: socket not ready: {e}!!!");
-            }
-            match tokio::net::UnixStream::connect(KERNEL_CONSOLE_SOCKET_PATH).await {
-                Ok(mut stream) => {
-                    let mut log = String::with_capacity(16_384);
-                    if let Err(e) = stream.read_to_string(&mut log).await {
-                        warn!("error reading kernel console: {e}");
-                    }
-                    log
-                }
-                Err(e) => format!("!!!KERNEL LOG UNAVAILABLE: connect failed: {e}!!!"),
-            }
-        });
-
-        if let Err(e) = client
+        client
             .lock()
             .await
             .boot_vm()
             .await
-        {
-            init_trace.abort();
-            test_stdout.abort();
-            test_stderr.abort();
-            event_watcher.abort();
-            kernel_log.abort();
-            return Err(VmError::VmBoot {
+            .map_err(|e| VmError::VmBoot {
                 reason: format!("{e:?}"),
-            });
-        }
+            })?;
+
+        // ── Phase 5: Start kernel console reader ─────────────────────
+        let kernel_log = spawn_kernel_log_reader();
 
         Ok(Self {
             hypervisor,
@@ -658,6 +677,15 @@ impl TestVm {
             test_stderr,
             kernel_log,
         } = self;
+
+        // Extract the inner JoinHandles from AbortOnDrop wrappers.
+        // This disarms the abort-on-drop behavior — from this point on,
+        // we own the handles directly and will await them below.
+        let event_watcher = event_watcher.into_inner();
+        let init_trace = init_trace.into_inner();
+        let test_stdout = test_stdout.into_inner();
+        let test_stderr = test_stderr.into_inner();
+        let kernel_log = kernel_log.into_inner();
 
         // ── Collect vsock / task output ──────────────────────────────
         // The vsock readers complete when the guest-side streams close
