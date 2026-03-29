@@ -186,19 +186,23 @@ pub struct LaunchedHypervisor<B: HypervisorBackend> {
 ///
 /// The `#[in_vm]` proc macro (in `n-vm-macros`) generates a call to
 /// [`run_container_tier`](crate::dispatch::run_container_tier) with an
-/// explicit backend type parameter:
+/// explicit backend type parameter selected by an optional argument:
 ///
 /// ```ignore
+/// // #[in_vm] or #[in_vm(cloud_hypervisor)]
 /// ::n_vm::run_container_tier::<::n_vm::CloudHypervisor, _>(test_fn);
+///
+/// // #[in_vm(qemu)]
+/// ::n_vm::run_container_tier::<::n_vm::Qemu, _>(test_fn);
 /// ```
 ///
-/// To make the new backend available:
+/// To make a new backend available to the proc macro:
 ///
 /// 1. Re-export the backend struct from `lib.rs` (e.g.
 ///    `pub use qemu::Qemu;`).
-/// 2. Update the proc macro to support backend selection -- either by
-///    changing the hardcoded type or by accepting an optional attribute
-///    argument (e.g. `#[in_vm(qemu)]`).
+/// 2. Add an entry to the `KNOWN_BACKENDS` table in `n-vm-macros`
+///    mapping a user-facing identifier (e.g. `"qemu"`) to the
+///    fully-qualified type path (e.g. `"::n_vm::Qemu"`).
 ///
 /// ## 6. Register in `lib.rs`
 ///

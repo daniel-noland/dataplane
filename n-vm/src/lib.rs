@@ -20,13 +20,23 @@
 //! # Hypervisor backends
 //!
 //! The [`backend`] module defines the [`HypervisorBackend`] trait that
-//! abstracts over different hypervisors.  The [`cloud_hypervisor`] module
-//! provides the default implementation ([`CloudHypervisor`]).
+//! abstracts over different hypervisors.  Two implementations are
+//! provided:
+//!
+//! - [`CloudHypervisor`] (in [`cloud_hypervisor`]) -- the default backend.
+//! - [`Qemu`] (in [`qemu`]) -- QEMU/KVM backend using QMP for lifecycle
+//!   control.
 //!
 //! [`TestVm`], [`run_in_vm`], and [`run_container_tier`] are all generic
-//! over the backend.  The `#[in_vm]` proc macro currently instantiates
-//! them with [`CloudHypervisor`], but callers can substitute any backend
-//! that implements [`HypervisorBackend`].
+//! over the backend.  The `#[in_vm]` proc macro selects the backend
+//! based on an optional argument:
+//!
+//! - `#[in_vm]` -- uses [`CloudHypervisor`] (the default).
+//! - `#[in_vm(cloud_hypervisor)]` -- same as above, explicitly.
+//! - `#[in_vm(qemu)]` -- uses [`Qemu`].
+//!
+//! Callers can also substitute any backend that implements
+//! [`HypervisorBackend`] by invoking the generic functions directly.
 //!
 //! # Error handling
 //!

@@ -6,10 +6,13 @@
 //! Both [`run_container_tier`] and [`run_host_tier`] are generic over a
 //! [`HypervisorBackend`](crate::backend::HypervisorBackend) so that the
 //! proc macro can select the backend at code-generation time.  The
-//! `#[in_vm]` macro currently hardcodes
-//! [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor), but
-//! future extensions (e.g. `#[in_vm(qemu)]`) can substitute a different
-//! backend without changing any runtime code.
+//! `#[in_vm]` macro selects the backend based on an optional argument:
+//!
+//! - `#[in_vm]` -- uses
+//!   [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor)
+//!   (the default).
+//! - `#[in_vm(cloud_hypervisor)]` -- same as above, explicitly.
+//! - `#[in_vm(qemu)]` -- uses [`Qemu`](crate::qemu::Qemu).
 //!
 //! The [`in_vm`](crate::in_vm) attribute macro rewrites a test function into a
 //! three-tier dispatch (host -> container -> VM guest).  Rather than generating
@@ -80,8 +83,10 @@ fn init_tracing() {
 /// 4. Prints the collected output and asserts success.
 ///
 /// The type parameter `B` selects the hypervisor backend.  The `#[in_vm]`
-/// proc macro currently passes
-/// [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor).
+/// proc macro passes
+/// [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor) by
+/// default, or [`Qemu`](crate::qemu::Qemu) when `#[in_vm(qemu)]` is
+/// used.
 ///
 /// The type parameter `F` is used only to derive the test name via
 /// [`std::any::type_name`]; the function value itself is never called in
