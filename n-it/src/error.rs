@@ -9,6 +9,8 @@
 //! deciding how to handle each error — typically by logging context and
 //! aborting via [`fatal!`].
 
+use std::path::Path;
+
 use n_vm_protocol::VsockChannel;
 use nix::errno::Errno;
 use nix::sys::signal::Signal;
@@ -20,24 +22,24 @@ use nix::sys::signal::Signal;
 pub enum MountError {
     /// The kernel returned `EPERM` — the init process lacks the required
     /// capability (should never happen for PID 1 in a normal VM).
-    #[error("permission denied while mounting {target}")]
+    #[error("permission denied while mounting {}", .target.display())]
     PermissionDenied {
         /// The mount point path that failed.
-        target: &'static str,
+        target: &'static Path,
     },
 
     /// The kernel returned an unrecognised errno during mount.
-    #[error("unknown error while mounting {target}")]
+    #[error("unknown error while mounting {}", .target.display())]
     Unknown {
         /// The mount point path that failed.
-        target: &'static str,
+        target: &'static Path,
     },
 
     /// A mount syscall failed with a specific errno.
-    #[error("failed to mount {target}: {source}")]
+    #[error("failed to mount {}: {source}", .target.display())]
     Failed {
         /// The mount point path that failed.
-        target: &'static str,
+        target: &'static Path,
         /// The underlying errno.
         source: Errno,
     },
@@ -48,28 +50,29 @@ pub enum MountError {
 pub enum UnmountError {
     /// The mount point remained busy after exhausting all retry attempts.
     #[error(
-        "{target} still busy after {attempts} retries; \
-         a leaked process is likely holding a file descriptor open"
+        "{} still busy after {attempts} retries; \
+         a leaked process is likely holding a file descriptor open",
+        .target.display()
     )]
     BusyExhausted {
         /// The mount point path that could not be unmounted.
-        target: &'static str,
+        target: &'static Path,
         /// The number of retry attempts made.
         attempts: u32,
     },
 
     /// The mount point was not actually mounted, or the path is invalid.
-    #[error("{target} not mounted or invalid")]
+    #[error("{} not mounted or invalid", .target.display())]
     NotMounted {
         /// The mount point path.
-        target: &'static str,
+        target: &'static Path,
     },
 
     /// An unexpected errno was returned by `umount2`.
-    #[error("failed to unmount {target}: {source}")]
+    #[error("failed to unmount {}: {source}", .target.display())]
     Failed {
         /// The mount point path that failed.
-        target: &'static str,
+        target: &'static Path,
         /// The underlying errno.
         source: Errno,
     },
