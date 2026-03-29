@@ -34,6 +34,7 @@ use tokio_vsock::VMADDR_CID_HOST;
 mod utils;
 
 mod child;
+mod error;
 mod mount;
 mod signal;
 

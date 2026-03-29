@@ -12,6 +12,11 @@
 //!
 //! Each phase delegates to a focused module, so the orchestrator itself
 //! requires only local reasoning about sequencing.
+//!
+//! **Error handling boundary**: the subsystem modules return typed
+//! [`Result`] values and outcome enums.  This orchestrator is the
+//! outermost boundary where unrecoverable errors are converted to
+//! [`fatal!`] calls (which flush I/O and abort the process).
 
 use std::convert::Infallible;
 
@@ -20,6 +25,7 @@ use nix::unistd::Pid;
 use tracing::{debug, error, info};
 
 use crate::child;
+use crate::error::TerminateOutcome;
 use crate::mount;
 use crate::signal::{SignalPolicy, SignalSet, SIGNAL_TABLE};
 
@@ -52,13 +58,21 @@ impl InitSystem {
         debug!("signal handlers registered");
 
         // ── Filesystem setup ─────────────────────────────────────
-        match tokio::task::spawn_blocking(mount::mount_essential_filesystems).await {
-            Ok(()) => {}
+        match tokio::task::spawn_blocking(|| {
+            mount::mount_essential_filesystems()
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => fatal!("filesystem setup failed: {e}"),
             Err(e) => fatal!("mount filesystem task panicked: {e}"),
         }
 
         // ── Spawn test process ───────────────────────────────────
-        let mut test_child = child::spawn_main_process().await;
+        let mut test_child = match child::spawn_main_process().await {
+            Ok(child) => child,
+            Err(e) => fatal!("failed to start test process: {e}"),
+        };
         let pid = match test_child.id() {
             Some(id) => Pid::from_raw(id as i32),
             None => fatal!("unable to determine PID of spawned test process"),
@@ -117,11 +131,18 @@ impl InitSystem {
         info!("beginning system shutdown");
 
         // Terminate all child processes; leaked processes downgrade success.
-        let success = child::terminate_remaining_processes().await.is_none() && success;
+        let terminate_outcome = child::terminate_remaining_processes().await;
+        let success = terminate_outcome.is_clean() && success;
+
+        if matches!(terminate_outcome, TerminateOutcome::ExhaustedRetries) {
+            error!("some child processes could not be terminated");
+        }
 
         // Final sync, unmount, and power off / abort.
         match tokio::task::spawn_blocking(move || {
-            mount::unmount_filesystems();
+            if let Err(e) = mount::unmount_filesystems() {
+                fatal!("failed to unmount filesystems: {e}");
+            }
             if success {
                 info!("powering off");
                 match reboot(RebootMode::RB_POWER_OFF) {
