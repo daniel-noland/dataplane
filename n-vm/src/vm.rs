@@ -568,14 +568,19 @@ impl TestVm {
             cloud_hypervisor_client::socket_based_api_client(HYPERVISOR_API_SOCKET_PATH),
         ));
 
-        client
+        if let Err(e) = client
             .lock()
             .await
             .create_vm(config)
             .await
-            .map_err(|e| VmError::VmCreate {
+        {
+            init_trace.abort();
+            test_stdout.abort();
+            test_stderr.abort();
+            return Err(VmError::VmCreate {
                 reason: format!("{e:?}"),
-            })?;
+            });
+        }
 
         let event_watcher = tokio::spawn(hypervisor::watch(event_receiver));
 
@@ -595,14 +600,21 @@ impl TestVm {
             }
         });
 
-        client
+        if let Err(e) = client
             .lock()
             .await
             .boot_vm()
             .await
-            .map_err(|e| VmError::VmBoot {
+        {
+            init_trace.abort();
+            test_stdout.abort();
+            test_stderr.abort();
+            event_watcher.abort();
+            kernel_log.abort();
+            return Err(VmError::VmBoot {
                 reason: format!("{e:?}"),
-            })?;
+            });
+        }
 
         Ok(Self {
             hypervisor,
