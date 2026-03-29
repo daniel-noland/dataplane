@@ -488,7 +488,18 @@ pub fn run_test_in_vm<F: FnOnce()>(
         let cleanup_result = collect_and_cleanup(&client, &container_id).await;
 
         // Propagate the log streaming error first if it occurred — it is
-        // the root cause.  Otherwise return the cleanup result.
+        // the root cause.  But if cleanup also failed, log that error so
+        // the container leak is visible even though we cannot return both
+        // errors.
+        if let (Err(log_err), Err(cleanup_err)) = (&log_result, &cleanup_result) {
+            tracing::error!(
+                %log_err,
+                %cleanup_err,
+                container_id,
+                "both log streaming and container cleanup failed; \
+                 propagating log error, but the container may have leaked",
+            );
+        }
         log_result?;
         cleanup_result
     })
