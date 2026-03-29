@@ -293,6 +293,11 @@ pub const VIRTIOFSD_BINARY_PATH: &str = "/bin/virtiofsd";
 ///
 /// **Backend-specific**: used only by the
 /// [`CloudHypervisor`](../n_vm/cloud_hypervisor/struct.CloudHypervisor.html)
-/// backend.  Other backends define their own binary path constants (or
-/// will, once added).
+/// backend.
 pub const CLOUD_HYPERVISOR_BINARY_PATH: &str = "/bin/cloud-hypervisor";
+
+/// Path to the QEMU system emulator binary inside the container.
+///
+/// **Backend-specific**: used only by the
+/// [`Qemu`](../n_vm/qemu/struct.Qemu.html) backend.
+pub const QEMU_BINARY_PATH: &str = "/bin/qemu-system-x86_64";
