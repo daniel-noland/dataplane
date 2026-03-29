@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Open Network Fabric Authors
+
+#![warn(missing_docs)]
+
 //! Proc macro crate for the `n-vm` test infrastructure.
 //!
 //! This crate provides the [`in_vm`] attribute macro, which rewrites a test
