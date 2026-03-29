@@ -14,7 +14,7 @@ use bollard::secret::{
 };
 use n_vm_protocol::{
     CONTAINER_IMAGE, CONTAINER_PLATFORM, ENV_IN_TEST_CONTAINER, ENV_MARKER_VALUE,
-    VM_ROOT_SHARE_PATH,
+    VM_ROOT_SHARE_PATH, VM_RUN_DIR,
 };
 use tokio_stream::StreamExt;
 
@@ -148,7 +148,7 @@ fn build_container_config(params: &ContainerParams<'_>) -> ContainerCreateBody {
     let tmpfs = {
         let mut map = std::collections::HashMap::new();
         map.insert(
-            "/vm".into(),
+            VM_RUN_DIR.into(),
             format!("nodev,noexec,nosuid,uid={uid},gid={gid}"),
         );
         map
@@ -244,7 +244,7 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
             "/dev/vhost-net".into(),
             docker_host,
         ];
-        let device_groups: Vec<String> = required_files
+        let mut device_groups: Vec<String> = required_files
             .iter()
             .map(|path| {
                 std::fs::metadata(path)
@@ -253,6 +253,8 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> ContainerTestResult {
                     .to_string()
             })
             .collect();
+        device_groups.sort_unstable();
+        device_groups.dedup();
 
         // ── Build container configuration ────────────────────────────
         let uid = nix::unistd::getuid().as_raw();
