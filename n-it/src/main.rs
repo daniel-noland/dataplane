@@ -80,9 +80,8 @@ fn main() -> Infallible {
 
         let init_span = tracing::span!(tracing::Level::INFO, "init");
         let _guard = init_span.enter();
-        const INIT_PID: u32 = 1;
-        if process::id() != INIT_PID {
-            fatal!("this program must be run as PID {INIT_PID} (init process)");
+        if process::id() != child::INIT_PID {
+            fatal!("this program must be run as PID {} (init process)", child::INIT_PID);
         }
         InitSystem::run().await
     })

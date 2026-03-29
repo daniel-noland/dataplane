@@ -207,6 +207,12 @@ pub fn forward_signal(pid: Pid, sig: Signal) {
     }
 }
 
+/// The PID of the init process (PID 1).
+///
+/// Used to filter `/proc` entries when listing direct children of init,
+/// and to verify that the binary is running as PID 1 in [`crate::main`].
+pub const INIT_PID: u32 = 1;
+
 /// Maximum number of SIGTERM rounds before giving up.
 pub const MAX_SIGTERM_ATTEMPTS: u8 = 50;
 
@@ -316,7 +322,7 @@ pub async fn list_child_processes() -> Result<Vec<Pid>, ListChildrenError> {
             trace!("/proc/{pid}/stat field 3 is not a valid u32: {ppid_str:?}");
             continue;
         };
-        if ppid == 1 {
+        if ppid == INIT_PID {
             let pid_i32 =
                 i32::try_from(pid).map_err(|_| ListChildrenError::PidOverflow { pid })?;
             children.push(Pid::from_raw(pid_i32));
