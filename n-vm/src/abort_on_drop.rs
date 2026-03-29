@@ -93,7 +93,7 @@ mod tests {
             completed2.store(true, Ordering::SeqCst);
         });
 
-        // Disarm — the task should NOT be aborted.
+        // Disarm -- the task should NOT be aborted.
         let handle = guard.into_inner();
         handle.await.expect("task should complete successfully");
 
@@ -111,7 +111,7 @@ mod tests {
             completed2.store(true, Ordering::SeqCst);
         });
 
-        // Drop the guard — the task should be aborted.
+        // Drop the guard -- the task should be aborted.
         drop(guard);
 
         // Give the runtime a moment to process the abort.

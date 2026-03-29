@@ -5,9 +5,9 @@
 //!
 //! This crate implements the two outer tiers of the nested test environment:
 //!
-//! - **Host tier** ([`run_test_in_vm`]) — launches a Docker container with the
+//! - **Host tier** ([`run_test_in_vm`]) -- launches a Docker container with the
 //!   required devices and capabilities.
-//! - **Container tier** ([`run_in_vm`] / [`TestVm`]) — launches a
+//! - **Container tier** ([`run_in_vm`] / [`TestVm`]) -- launches a
 //!   cloud-hypervisor VM with virtiofsd, monitors hypervisor events, and
 //!   collects test output.
 //!

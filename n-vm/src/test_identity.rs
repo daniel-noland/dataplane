@@ -3,11 +3,11 @@
 
 //! Shared test identity resolution for the `n-vm` test infrastructure.
 //!
-//! Both the **host → container** tier ([`container`](crate::container)) and the
-//! **container → VM** tier ([`vm`](crate::vm)) need to derive the test name
+//! Both the **host -> container** tier ([`container`](crate::container)) and the
+//! **container -> VM** tier ([`vm`](crate::vm)) need to derive the test name
 //! from a function type parameter `F` via [`std::any::type_name`].  The parsing
 //! logic (strip leading `&`, split on `::`, extract the test name suffix) was
-//! previously duplicated — this module provides a single implementation.
+//! previously duplicated -- this module provides a single implementation.
 //!
 //! # Stability note
 //!
@@ -52,11 +52,11 @@ impl TestIdentity {
     /// This performs two transformations on the output of
     /// [`std::any::type_name::<F>()`]:
     ///
-    /// 1. **Strip leading `&`** — when `F` is a reference to a function item
+    /// 1. **Strip leading `&`** -- when `F` is a reference to a function item
     ///    (which can happen depending on how the macro captures the function),
     ///    `type_name` prefixes the output with `"&"`.
     ///
-    /// 2. **Split on the first `::`** — the portion after the first `::` is
+    /// 2. **Split on the first `::`** -- the portion after the first `::` is
     ///    the test name as the Rust test harness expects it with `--exact`.
     ///
     /// # Panics
