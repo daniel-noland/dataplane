@@ -19,8 +19,6 @@
 //! child process, waiting for sockets, `/dev/kvm` accessibility) remain in
 //! [`VmError`](crate::error::VmError).
 
-use std::path::PathBuf;
-
 /// Errors specific to the cloud-hypervisor [`HypervisorBackend`](crate::backend::HypervisorBackend)
 /// implementation.
 ///
@@ -97,17 +95,5 @@ pub enum CloudHypervisorError {
         /// See [`VmCreate::reason`](Self::VmCreate) for why this is a
         /// `String` rather than a typed error.
         reason: String,
-    },
-
-    /// The cloud-hypervisor API socket did not appear within the expected
-    /// timeout after process startup.
-    ///
-    /// After the event-monitor pipe becomes readable (indicating the VMM
-    /// has started), the container tier polls for the API socket.  This
-    /// error means the socket never appeared.
-    #[error("cloud-hypervisor API socket did not appear at {path:?} within timeout")]
-    ApiSocketTimeout {
-        /// The expected socket path.
-        path: PathBuf,
     },
 }

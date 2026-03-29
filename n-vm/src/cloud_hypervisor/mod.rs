@@ -26,6 +26,8 @@
 pub mod error;
 pub(crate) mod events;
 
+pub use self::error::CloudHypervisorError;
+
 use std::os::unix::io::RawFd;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -48,8 +50,6 @@ use crate::abort_on_drop::AbortOnDrop;
 use crate::backend::{HypervisorBackend, LaunchedHypervisor};
 use crate::error::VmError;
 use crate::vm::{TestVmParams, check_kvm_accessible, wait_for_socket};
-
-use self::error::CloudHypervisorError;
 
 // ── Constants ────────────────────────────────────────────────────────
 
