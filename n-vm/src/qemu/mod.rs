@@ -431,14 +431,16 @@ async fn spawn_qemu_process(
 
 /// Builds the complete QEMU argument vector for a test run.
 fn build_qemu_args(params: &TestVmParams<'_>) -> Vec<String> {
+    let iommu = params.iommu;
     let mut args = Vec::with_capacity(64);
-    push_machine_args(&mut args);
+    push_machine_args(&mut args, iommu);
     push_cpu_args(&mut args);
     push_memory_args(&mut args);
+    push_iommu_args(&mut args, iommu);
     push_kernel_args(&mut args, params);
-    push_fs_args(&mut args);
-    push_vsock_args(&mut args);
-    push_network_args(&mut args);
+    push_fs_args(&mut args, iommu);
+    push_vsock_args(&mut args, iommu);
+    push_network_args(&mut args, iommu);
     push_serial_args(&mut args);
     push_qmp_args(&mut args);
     push_platform_args(&mut args, params);
@@ -447,11 +449,21 @@ fn build_qemu_args(params: &TestVmParams<'_>) -> Vec<String> {
 }
 
 /// Machine type and acceleration.
-fn push_machine_args(args: &mut Vec<String>) {
+///
+/// When `iommu` is `true`, adds `kernel-irqchip=split` to the machine
+/// options.  This is required for the Intel IOMMU's interrupt remapping
+/// to function: in split irqchip mode the in-kernel PIC/IOAPIC is
+/// disabled so that interrupt routing goes through the emulated IOMMU.
+fn push_machine_args(args: &mut Vec<String>, iommu: bool) {
+    let machine = if iommu {
+        "q35,accel=kvm,kernel-irqchip=split"
+    } else {
+        "q35,accel=kvm"
+    };
     args.extend([
         "-enable-kvm".into(),
         "-machine".into(),
-        "q35,accel=kvm".into(),
+        machine.into(),
         "-cpu".into(),
         "host".into(),
     ]);
@@ -493,6 +505,35 @@ fn push_memory_args(args: &mut Vec<String>) {
     ]);
 }
 
+/// Intel IOMMU device for DMA remapping.
+///
+/// When `iommu` is `true`, adds an `intel-iommu` device with:
+///
+/// - **`intremap=on`** -- interrupt remapping, required for proper MSI
+///   isolation between devices.
+/// - **`device-iotlb=on`** -- device-side IOTLB for Address Translation
+///   Services (ATS), enabling virtio devices with `ats=on` to cache
+///   IOMMU translations on the device side.
+/// - **`caching-mode=on`** -- required for vhost-based devices (e.g.
+///   `vhost-user-fs-pci`) that perform DMA from a separate process
+///   without going through QEMU's emulated IOMMU data path.
+///
+/// The machine type must use `kernel-irqchip=split` (see
+/// [`push_machine_args`]) for interrupt remapping to function.
+///
+/// Unlike cloud-hypervisor's per-segment IOMMU model, QEMU's Intel
+/// IOMMU covers the entire PCI topology.  Individual virtio devices
+/// opt in via `iommu_platform=on,ats=on` on their device strings (see
+/// [`push_network_args`], [`push_fs_args`], [`push_vsock_args`]).
+fn push_iommu_args(args: &mut Vec<String>, iommu: bool) {
+    if iommu {
+        args.extend([
+            "-device".into(),
+            "intel-iommu,intremap=on,device-iotlb=on,caching-mode=on".into(),
+        ]);
+    }
+}
+
 /// Kernel image and command line.
 ///
 /// The kernel command line passes the test binary path and name to the
@@ -530,14 +571,18 @@ fn push_kernel_args(args: &mut Vec<String>, params: &TestVmParams<'_>) {
 /// Uses `vhost-user-fs-pci` with a chardev pointing at the virtiofsd
 /// socket, matching the cloud-hypervisor backend's filesystem
 /// configuration.
-fn push_fs_args(args: &mut Vec<String>) {
+///
+/// When `iommu` is `true`, appends `iommu_platform=on,ats=on` so that
+/// the device performs DMA through the virtual IOMMU.
+fn push_fs_args(args: &mut Vec<String>, iommu: bool) {
+    let iommu_suffix = if iommu { ",iommu_platform=on,ats=on" } else { "" };
     args.extend([
         "-chardev".into(),
         format!("socket,id=virtiofs0,path={VIRTIOFSD_SOCKET_PATH}"),
         "-device".into(),
         format!(
             "vhost-user-fs-pci,queue-size={VIRTIOFS_QUEUE_SIZE},\
-             chardev=virtiofs0,tag={VIRTIOFS_ROOT_TAG}"
+             chardev=virtiofs0,tag={VIRTIOFS_ROOT_TAG}{iommu_suffix}"
         ),
     ]);
 }
@@ -546,16 +591,23 @@ fn push_fs_args(args: &mut Vec<String>) {
 ///
 /// Uses `vhost-vsock-pci` with the kernel's vhost-vsock module.
 ///
+/// When `iommu` is `true`, appends `iommu_platform=on,ats=on` so that
+/// the device performs DMA through the virtual IOMMU.
+///
 /// # Limitations
 ///
 /// See the [module-level documentation](self) for the vsock bridging
 /// limitation: this device uses kernel vhost-vsock (AF_VSOCK on the
 /// host), while the [`TestVm`](crate::vm::TestVm) infrastructure
 /// expects Unix sockets at `$VHOST_SOCKET_$PORT` paths.
-fn push_vsock_args(args: &mut Vec<String>) {
+fn push_vsock_args(args: &mut Vec<String>, iommu: bool) {
+    let iommu_suffix = if iommu { ",iommu_platform=on,ats=on" } else { "" };
     args.extend([
         "-device".into(),
-        format!("vhost-vsock-pci,guest-cid={}", VM_GUEST_CID.as_raw()),
+        format!(
+            "vhost-vsock-pci,guest-cid={}{iommu_suffix}",
+            VM_GUEST_CID.as_raw()
+        ),
     ]);
 }
 
@@ -572,7 +624,12 @@ fn push_vsock_args(args: &mut Vec<String>) {
 /// `ip link set`) if non-default MTU is required.  The cloud-hypervisor
 /// backend sets MTU in the device configuration, which cloud-hypervisor
 /// applies to the TAP devices automatically.
-fn push_network_args(args: &mut Vec<String>) {
+///
+/// When `iommu` is `true`, appends `iommu_platform=on,ats=on` to each
+/// `virtio-net-pci` device string so that network I/O is routed through
+/// the virtual IOMMU.
+fn push_network_args(args: &mut Vec<String>, iommu: bool) {
+    let iommu_suffix = if iommu { ",iommu_platform=on,ats=on" } else { "" };
     for iface in [&IFACE_MGMT, &IFACE_FABRIC1, &IFACE_FABRIC2] {
         args.extend([
             "-netdev".into(),
@@ -583,7 +640,7 @@ fn push_network_args(args: &mut Vec<String>) {
             ),
             "-device".into(),
             format!(
-                "virtio-net-pci,netdev=nd-{id},mac={mac}",
+                "virtio-net-pci,netdev=nd-{id},mac={mac}{iommu_suffix}",
                 id = iface.id,
                 mac = iface.mac,
             ),
@@ -683,7 +740,7 @@ mod tests {
     #[test]
     fn machine_args_enable_kvm_with_q35() {
         let mut args = Vec::new();
-        push_machine_args(&mut args);
+        push_machine_args(&mut args, false);
         assert!(args.contains(&"-enable-kvm".to_string()));
         assert!(args.contains(&"q35,accel=kvm".to_string()));
         assert!(args.contains(&"host".to_string()));
@@ -793,7 +850,7 @@ mod tests {
     #[test]
     fn fs_args_use_virtiofs_tag_and_socket() {
         let mut args = Vec::new();
-        push_fs_args(&mut args);
+        push_fs_args(&mut args, false);
         let chardev = args
             .iter()
             .find(|a| a.starts_with("socket,id=virtiofs0"))
@@ -815,7 +872,7 @@ mod tests {
     #[test]
     fn vsock_args_use_guest_cid() {
         let mut args = Vec::new();
-        push_vsock_args(&mut args);
+        push_vsock_args(&mut args, false);
         let device = args
             .iter()
             .find(|a| a.starts_with("vhost-vsock-pci"))
@@ -831,7 +888,7 @@ mod tests {
     #[test]
     fn network_args_have_three_interfaces() {
         let mut args = Vec::new();
-        push_network_args(&mut args);
+        push_network_args(&mut args, false);
         let netdev_count = args.iter().filter(|a| a.starts_with("tap,")).count();
         let device_count = args
             .iter()
@@ -844,7 +901,7 @@ mod tests {
     #[test]
     fn all_interfaces_have_unique_mac_addresses() {
         let mut args = Vec::new();
-        push_network_args(&mut args);
+        push_network_args(&mut args, false);
         let macs: Vec<&str> = args
             .iter()
             .filter_map(|a| {
@@ -863,7 +920,7 @@ mod tests {
     #[test]
     fn all_interfaces_have_unique_tap_names() {
         let mut args = Vec::new();
-        push_network_args(&mut args);
+        push_network_args(&mut args, false);
         let taps: Vec<&str> = args
             .iter()
             .filter_map(|a| {
@@ -957,6 +1014,167 @@ mod tests {
     fn build_qemu_args_is_nonempty() {
         let args = build_qemu_args(&sample_params());
         assert!(!args.is_empty());
+    }
+
+    // ── vIOMMU configuration ─────────────────────────────────────────
+
+    /// Helper that returns [`TestVmParams`] with vIOMMU enabled.
+    fn sample_params_iommu() -> TestVmParams<'static> {
+        TestVmParams {
+            iommu: true,
+            ..sample_params()
+        }
+    }
+
+    #[test]
+    fn machine_args_use_irqchip_split_when_iommu_enabled() {
+        let mut args = Vec::new();
+        push_machine_args(&mut args, true);
+        assert!(
+            args.contains(&"q35,accel=kvm,kernel-irqchip=split".to_string()),
+            "iommu requires kernel-irqchip=split: {args:?}",
+        );
+    }
+
+    #[test]
+    fn machine_args_omit_irqchip_split_when_iommu_disabled() {
+        let mut args = Vec::new();
+        push_machine_args(&mut args, false);
+        assert!(
+            args.contains(&"q35,accel=kvm".to_string()),
+            "no kernel-irqchip=split without iommu: {args:?}",
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("kernel-irqchip")),
+            "should not mention kernel-irqchip when iommu is disabled",
+        );
+    }
+
+    #[test]
+    fn iommu_args_present_when_enabled() {
+        let mut args = Vec::new();
+        push_iommu_args(&mut args, true);
+        let device = args
+            .iter()
+            .find(|a| a.starts_with("intel-iommu"))
+            .expect("should have an intel-iommu device");
+        assert!(device.contains("intremap=on"), "{device}");
+        assert!(device.contains("device-iotlb=on"), "{device}");
+        assert!(device.contains("caching-mode=on"), "{device}");
+    }
+
+    #[test]
+    fn iommu_args_absent_when_disabled() {
+        let mut args = Vec::new();
+        push_iommu_args(&mut args, false);
+        assert!(args.is_empty(), "no IOMMU args when disabled");
+    }
+
+    #[test]
+    fn network_devices_have_iommu_platform_when_enabled() {
+        let mut args = Vec::new();
+        push_network_args(&mut args, true);
+        let devices: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("virtio-net-pci,"))
+            .collect();
+        assert_eq!(devices.len(), 3);
+        for dev in &devices {
+            assert!(
+                dev.contains("iommu_platform=on"),
+                "device should have iommu_platform=on: {dev}",
+            );
+            assert!(
+                dev.contains("ats=on"),
+                "device should have ats=on: {dev}",
+            );
+        }
+    }
+
+    #[test]
+    fn network_devices_omit_iommu_platform_when_disabled() {
+        let mut args = Vec::new();
+        push_network_args(&mut args, false);
+        for arg in &args {
+            assert!(
+                !arg.contains("iommu_platform"),
+                "should not contain iommu_platform when disabled: {arg}",
+            );
+        }
+    }
+
+    #[test]
+    fn fs_device_has_iommu_platform_when_enabled() {
+        let mut args = Vec::new();
+        push_fs_args(&mut args, true);
+        let device = args
+            .iter()
+            .find(|a| a.starts_with("vhost-user-fs-pci"))
+            .unwrap();
+        assert!(
+            device.contains("iommu_platform=on,ats=on"),
+            "fs device should have iommu_platform: {device}",
+        );
+    }
+
+    #[test]
+    fn fs_device_omits_iommu_platform_when_disabled() {
+        let mut args = Vec::new();
+        push_fs_args(&mut args, false);
+        let device = args
+            .iter()
+            .find(|a| a.starts_with("vhost-user-fs-pci"))
+            .unwrap();
+        assert!(
+            !device.contains("iommu_platform"),
+            "fs device should not have iommu_platform when disabled: {device}",
+        );
+    }
+
+    #[test]
+    fn vsock_device_has_iommu_platform_when_enabled() {
+        let mut args = Vec::new();
+        push_vsock_args(&mut args, true);
+        let device = args
+            .iter()
+            .find(|a| a.starts_with("vhost-vsock-pci"))
+            .unwrap();
+        assert!(
+            device.contains("iommu_platform=on,ats=on"),
+            "vsock device should have iommu_platform: {device}",
+        );
+    }
+
+    #[test]
+    fn vsock_device_omits_iommu_platform_when_disabled() {
+        let mut args = Vec::new();
+        push_vsock_args(&mut args, false);
+        let device = args
+            .iter()
+            .find(|a| a.starts_with("vhost-vsock-pci"))
+            .unwrap();
+        assert!(
+            !device.contains("iommu_platform"),
+            "vsock device should not have iommu_platform when disabled: {device}",
+        );
+    }
+
+    #[test]
+    fn full_args_with_iommu_contain_intel_iommu_device() {
+        let args = build_qemu_args(&sample_params_iommu());
+        assert!(
+            args.iter().any(|a| a.starts_with("intel-iommu")),
+            "full arg vector should contain intel-iommu device when iommu=true",
+        );
+    }
+
+    #[test]
+    fn full_args_without_iommu_omit_intel_iommu_device() {
+        let args = build_qemu_args(&sample_params());
+        assert!(
+            !args.iter().any(|a| a.contains("intel-iommu")),
+            "full arg vector should not contain intel-iommu when iommu=false",
+        );
     }
 
     // ── Event log display ────────────────────────────────────────────
