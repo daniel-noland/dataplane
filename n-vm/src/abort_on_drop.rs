@@ -1,30 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Open Network Fabric Authors
 
-//! RAII wrapper for [`JoinHandle`] that aborts the task on drop.
-//!
-//! During [`TestVm::launch`](crate::vm::TestVm::launch), several background
-//! tasks are spawned incrementally.  If a later phase fails, all previously
-//! spawned tasks must be aborted.  Without this wrapper, every early-return
-//! site must manually call `.abort()` on the correct subset of handles — a
-//! pattern that is fragile and incorrect under panics.
-//!
-//! `AbortOnDrop` solves this by aborting the inner task in its [`Drop`] impl.
-//! Once all phases succeed, the handles are extracted via [`into_inner`] and
-//! moved into the fully-constructed struct, disarming the automatic abort.
+//! RAII wrapper for [`JoinHandle`](tokio::task::JoinHandle) that aborts the
+//! task on drop.  See [`AbortOnDrop`] for details.
 
 use tokio::task::JoinHandle;
 
 /// A [`JoinHandle`] wrapper that aborts the task when dropped.
 ///
-/// This is used during incremental construction of [`TestVm`](crate::vm::TestVm)
-/// to ensure that background tasks spawned during earlier phases are cleaned up
-/// if a later phase fails — whether by returning an error or by panicking.
+/// During incremental construction of [`TestVm`](crate::vm::TestVm),
+/// several background tasks are spawned across multiple phases.  If a
+/// later phase fails, all previously spawned tasks must be aborted.
+/// Without this wrapper, every early-return site must manually call
+/// `.abort()` on the correct subset of handles -- a pattern that is
+/// fragile and incorrect under panics.
+///
+/// `AbortOnDrop` solves this by aborting the inner task in its [`Drop`]
+/// impl.  Once all phases succeed, the handles are extracted via
+/// [`into_inner`](Self::into_inner) and moved into the fully-constructed
+/// struct, disarming the automatic abort.
 ///
 /// # Usage
 ///
 /// ```ignore
-/// let handle = AbortOnDrop::new(tokio::spawn(async { /* … */ }));
+/// let handle = AbortOnDrop::new(tokio::spawn(async { /* ... */ }));
 ///
 /// // If this line returns Err, `handle` is dropped and the task is aborted.
 /// some_fallible_operation().await?;
