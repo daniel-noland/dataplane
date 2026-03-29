@@ -7,6 +7,13 @@
 //!
 //! The [`watch`] function consumes the event stream and returns a
 //! [`HypervisorVerdict`] indicating whether the VM shut down cleanly.
+//!
+//! Both [`Source`] and [`EventType`] use `#[serde(other)]` on their
+//! `Unknown` variants so that unrecognised strings emitted by newer
+//! cloud-hypervisor versions do not cause deserialization failures.
+//! Without this, a new event string would downgrade the
+//! [`HypervisorVerdict`] to [`Failure`](HypervisorVerdict::Failure) and
+//! turn an otherwise passing test into a false negative.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -34,12 +41,7 @@ pub enum Source {
     /// A virtio device backend.
     #[serde(rename = "virtio-device")]
     VirtioDevice,
-    /// An unrecognised source emitted by a newer cloud-hypervisor version.
-    ///
-    /// Using `#[serde(other)]` ensures that new source strings do not cause
-    /// deserialization failures, which would otherwise downgrade the
-    /// [`HypervisorVerdict`] to [`Failure`](HypervisorVerdict::Failure) and
-    /// turn an otherwise passing test into a false negative.
+    /// An unrecognised source (see module-level docs on `#[serde(other)]`).
     #[serde(other)]
     Unknown,
 }
@@ -68,13 +70,7 @@ pub enum EventType {
     /// The guest kernel panicked.
     #[serde(rename = "panic")]
     Panic,
-    /// An unrecognised event type emitted by a newer cloud-hypervisor
-    /// version.
-    ///
-    /// Using `#[serde(other)]` ensures that new event types do not cause
-    /// deserialization failures, which would otherwise downgrade the
-    /// [`HypervisorVerdict`] to [`Failure`](HypervisorVerdict::Failure) and
-    /// turn an otherwise passing test into a false negative.
+    /// An unrecognised event type (see module-level docs on `#[serde(other)]`).
     #[serde(other)]
     Unknown,
 }
