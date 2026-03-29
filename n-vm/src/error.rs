@@ -18,6 +18,8 @@
 //! [`std::error::Error`].  Per project guidelines this is acceptable
 //! when imposed by an external framework.
 
+use std::path::PathBuf;
+
 // ── VM tier errors ───────────────────────────────────────────────────
 
 /// Errors that can occur while launching or managing a cloud-hypervisor VM
@@ -27,6 +29,25 @@
 /// [`run_in_vm`](crate::run_in_vm).
 #[derive(Debug, thiserror::Error)]
 pub enum VmError {
+    /// `argv[0]` was not available, so the test binary path could not be
+    /// determined.
+    ///
+    /// This can happen if the process was spawned without arguments (e.g.
+    /// via a bare `execve` with an empty argv array).
+    #[error("argv[0] missing: cannot determine test binary path")]
+    MissingArgv,
+
+    /// The test binary path (from `argv[0]`) does not contain a `'/'`
+    /// separator, so the binary name cannot be extracted.
+    ///
+    /// This can happen if the binary was invoked via `PATH` lookup without
+    /// a directory component (e.g. `my_test` instead of `./my_test`).
+    #[error("test binary path does not contain a '/' separator: {path:?}")]
+    InvalidBinaryPath {
+        /// The argv\[0\] value that could not be split.
+        path: String,
+    },
+
     /// virtiofsd failed to start.
     #[error("failed to spawn virtiofsd")]
     VirtiofsdSpawn(#[source] std::io::Error),
@@ -134,6 +155,28 @@ pub enum ContainerError {
     /// Could not canonicalize the test binary's parent directory.
     #[error("failed to canonicalize test binary directory")]
     BinaryPathCanonicalize(#[source] std::io::Error),
+
+    /// The test binary path (from `/proc/self/exe`) has no parent
+    /// directory component.
+    ///
+    /// This is unexpected for a path returned by `readlink`, which should
+    /// always be absolute.
+    #[error("test binary path has no parent directory: {path}")]
+    NoParentDirectory {
+        /// The path that had no parent.
+        path: PathBuf,
+    },
+
+    /// A filesystem path required for the container configuration is not
+    /// valid UTF-8.
+    ///
+    /// Docker and the container runtime APIs require UTF-8 strings for
+    /// mount paths and command arguments.
+    #[error("path is not valid UTF-8: {path:?}")]
+    NonUtf8Path {
+        /// The path that could not be converted to a UTF-8 string.
+        path: PathBuf,
+    },
 
     /// A required device node (e.g. `/dev/kvm`) is not accessible on the
     /// host.

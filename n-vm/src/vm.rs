@@ -1,5 +1,14 @@
 //! Cloud-hypervisor VM lifecycle management for the container tier.
 //!
+//! # Error handling
+//!
+//! Functions that can fail return [`Result<_, VmError>`].  The
+//! [`TestVm::collect`] phase is intentionally infallible — individual
+//! subsystem failures are recorded as degraded output (e.g.
+//! `"!!!…UNAVAILABLE…!!!"`) rather than propagated, because the primary
+//! goal is to give the developer as much diagnostic information as
+//! possible even when things go wrong.
+//!
 //! This module handles launching virtiofsd, configuring and booting a
 //! cloud-hypervisor VM, collecting output from all subsystems, and returning
 //! a unified [`VmTestOutput`].
@@ -115,10 +124,16 @@ fn spawn_vsock_reader(channel: &VsockChannel) -> Result<JoinHandle<String>, VmEr
     })?;
     Ok(tokio::spawn(async move {
         let mut buf = Vec::with_capacity(VSOCK_READER_CAPACITY);
-        let (mut connection, _) = listen
-            .accept()
-            .await
-            .unwrap_or_else(|e| panic!("failed to accept {label} vsock connection: {e}"));
+        let mut connection = match listen.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                error!("failed to accept {label} vsock connection: {e}");
+                return format!(
+                    "!!!{} UNAVAILABLE: accept failed: {e}!!!",
+                    label.to_uppercase()
+                );
+            }
+        };
         loop {
             match connection.read_buf(&mut buf).await {
                 Ok(0) => break,
@@ -680,16 +695,34 @@ impl TestVm {
 /// [`TestVm::collect`].
 pub async fn run_in_vm<F: FnOnce()>(_: F) -> Result<VmTestOutput, VmError> {
     // ── Resolve test identity ────────────────────────────────────────
+    //
+    // `type_name::<F>()` returns the fully-qualified path of the function
+    // item type, e.g. `"my_crate::tests::my_test"`.  When `F` is a
+    // reference to a function item (which can happen depending on how the
+    // macro captures the function), the output is prefixed with `"&"`, so
+    // we strip that.
+    //
+    // NOTE: `type_name` is explicitly documented as not stable across
+    // compiler versions, but the `crate::path` format has been consistent
+    // in practice and is the same mechanism the proc macro relies on.
     let type_name = std::any::type_name::<F>().trim_start_matches("&");
     let full_bin_path = std::env::args()
         .next()
-        .expect("argv[0] missing: cannot determine test binary path");
+        .ok_or(VmError::MissingArgv)?;
     let (_, bin_name) = full_bin_path
         .rsplit_once("/")
-        .expect("test binary path does not contain a '/' separator");
+        .ok_or_else(|| VmError::InvalidBinaryPath {
+            path: full_bin_path.clone(),
+        })?;
+    // type_name for a function item type always contains "::" because it
+    // is fully qualified (e.g. "crate::module::function").  If this
+    // invariant is violated, the Rust compiler changed its type_name
+    // format in an incompatible way.
     let (_, test_name) = type_name
         .split_once("::")
-        .expect("type_name did not contain '::' separator for test name");
+        .unwrap_or_else(|| unreachable!(
+            "std::any::type_name::<F>() did not contain '::': {type_name:?}"
+        ));
 
     let params = TestVmParams {
         full_bin_path: &full_bin_path,

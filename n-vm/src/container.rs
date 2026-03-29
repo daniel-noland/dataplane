@@ -223,22 +223,35 @@ pub fn run_test_in_vm<F: FnOnce()>(
 
     runtime.block_on(async {
         // ── Resolve test identity and binary paths ───────────────────
-        let (_, test_name) = std::any::type_name::<F>()
+        // type_name for a function item type always contains "::" because
+        // it is fully qualified (e.g. "crate::module::function").  If this
+        // invariant is violated, the Rust compiler changed its type_name
+        // format in an incompatible way.
+        let type_name = std::any::type_name::<F>();
+        let (_, test_name) = type_name
             .split_once("::")
-            .expect("type_name did not contain '::' separator for test name");
+            .unwrap_or_else(|| unreachable!(
+                "std::any::type_name::<F>() did not contain '::': {type_name:?}"
+            ));
         let bin_path = std::fs::read_link("/proc/self/exe")
             .map_err(ContainerError::BinaryPathRead)?;
         let bin_parent = bin_path
             .parent()
-            .expect("test binary path has no parent directory");
+            .ok_or_else(|| ContainerError::NoParentDirectory {
+                path: bin_path.clone(),
+            })?;
         let bin_dir = std::fs::canonicalize(bin_parent)
             .map_err(ContainerError::BinaryPathCanonicalize)?;
         let bin_dir_str = bin_dir
             .to_str()
-            .expect("test binary directory path is not valid UTF-8");
+            .ok_or_else(|| ContainerError::NonUtf8Path {
+                path: bin_dir.clone(),
+            })?;
         let bin_path_str = bin_path
             .to_str()
-            .expect("test binary path is not valid UTF-8");
+            .ok_or_else(|| ContainerError::NonUtf8Path {
+                path: bin_path.clone(),
+            })?;
 
         // ── Resolve device group ownership ───────────────────────────
         // The container process runs as the current user.  To access the
