@@ -430,6 +430,75 @@ async fn collect_and_cleanup(
     })
 }
 
+// ── ContainerGuard ───────────────────────────────────────────────────
+
+/// RAII guard that ensures a Docker container is cleaned up.
+///
+/// The guard holds a reference to the Docker client and the container ID.
+/// The expected usage is:
+///
+/// 1. Create the guard immediately after the container is started.
+/// 2. Perform operations against the running container (e.g. log streaming).
+/// 3. Call [`into_result`](Self::into_result) to inspect the exit status
+///    and remove the container, defusing the guard.
+///
+/// If the guard is dropped *without* calling `into_result` (e.g. due to a
+/// panic or an early return inserted by a future refactor), the [`Drop`]
+/// impl logs the container ID so the leak is visible in test output.
+///
+/// # Why not async Drop?
+///
+/// Rust does not support async `Drop`.  The guard cannot perform async
+/// container removal in its destructor.  The `Drop` impl instead emits a
+/// prominent `tracing::error` with the container ID so that the operator
+/// can clean up manually (e.g. `docker rm -f <id>`).
+struct ContainerGuard<'a> {
+    client: &'a bollard::Docker,
+    container_id: String,
+    /// Set to `true` once explicit cleanup has been performed via
+    /// [`into_result`](Self::into_result).
+    defused: bool,
+}
+
+impl<'a> ContainerGuard<'a> {
+    /// Creates a new guard for a running container.
+    fn new(client: &'a bollard::Docker, container_id: String) -> Self {
+        Self {
+            client,
+            container_id,
+            defused: false,
+        }
+    }
+
+    /// Returns a reference to the container ID.
+    fn id(&self) -> &str {
+        &self.container_id
+    }
+
+    /// Performs the explicit inspect + remove lifecycle.
+    ///
+    /// This marks the guard as defused so that the [`Drop`] impl is a
+    /// no-op.  Returns the container's exit status on success.
+    async fn into_result(mut self) -> Result<ContainerTestResult, ContainerError> {
+        self.defused = true;
+        collect_and_cleanup(self.client, &self.container_id).await
+    }
+}
+
+impl Drop for ContainerGuard<'_> {
+    fn drop(&mut self) {
+        if !self.defused {
+            tracing::error!(
+                container_id = %self.container_id,
+                "ContainerGuard dropped without explicit cleanup; \
+                 the container was NOT removed and may need manual cleanup \
+                 (e.g. `docker rm -f {}`)",
+                self.container_id,
+            );
+        }
+    }
+}
+
 // ── run_test_in_vm ───────────────────────────────────────────────────
 
 /// Launches a Docker container and re-runs the current test binary inside it.
@@ -472,11 +541,16 @@ pub fn run_test_in_vm<F: FnOnce()>(
             .map_err(ContainerError::DockerConnect)?;
         let container_id = create_and_start_container(&client, config).await?;
 
-        // Always attempt cleanup even if log streaming fails, to avoid
-        // leaking Docker containers (auto_remove is disabled so that we
-        // can inspect the exit status).
-        let log_result = stream_container_logs(&client, &container_id).await;
-        let cleanup_result = collect_and_cleanup(&client, &container_id).await;
+        // Wrap the container in a guard so that if anything between here
+        // and the explicit cleanup panics or returns early, the container
+        // leak is at least logged (see ContainerGuard::drop).
+        let guard = ContainerGuard::new(&client, container_id);
+
+        let log_result = stream_container_logs(&client, guard.id()).await;
+
+        // Explicit cleanup — inspects the exit status and removes the
+        // container.  This defuses the guard so its Drop is a no-op.
+        let cleanup_result = guard.into_result().await;
 
         // Propagate the log streaming error first if it occurred — it is
         // the root cause.  But if cleanup also failed, log that error so
@@ -486,7 +560,6 @@ pub fn run_test_in_vm<F: FnOnce()>(
             tracing::error!(
                 %log_err,
                 %cleanup_err,
-                container_id,
                 "both log streaming and container cleanup failed; \
                  propagating log error, but the container may have leaked",
             );
