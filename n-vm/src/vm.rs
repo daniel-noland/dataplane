@@ -3,9 +3,9 @@
 //! # Error handling
 //!
 //! Functions that can fail return [`Result<_, VmError>`].  The
-//! [`TestVm::collect`] phase is intentionally infallible — individual
+//! [`TestVm::collect`] phase is intentionally infallible -- individual
 //! subsystem failures are recorded as degraded output (e.g.
-//! `"!!!…UNAVAILABLE…!!!"`) rather than propagated, because the primary
+//! `"!!!...UNAVAILABLE...!!!"`) rather than propagated, because the primary
 //! goal is to give the developer as much diagnostic information as
 //! possible even when things go wrong.
 //!
@@ -16,16 +16,16 @@
 //! Test process stdout and stderr are forwarded from the VM guest to the
 //! container tier via dedicated [`VsockChannel`]s, giving the host clean
 //! separation of the two channels.  The cloud-hypervisor virtio-console
-//! (`hvc0`) is disabled — all test output travels over vsock.
+//! (`hvc0`) is disabled -- all test output travels over vsock.
 //!
 //! # Lifecycle
 //!
 //! The [`TestVm`] struct owns every long-lived resource (child processes,
 //! background tasks, API client) and exposes a two-phase API:
 //!
-//! 1. [`TestVm::launch`] — prepares the environment (virtiofsd, vsock
+//! 1. [`TestVm::launch`] -- prepares the environment (virtiofsd, vsock
 //!    listeners, cloud-hypervisor) and boots the VM.
-//! 2. [`TestVm::collect`] — waits for the test to finish, gathers output
+//! 2. [`TestVm::collect`] -- waits for the test to finish, gathers output
 //!    from all subsystems, and performs a clean shutdown.
 //!
 //! The convenience function [`run_in_vm`] wraps both phases for the
@@ -270,7 +270,7 @@ impl<'a> TestVmParams<'a> {
         }
     }
 
-    /// Builds the CPU topology: 6 vCPUs arranged as 3 dies × 1 core × 2
+    /// Builds the CPU topology: 6 vCPUs arranged as 3 dies x 1 core x 2
     /// threads.
     fn build_cpu_config() -> CpusConfig {
         CpusConfig {
@@ -302,8 +302,8 @@ impl<'a> TestVmParams<'a> {
     /// Builds the network interface configurations.
     ///
     /// Returns three interfaces:
-    /// - **mgmt** — management network on PCI segment 0 (1500 MTU).
-    /// - **fabric1** / **fabric2** — fabric-facing interfaces on PCI
+    /// - **mgmt** -- management network on PCI segment 0 (1500 MTU).
+    /// - **fabric1** / **fabric2** -- fabric-facing interfaces on PCI
     ///   segment 1 (9500 MTU jumbo frames).
     fn build_network_configs() -> Vec<NetConfig> {
         vec![
@@ -481,7 +481,7 @@ impl std::fmt::Display for VmTestOutput {
 
 /// Owns all long-lived resources for a running test VM.
 ///
-/// The two-phase API ([`launch`](Self::launch) → [`collect`](Self::collect))
+/// The two-phase API ([`launch`](Self::launch) -> [`collect`](Self::collect))
 /// separates concerns:
 ///
 /// - **`launch`** handles environment preparation, process spawning, and VM
@@ -492,7 +492,7 @@ impl std::fmt::Display for VmTestOutput {
 ///
 /// - **`collect`** waits for the test to complete, gathers output from every
 ///   subsystem, performs a best-effort shutdown, and assembles a
-///   [`VmTestOutput`].  It always succeeds — individual subsystem failures
+///   [`VmTestOutput`].  It always succeeds -- individual subsystem failures
 ///   are recorded as degraded output rather than hard errors, because the
 ///   primary goal is to give the developer as much diagnostic information
 ///   as possible.
@@ -527,7 +527,7 @@ impl TestVm {
     /// task that accepts a single connection and reads it to EOF.
     ///
     /// This pattern is shared by the init-system tracing channel, test
-    /// stdout, and test stderr — all of which are vsock streams that the
+    /// stdout, and test stderr -- all of which are vsock streams that the
     /// VM guest connects to via `vhost_vsock`.
     ///
     /// The listener must be bound *before* the VM boots so that the
@@ -689,15 +689,15 @@ impl TestVm {
     /// This method orchestrates five focused phases, each delegated to an
     /// associated function on this type:
     ///
-    /// 1. [`launch_virtiofsd`](Self::launch_virtiofsd) — share the
+    /// 1. [`launch_virtiofsd`](Self::launch_virtiofsd) -- share the
     ///    container filesystem into the VM.
-    /// 2. [`spawn_vsock_reader`](Self::spawn_vsock_reader) — bind vsock
+    /// 2. [`spawn_vsock_reader`](Self::spawn_vsock_reader) -- bind vsock
     ///    listeners for all channels.
-    /// 3. [`spawn_hypervisor`](Self::spawn_hypervisor) — create the event
+    /// 3. [`spawn_hypervisor`](Self::spawn_hypervisor) -- create the event
     ///    pipe, verify `/dev/kvm`, spawn cloud-hypervisor, and wait for the
     ///    API socket.
     /// 4. Create and boot the VM via the hypervisor REST API.
-    /// 5. [`spawn_kernel_log_reader`](Self::spawn_kernel_log_reader) —
+    /// 5. [`spawn_kernel_log_reader`](Self::spawn_kernel_log_reader) --
     ///    start collecting kernel console output.
     ///
     /// All background tasks are wrapped in [`AbortOnDrop`], so if any phase
@@ -765,7 +765,7 @@ impl TestVm {
     /// This method consumes the `TestVm`, shutting down the hypervisor and
     /// virtiofsd after collecting their output.  Individual subsystem
     /// failures are recorded as degraded output (e.g.
-    /// `"!!!…UNAVAILABLE…!!!"`) rather than propagated as errors, because
+    /// `"!!!...UNAVAILABLE...!!!"`) rather than propagated as errors, because
     /// the primary goal is to give the developer as much diagnostic
     /// information as possible even when things go wrong.
     pub async fn collect(self) -> VmTestOutput {
@@ -781,7 +781,7 @@ impl TestVm {
         } = self;
 
         // Extract the inner JoinHandles from AbortOnDrop wrappers.
-        // This disarms the abort-on-drop behavior — from this point on,
+        // This disarms the abort-on-drop behavior -- from this point on,
         // we own the handles directly and will await them below.
         let event_watcher = event_watcher.into_inner();
         let init_trace = init_trace.into_inner();
@@ -791,7 +791,7 @@ impl TestVm {
 
         // ── Collect vsock / task output ──────────────────────────────
         // The vsock readers complete when the guest-side streams close
-        // (test process exits → stdout/stderr close; n-it exits →
+        // (test process exits -> stdout/stderr close; n-it exits ->
         // init_trace closes).
         let init_trace = ProcessOutput::join_task_or_fallback(init_trace, "init system trace").await;
         let test_stdout = ProcessOutput::join_task_or_fallback(test_stdout, "test stdout").await;
@@ -834,8 +834,8 @@ impl TestVm {
         // The Rust test harness (invoked with `--format=terse`) writes a
         // summary line to stdout:
         //
-        //   test result: ok. 1 passed; 0 failed; …
-        //   test result: FAILED. 0 passed; 1 failed; …
+        //   test result: ok. 1 passed; 0 failed; ...
+        //   test result: FAILED. 0 passed; 1 failed; ...
         //
         // We check for the failure marker so that a test-level failure is
         // not masked by a clean infrastructure shutdown.  This is the most
@@ -844,7 +844,7 @@ impl TestVm {
         let test_passed = !test_stdout.contains("test result: FAILED");
 
         let test_output = ProcessOutput {
-            // The test process runs inside the VM — its exit code is not
+            // The test process runs inside the VM -- its exit code is not
             // directly observable from the container tier.  We rely on the
             // test harness summary line (checked via test_passed above) and
             // on n-it's behavior of aborting on test failure (which triggers
@@ -886,7 +886,7 @@ impl TestVm {
 /// # Errors
 ///
 /// Returns [`VmError`] if any part of the VM launch sequence fails.
-/// Output collection is best-effort and never fails — see
+/// Output collection is best-effort and never fails -- see
 /// [`TestVm::collect`].
 pub async fn run_in_vm<F: FnOnce()>(_: F) -> Result<VmTestOutput, VmError> {
     // ── Resolve test identity ────────────────────────────────────────

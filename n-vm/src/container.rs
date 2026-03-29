@@ -183,13 +183,13 @@ impl ContainerParams {
         //
         // Uses `strip_prefix` (not `trim_start_matches`) to avoid
         // stripping the prefix more than once (e.g.
-        // "unix://unix://foo" → "foo").
+        // "unix://unix://foo" -> "foo").
         let docker_socket_path: Option<String> = match std::env::var("DOCKER_HOST") {
             Ok(host) => match host.strip_prefix("unix://") {
                 Some(path) => Some(path.to_string()),
                 // Non-Unix schemes (e.g. tcp://) have no local socket.
                 None if host.contains("://") => None,
-                // Bare path with no scheme — treat as a Unix socket path.
+                // Bare path with no scheme -- treat as a Unix socket path.
                 None => Some(host),
             },
             Err(_) => Some("/var/run/docker.sock".into()),
@@ -197,7 +197,7 @@ impl ContainerParams {
 
         // Derive the list from REQUIRED_DEVICES (the same array used for
         // --device mappings) plus the Docker socket (when local).  This
-        // prevents drift between the two lists — previously /dev/net/tun
+        // prevents drift between the two lists -- previously /dev/net/tun
         // was in REQUIRED_DEVICES but absent here.
         let required_files: Vec<String> = REQUIRED_DEVICES
             .iter()
@@ -225,11 +225,6 @@ impl ContainerParams {
     // ── Accessors ────────────────────────────────────────────────────
 
     /// Returns the test binary path as a UTF-8 string slice.
-    ///
-    /// # Panics
-    ///
-    /// Cannot panic — [`resolve`](Self::resolve) validates UTF-8 before
-    /// construction.
     fn bin_path_str(&self) -> &str {
         self.bin_path
             .to_str()
@@ -237,11 +232,6 @@ impl ContainerParams {
     }
 
     /// Returns the test binary directory as a UTF-8 string slice.
-    ///
-    /// # Panics
-    ///
-    /// Cannot panic — [`resolve`](Self::resolve) validates UTF-8 before
-    /// construction.
     fn bin_dir_str(&self) -> &str {
         self.bin_dir
             .to_str()
@@ -425,7 +415,7 @@ impl CleanupThread {
                 // Block until we know whether cleanup is needed.
                 let container_id = match rx.blocking_recv() {
                     Ok(id) => id,
-                    // Sender dropped without sending → explicit cleanup
+                    // Sender dropped without sending -- explicit cleanup
                     // already happened, nothing to do.
                     Err(_) => return,
                 };
@@ -484,7 +474,7 @@ impl CleanupThread {
     /// Drops the sender (so the receiver sees `RecvError`) and joins the
     /// thread, which should return almost immediately.
     fn defuse(&mut self) {
-        // Drop the sender without sending — the receiver unblocks with
+        // Drop the sender without sending -- the receiver unblocks with
         // Err(RecvError) and the thread exits.
         self.tx.take();
         if let Some(thread) = self.thread.take() {
@@ -504,7 +494,7 @@ impl CleanupThread {
             // do.
             let _ = tx.send(container_id);
         }
-        // Detach the thread — don't block Drop on the Docker API call.
+        // Detach the thread -- don't block Drop on the Docker API call.
         self.thread.take();
     }
 }
@@ -516,11 +506,11 @@ impl CleanupThread {
 ///
 /// The expected usage is:
 ///
-/// 1. [`create_and_start`](Self::create_and_start) — create the container
+/// 1. [`create_and_start`](Self::create_and_start) -- create the container
 ///    and return an armed guard.
-/// 2. [`stream_logs`](Self::stream_logs) — forward container
+/// 2. [`stream_logs`](Self::stream_logs) -- forward container
 ///    stdout/stderr to the host.
-/// 3. [`into_result`](Self::into_result) — inspect the exit status,
+/// 3. [`into_result`](Self::into_result) -- inspect the exit status,
 ///    remove the container, and defuse the guard.
 ///
 /// If the guard is dropped *without* calling `into_result` (e.g. due to a
@@ -535,7 +525,7 @@ impl CleanupThread {
 /// [`Sender::send`](oneshot::Sender::send) is synchronous (not async),
 /// making it safe to call from [`Drop`].  A dedicated [`std::thread`]
 /// receives the message and performs the async Docker API call in its own
-/// minimal tokio runtime — fully decoupled from whatever runtime (if any)
+/// minimal tokio runtime -- fully decoupled from whatever runtime (if any)
 /// the caller is using.
 struct ContainerGuard<'a> {
     client: &'a bollard::Docker,
@@ -733,18 +723,18 @@ pub fn run_test_in_vm<F: FnOnce()>(
         let client = bollard::Docker::connect_with_unix_defaults()
             .map_err(ContainerError::DockerConnect)?;
 
-        // The guard is armed at creation — if anything between here and
+        // The guard is armed at creation -- if anything between here and
         // the explicit cleanup panics or returns early, the CleanupThread
         // will force-remove the container.
         let guard = ContainerGuard::create_and_start(&client, config).await?;
 
         let log_result = guard.stream_logs().await;
 
-        // Explicit cleanup — inspects the exit status and removes the
+        // Explicit cleanup -- inspects the exit status and removes the
         // container.  This defuses the guard so its Drop is a no-op.
         let cleanup_result = guard.into_result().await;
 
-        // Propagate the log streaming error first if it occurred — it is
+        // Propagate the log streaming error first if it occurred -- it is
         // the root cause.  But if cleanup also failed, log that error so
         // the container leak is visible even though we cannot return both
         // errors.

@@ -4,9 +4,9 @@
 //! Tier dispatch helpers for the `#[in_vm]` proc macro.
 //!
 //! The [`in_vm`](crate::in_vm) attribute macro rewrites a test function into a
-//! three-tier dispatch (host → container → VM guest).  Rather than generating
-//! all of that runtime logic inline — which makes changes require proc-macro
-//! recompilation and produces hard-to-debug codegen — this module provides
+//! three-tier dispatch (host -> container -> VM guest).  Rather than generating
+//! all of that runtime logic inline -- which makes changes require proc-macro
+//! recompilation and produces hard-to-debug codegen -- this module provides
 //! thin, callable helpers for the two outer tiers.
 //!
 //! The macro itself only needs to:
@@ -44,7 +44,7 @@ pub fn is_in_test_container() -> bool {
     std::env::var(ENV_IN_TEST_CONTAINER).as_deref() == Ok(ENV_MARKER_VALUE)
 }
 
-// ── Tier 2: Container → VM ──────────────────────────────────────────
+// ── Tier 2: Container -> VM ─────────────────────────────────────────
 
 /// Initialises a tracing subscriber suitable for the container tier.
 ///
@@ -108,7 +108,7 @@ pub fn run_container_tier<F: FnOnce()>(test_fn: F) {
     });
 }
 
-// ── Tier 1: Host → Container ────────────────────────────────────────
+// ── Tier 1: Host -> Container ───────────────────────────────────────
 
 /// Host-tier dispatch: launch a Docker container and re-run the test
 /// inside it.

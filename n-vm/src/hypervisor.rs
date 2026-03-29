@@ -114,7 +114,7 @@ pub enum HypervisorVerdict {
     /// The VMM emitted a clean `Shutdown` event with no preceding guest
     /// panic or event-stream errors.
     CleanShutdown,
-    /// The VM session ended abnormally — a guest panic was detected, the
+    /// The VM session ended abnormally -- a guest panic was detected, the
     /// event stream contained deserialization errors, or the stream ended
     /// without a clean shutdown event.
     Failure,
@@ -179,13 +179,13 @@ pub fn compute_verdict(events: &[Event], had_stream_errors: bool) -> HypervisorV
 /// consists of concatenated JSON objects written to a pipe.
 ///
 /// The previous implementation carried a phantom lifetime and generic type
-/// parameter that were never used — the `Decoder` impl was always
+/// parameter that were never used -- the `Decoder` impl was always
 /// monomorphised for [`Event`].  This version is a simple unit struct.
 #[derive(Debug, Default)]
 pub struct AsyncJsonStreamDecoder;
 
 impl AsyncJsonStreamDecoder {
-    /// Creates a new decoder instance.
+    /// Creates a new decoder.
     pub fn new() -> Self {
         Self
     }
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn events_after_shutdown_are_ignored_for_verdict() {
         // Events collected after the shutdown (e.g. Deleted) should not
-        // affect the verdict — the shutdown event is the decision point.
+        // affect the verdict -- the shutdown event is the decision point.
         let events = vec![
             event(Source::Vmm, EventType::Starting),
             event(Source::Vmm, EventType::Shutdown),
