@@ -31,6 +31,7 @@ use n_vm_protocol::{
     VM_ROOT_SHARE_PATH, VM_RUN_DIR,
 };
 use tokio_stream::StreamExt;
+use tracing::warn;
 
 use crate::error::ContainerError;
 
@@ -185,7 +186,10 @@ fn resolve_test_params<F: FnOnce()>() -> Result<ContainerParams, ContainerError>
     // is fully qualified (e.g. "crate::module::function").  If this
     // invariant is violated, the Rust compiler changed its type_name
     // format in an incompatible way.
-    let type_name = std::any::type_name::<F>();
+    // When `F` is a reference to a function item the output of
+    // `type_name` is prefixed with `"&"`.  Strip it for consistency
+    // with `run_in_vm` (vm.rs), which performs the same trimming.
+    let type_name = std::any::type_name::<F>().trim_start_matches('&');
     let (_, test_name) = type_name.split_once("::").unwrap_or_else(|| {
         unreachable!("std::any::type_name::<F>() did not contain '::': {type_name:?}")
     });
@@ -383,7 +387,9 @@ async fn stream_container_logs(
                 | bollard::container::LogOutput::Console { message } => {
                     print!("{}", String::from_utf8_lossy(&message));
                 }
-                bollard::container::LogOutput::StdIn { .. } => unreachable!(),
+                bollard::container::LogOutput::StdIn { .. } => {
+                    warn!("unexpected StdIn log entry from Docker");
+                }
             },
             Err(e) => {
                 return Err(ContainerError::LogStream(e));
