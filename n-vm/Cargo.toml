@@ -18,6 +18,8 @@ cloud-hypervisor-client = { workspace = true, default-features = false, features
 command-fds = { workspace = true, default-features = false, features = ["tokio"] }
 bollard = { workspace = true, default-features = false, features = ["pipe", "ssl_providerless"] }
 nix = { workspace = true, default-features = false, features = ["signal", "user"] }
+qapi-qmp = { workspace = true, default-features = false, features = [] }
+qapi-spec = { workspace = true, default-features = false, features = [] }
 serde = { workspace = true, default-features = false, features = ["derive"] }
 serde_json = { workspace = true, default-features = false, features = ["std"] }
 tokio = { workspace = true, default-features = false, features = ["rt", "process", "macros", "fs", "net", "time", "io-util", "io-std"] }

@@ -167,6 +167,8 @@ procfs = { version = "0.18.0", default-features = false, features = [] }
 # TODO: this WARNING makes no sense to me.  What is the goal here?
 # !!! WARNING: Update the version number passed to PyroscopeAgentBuilder::new() in dataplane/src/main.rs when updating pyroscope!
 pyroscope = { version = "2.0.0", default-features = false, features = ["backend-pprof-rs"] } # WARNING - see line above
+qapi-qmp = { version = "0.15.0", default-features = false, features = [] }
+qapi-spec = { version = "0.3.2", default-features = false, features = [] }
 quote = { version = "1.0.45", default-features = false, features = [] }
 rand = { version = "0.10.0", default-features = false, features = [] }
 rapidhash = { version = "4.4.1", default-features = false, features = [] }
