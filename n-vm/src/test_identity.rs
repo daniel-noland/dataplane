@@ -31,16 +31,14 @@
 pub(crate) struct TestIdentity {
     /// The fully-qualified type name after `&`-stripping.
     ///
-    /// Not currently read outside tests, but provided for future callers
-    /// that may need the full path (e.g. for logging or diagnostics).
-    #[allow(dead_code)]
-    ///
     /// This is the raw output of `std::any::type_name::<F>()` with any
-    /// leading `&` removed.  It is a `&'static str` because `type_name`
-    /// returns a `&'static str`.
+    /// leading `&` removed.  Not currently read outside tests, but
+    /// provided for future callers that may need the full path (e.g. for
+    /// logging or diagnostics).
+    #[allow(dead_code)]
     pub full_type_name: &'static str,
 
-    /// The test name portion — everything after the first `::`.
+    /// The test name portion -- everything after the first `::`.
     ///
     /// For a fully-qualified type name like `"my_crate::tests::my_test"`,
     /// this would be `"tests::my_test"`.  This matches the format expected
