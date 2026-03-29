@@ -7,7 +7,7 @@
 //! 1. Register signal handlers ([`SignalSet`](crate::signal::SignalSet)).
 //! 2. Mount essential filesystems.
 //! 3. Spawn the test process.
-//! 4. Enter the event loop — forward signals and wait for exit.
+//! 4. Enter the event loop -- forward signals and wait for exit.
 //! 5. Shut down cleanly (terminate children, unmount, power off / abort).
 //!
 //! Each phase delegates to a focused module, so the orchestrator itself
@@ -162,7 +162,7 @@ impl InitSystem {
         .await
         {
             Ok(_) => {
-                // Normally unreachable — the blocking task either powers off
+                // Normally unreachable -- the blocking task either powers off
                 // or aborts.  Use fatal! to ensure stdio is flushed.
                 fatal!("unreachable code?");
             }

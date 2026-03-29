@@ -3,20 +3,20 @@
 //! This binary runs as **PID 1** inside a cloud-hypervisor VM booted by
 //! [`n_vm::run_in_vm`].  Its responsibilities are:
 //!
-//! 1. **Mount essential filesystems** — `/proc`, `/sys`, `/tmp`, `/run`, and
+//! 1. **Mount essential filesystems** -- `/proc`, `/sys`, `/tmp`, `/run`, and
 //!    `/sys/fs/cgroup` with appropriate security flags.
 //! 2. **Spawn the test binary** as a child process with the `IN_VM=YES`
 //!    environment variable, causing the `#[in_vm]` macro to execute the test
 //!    body directly.
-//! 3. **Forward signals** — benign signals (SIGHUP, SIGUSR1, etc.) are
+//! 3. **Forward signals** -- benign signals (SIGHUP, SIGUSR1, etc.) are
 //!    forwarded to the test process; failure signals (SIGINT, SIGPIPE, etc.)
 //!    are forwarded and also mark the test as failed.
-//! 4. **Reap orphaned processes** — after the test exits, any remaining child
+//! 4. **Reap orphaned processes** -- after the test exits, any remaining child
 //!    processes are terminated with SIGTERM.  Leaked processes are treated as
 //!    a test failure.
 //! 5. **Stream tracing data** back to the host via a vsock connection so that
 //!    the container tier can collect init system logs.
-//! 6. **Clean shutdown** — unmount filesystems, sync, and power off the VM
+//! 6. **Clean shutdown** -- unmount filesystems, sync, and power off the VM
 //!    (or abort on failure so the hypervisor detects a guest panic).
 
 #![deny(unsafe_op_in_unsafe_fn)]

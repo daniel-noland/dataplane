@@ -174,7 +174,7 @@ pub fn send_signal_to_all_processes(
             Ok(BroadcastSignalOutcome::Delivered)
         }
         Err(Errno::ESRCH) => {
-            // No processes found — this can happen if we're the only
+            // No processes found -- this can happen if we're the only
             // process left.
             trace!("no processes found to send {signal:?} to");
             Ok(BroadcastSignalOutcome::NoProcesses)
@@ -191,7 +191,7 @@ pub fn send_signal_to_all_processes(
 /// process has already exited.
 ///
 /// Unlike [`send_signal_to_all_processes`], this targets a single PID and
-/// treats `ESRCH` (no such process) as a non-fatal condition — the child
+/// treats `ESRCH` (no such process) as a non-fatal condition -- the child
 /// may have exited between the time the signal was received and the time
 /// we attempt to forward it.
 pub fn forward_signal(pid: Pid, sig: Signal) {
@@ -233,7 +233,7 @@ pub async fn terminate_remaining_processes() -> TerminateOutcome {
         Ok(_) => {}
         Err(e) => {
             // If we can't even list children during shutdown, log it and
-            // assume the worst — try to terminate anyway.
+            // assume the worst -- try to terminate anyway.
             error!("failed to list child processes during shutdown: {e}");
         }
     }

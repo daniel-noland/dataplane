@@ -6,7 +6,7 @@
 //! [`Option<()>`].
 //!
 //! The orchestrator ([`crate::init::InitSystem`]) is responsible for
-//! deciding how to handle each error — typically by logging context and
+//! deciding how to handle each error -- typically by logging context and
 //! aborting via [`fatal!`].
 
 use std::path::Path;
@@ -20,7 +20,7 @@ use nix::sys::signal::Signal;
 /// An error that occurred while mounting an essential filesystem.
 #[derive(Debug, thiserror::Error)]
 pub enum MountError {
-    /// The kernel returned `EPERM` — the init process lacks the required
+    /// The kernel returned `EPERM` -- the init process lacks the required
     /// capability (should never happen for PID 1 in a normal VM).
     #[error("permission denied while mounting {}", .target.display())]
     PermissionDenied {
@@ -110,7 +110,7 @@ pub enum SpawnError {
 /// Outcome of reaping orphaned child processes via `waitpid`.
 ///
 /// This replaces the previous `Option<()>` return where `Some(())`
-/// meant failure — a pattern the project guidelines explicitly
+/// meant failure -- a pattern the project guidelines explicitly
 /// discourage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReapOutcome {
@@ -150,7 +150,7 @@ impl BroadcastSignalOutcome {
 
 /// An unrecoverable error when broadcasting a signal.
 ///
-/// `EPERM` from an init system is genuinely fatal — if PID 1 cannot
+/// `EPERM` from an init system is genuinely fatal -- if PID 1 cannot
 /// signal its children the system is in an unrecoverable state.
 #[derive(Debug, thiserror::Error)]
 pub enum BroadcastSignalError {
