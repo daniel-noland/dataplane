@@ -911,3 +911,278 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> Result<VmTestOutput, VmError> {
     let vm = TestVm::launch(&params).await?;
     Ok(vm.collect().await)
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a representative [`TestVmParams`] for use in config builder
+    /// tests.  The values are arbitrary but realistic.
+    fn sample_params() -> TestVmParams<'static> {
+        TestVmParams {
+            full_bin_path: Path::new("/target/debug/deps/my_test-abc123"),
+            bin_name: "my_test-abc123",
+            test_name: "tests::my_test",
+        }
+    }
+
+    // ── Payload ──────────────────────────────────────────────────────
+
+    #[test]
+    fn payload_config_uses_kernel_image_path() {
+        let params = sample_params();
+        let payload = params.build_payload_config();
+        assert_eq!(payload.kernel.as_deref(), Some(KERNEL_IMAGE_PATH));
+    }
+
+    #[test]
+    fn payload_config_embeds_test_binary_in_cmdline() {
+        let params = sample_params();
+        let payload = params.build_payload_config();
+        let cmdline = payload.cmdline.as_deref().expect("cmdline should be set");
+        assert!(
+            cmdline.contains("/target/debug/deps/my_test-abc123"),
+            "cmdline should contain the full binary path: {cmdline}",
+        );
+    }
+
+    #[test]
+    fn payload_config_embeds_test_name_in_cmdline() {
+        let params = sample_params();
+        let payload = params.build_payload_config();
+        let cmdline = payload.cmdline.as_deref().expect("cmdline should be set");
+        assert!(
+            cmdline.contains("tests::my_test"),
+            "cmdline should contain the test name: {cmdline}",
+        );
+    }
+
+    #[test]
+    fn payload_config_sets_init_binary() {
+        let params = sample_params();
+        let payload = params.build_payload_config();
+        let cmdline = payload.cmdline.as_deref().expect("cmdline should be set");
+        assert!(
+            cmdline.contains(&format!("init={INIT_BINARY_PATH}")),
+            "cmdline should specify the init binary: {cmdline}",
+        );
+    }
+
+    #[test]
+    fn payload_config_enables_hugepages_on_cmdline() {
+        let params = sample_params();
+        let payload = params.build_payload_config();
+        let cmdline = payload.cmdline.as_deref().expect("cmdline should be set");
+        assert!(
+            cmdline.contains(&format!("hugepages={VM_HUGEPAGE_COUNT}")),
+            "cmdline should configure hugepage count: {cmdline}",
+        );
+        assert!(
+            cmdline.contains("hugepagesz=2M"),
+            "cmdline should configure hugepage size: {cmdline}",
+        );
+    }
+
+    #[test]
+    fn payload_config_passes_exact_flag_to_test_harness() {
+        let params = sample_params();
+        let payload = params.build_payload_config();
+        let cmdline = payload.cmdline.as_deref().expect("cmdline should be set");
+        assert!(
+            cmdline.contains("--exact"),
+            "cmdline should pass --exact to the test harness: {cmdline}",
+        );
+        assert!(
+            cmdline.contains("--no-capture"),
+            "cmdline should pass --no-capture to the test harness: {cmdline}",
+        );
+    }
+
+    // ── CPU ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn cpu_config_has_six_vcpus() {
+        let cpus = TestVmParams::build_cpu_config();
+        assert_eq!(cpus.boot_vcpus, 6);
+        assert_eq!(cpus.max_vcpus, 6);
+    }
+
+    #[test]
+    fn cpu_topology_is_three_dies_by_one_core_by_two_threads() {
+        let cpus = TestVmParams::build_cpu_config();
+        let topo = cpus.topology.expect("topology should be set");
+        assert_eq!(topo.threads_per_core, Some(2));
+        assert_eq!(topo.cores_per_die, Some(1));
+        assert_eq!(topo.dies_per_package, Some(3));
+        assert_eq!(topo.packages, Some(1));
+        // Sanity: product of topology should equal boot_vcpus.
+        let total = topo.threads_per_core.unwrap()
+            * topo.cores_per_die.unwrap()
+            * topo.dies_per_package.unwrap()
+            * topo.packages.unwrap();
+        assert_eq!(
+            total, cpus.boot_vcpus,
+            "topology product ({total}) should match boot_vcpus ({})",
+            cpus.boot_vcpus,
+        );
+    }
+
+    // ── Memory ───────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_config_has_expected_size() {
+        let mem = TestVmParams::build_memory_config();
+        assert_eq!(mem.size, VM_MEMORY_BYTES);
+    }
+
+    #[test]
+    fn memory_config_enables_hugepages_and_sharing() {
+        let mem = TestVmParams::build_memory_config();
+        assert_eq!(mem.hugepages, Some(true));
+        assert_eq!(mem.hugepage_size, Some(VM_HUGEPAGE_BYTES));
+        assert_eq!(mem.shared, Some(true), "shared memory is required for virtiofs");
+        assert_eq!(mem.mergeable, Some(true));
+        assert_eq!(mem.thp, Some(true));
+    }
+
+    // ── Network ──────────────────────────────────────────────────────
+
+    #[test]
+    fn network_config_has_three_interfaces() {
+        let nets = TestVmParams::build_network_configs();
+        assert_eq!(nets.len(), 3);
+    }
+
+    #[test]
+    fn mgmt_interface_is_on_pci_segment_zero_with_standard_mtu() {
+        let nets = TestVmParams::build_network_configs();
+        let mgmt = nets.iter().find(|n| n.id.as_deref() == Some("mgmt"))
+            .expect("should have a 'mgmt' interface");
+        assert_eq!(mgmt.pci_segment, Some(0));
+        assert_eq!(mgmt.mtu, Some(MGMT_MTU));
+        assert_eq!(mgmt.queue_size, Some(MGMT_QUEUE_SIZE));
+    }
+
+    #[test]
+    fn fabric_interfaces_are_on_pci_segment_one_with_jumbo_mtu() {
+        let nets = TestVmParams::build_network_configs();
+        for name in &["fabric1", "fabric2"] {
+            let iface = nets.iter().find(|n| n.id.as_deref() == Some(*name))
+                .unwrap_or_else(|| panic!("should have a '{name}' interface"));
+            assert_eq!(iface.pci_segment, Some(1), "{name} PCI segment");
+            assert_eq!(iface.mtu, Some(FABRIC_MTU), "{name} MTU");
+            assert_eq!(iface.queue_size, Some(FABRIC_QUEUE_SIZE), "{name} queue size");
+        }
+    }
+
+    #[test]
+    fn all_interfaces_have_unique_mac_addresses() {
+        let nets = TestVmParams::build_network_configs();
+        let macs: Vec<_> = nets.iter().filter_map(|n| n.mac.as_deref()).collect();
+        assert_eq!(macs.len(), 3, "all interfaces should have MAC addresses");
+        let mut deduped = macs.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(macs.len(), deduped.len(), "all MAC addresses should be unique");
+    }
+
+    #[test]
+    fn all_interfaces_have_unique_tap_names() {
+        let nets = TestVmParams::build_network_configs();
+        let taps: Vec<_> = nets.iter().filter_map(|n| n.tap.as_deref()).collect();
+        assert_eq!(taps.len(), 3, "all interfaces should have tap names");
+        let mut deduped = taps.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(taps.len(), deduped.len(), "all tap names should be unique");
+    }
+
+    // ── Filesystem ───────────────────────────────────────────────────
+
+    #[test]
+    fn fs_config_uses_virtiofs_root_tag_and_socket() {
+        let fs = TestVmParams::build_fs_config();
+        assert_eq!(fs.len(), 1);
+        let entry = &fs[0];
+        assert_eq!(entry.tag, VIRTIOFS_ROOT_TAG);
+        assert_eq!(entry.socket, VIRTIOFSD_SOCKET_PATH);
+        assert_eq!(entry.queue_size, VIRTIOFS_QUEUE_SIZE);
+    }
+
+    // ── Platform ─────────────────────────────────────────────────────
+
+    #[test]
+    fn platform_config_embeds_binary_and_test_name_in_oem_strings() {
+        let params = sample_params();
+        let platform = params.build_platform_config();
+        let oem = platform.oem_strings.expect("oem_strings should be set");
+        assert!(
+            oem.iter().any(|s| s == "exe=my_test-abc123"),
+            "OEM strings should contain the binary name: {oem:?}",
+        );
+        assert!(
+            oem.iter().any(|s| s == "test=tests::my_test"),
+            "OEM strings should contain the test name: {oem:?}",
+        );
+    }
+
+    #[test]
+    fn platform_config_has_two_pci_segments() {
+        let params = sample_params();
+        let platform = params.build_platform_config();
+        assert_eq!(platform.num_pci_segments, Some(2));
+    }
+
+    // ── Composed VmConfig ────────────────────────────────────────────
+
+    #[test]
+    fn vm_config_disables_virtio_console() {
+        let params = sample_params();
+        let config = params.build_vm_config();
+        let console = config.console.expect("console should be set");
+        assert_eq!(console.mode, Mode::Off);
+    }
+
+    #[test]
+    fn vm_config_serial_uses_socket_mode() {
+        let params = sample_params();
+        let config = params.build_vm_config();
+        let serial = config.serial.expect("serial should be set");
+        assert_eq!(serial.mode, Mode::Socket);
+        assert_eq!(
+            serial.socket.as_deref(),
+            Some(KERNEL_CONSOLE_SOCKET_PATH),
+        );
+    }
+
+    #[test]
+    fn vm_config_vsock_uses_guest_cid() {
+        let params = sample_params();
+        let config = params.build_vm_config();
+        let vsock = config.vsock.expect("vsock should be set");
+        assert_eq!(vsock.cid, VM_GUEST_CID.as_raw() as i64);
+        assert_eq!(vsock.socket, VHOST_VSOCK_SOCKET_PATH);
+    }
+
+    #[test]
+    fn vm_config_enables_safety_features() {
+        let params = sample_params();
+        let config = params.build_vm_config();
+        assert_eq!(config.watchdog, Some(true), "watchdog should be enabled");
+        assert_eq!(config.pvpanic, Some(true), "pvpanic should be enabled");
+        assert_eq!(config.iommu, Some(false), "iommu should be disabled at VM level");
+    }
+
+    #[test]
+    fn vm_config_enables_landlock_with_vm_run_dir() {
+        let params = sample_params();
+        let config = params.build_vm_config();
+        assert_eq!(config.landlock_enable, Some(true));
+        let rules = config.landlock_rules.expect("landlock_rules should be set");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].path, VM_RUN_DIR);
+        assert_eq!(rules[0].access, "rw");
+    }
+}
