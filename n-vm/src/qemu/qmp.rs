@@ -205,8 +205,7 @@ impl QmpConnection {
         let mut writer = write_half;
 
         // ── Phase 1: read the QMP greeting ───────────────────────────
-        let greeting =
-            read_line_json::<qapi_qmp::QapiCapabilities>(&mut reader).await?;
+        let greeting = read_line_json::<qapi_qmp::QapiCapabilities>(&mut reader).await?;
 
         let v = &greeting.QMP.version;
         debug!(
@@ -217,8 +216,7 @@ impl QmpConnection {
         // ── Phase 2: negotiate capabilities ──────────────────────────
         send_command(&mut writer, QmpCommandName::QmpCapabilities).await?;
 
-        let msg =
-            read_line_json::<qapi_qmp::QmpMessageAny>(&mut reader).await?;
+        let msg = read_line_json::<qapi_qmp::QmpMessageAny>(&mut reader).await?;
         match msg {
             QmpMessage::Response(resp) => match resp.result() {
                 Ok(_) => {
@@ -379,7 +377,10 @@ async fn read_line_json<T: serde::de::DeserializeOwned>(
     reader: &mut BufReader<OwnedReadHalf>,
 ) -> Result<T, QemuError> {
     let mut line = String::new();
-    let bytes_read = reader.read_line(&mut line).await.map_err(QemuError::QmpIo)?;
+    let bytes_read = reader
+        .read_line(&mut line)
+        .await
+        .map_err(QemuError::QmpIo)?;
     if bytes_read == 0 {
         return Err(QemuError::QmpGreeting {
             reason: "connection closed before message received".into(),
@@ -464,16 +465,12 @@ mod tests {
 
     #[test]
     fn deserialize_error_response() {
-        let json =
-            r#"{"error": {"class": "GenericError", "desc": "something went wrong"}}"#;
+        let json = r#"{"error": {"class": "GenericError", "desc": "something went wrong"}}"#;
         let msg: qapi_qmp::QmpMessageAny = serde_json::from_str(json).unwrap();
         match msg {
             QmpMessage::Response(resp) => match resp.result() {
                 Err(error) => {
-                    assert_eq!(
-                        error.class,
-                        qapi_spec::ErrorClass::GenericError,
-                    );
+                    assert_eq!(error.class, qapi_spec::ErrorClass::GenericError,);
                     assert_eq!(error.desc, "something went wrong");
                 }
                 Ok(_) => panic!("expected error response, got success"),
@@ -491,10 +488,7 @@ mod tests {
         match msg {
             QmpMessage::Event(qapi_qmp::Event::SHUTDOWN { data, .. }) => {
                 assert!(data.guest);
-                assert_eq!(
-                    data.reason,
-                    qapi_qmp::ShutdownCause::guest_shutdown,
-                );
+                assert_eq!(data.reason, qapi_qmp::ShutdownCause::guest_shutdown,);
             }
             other => panic!("expected SHUTDOWN event, got {other:?}"),
         }
@@ -565,13 +559,15 @@ mod tests {
 
         match serde_json::from_str::<qapi_qmp::QmpMessageAny>(return_json).unwrap() {
             QmpMessage::Response(r) => {
-                r.result().expect("return_json should be a success response");
+                r.result()
+                    .expect("return_json should be a success response");
             }
             other => panic!("expected Response for return_json, got {other:?}"),
         }
         match serde_json::from_str::<qapi_qmp::QmpMessageAny>(error_json).unwrap() {
             QmpMessage::Response(r) => {
-                r.result().expect_err("error_json should be an error response");
+                r.result()
+                    .expect_err("error_json should be an error response");
             }
             other => panic!("expected Response for error_json, got {other:?}"),
         }

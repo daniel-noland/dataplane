@@ -39,7 +39,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use n_vm_protocol::{
-    KERNEL_CONSOLE_SOCKET_PATH, VIRTIOFSD_BINARY_PATH, VIRTIOFSD_SOCKET_PATH, VIRTIOFS_ROOT_TAG,
+    KERNEL_CONSOLE_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VIRTIOFSD_BINARY_PATH, VIRTIOFSD_SOCKET_PATH,
     VM_ROOT_SHARE_PATH, VsockChannel,
 };
 use tokio::io::AsyncReadExt;
@@ -271,11 +271,7 @@ pub struct VmTestOutput<B: HypervisorBackend> {
 impl<B: HypervisorBackend> std::fmt::Display for VmTestOutput<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "=============== in_vm TEST RESULTS ===============")?;
-        writeln!(
-            f,
-            "--------------- {} events ---------------",
-            B::NAME
-        )?;
+        writeln!(f, "--------------- {} events ---------------", B::NAME)?;
         write!(f, "{}", self.hypervisor_events)?;
         self.hypervisor.fmt_sections(f, B::NAME)?;
         self.virtiofsd.fmt_sections(f, "virtiofsd")?;

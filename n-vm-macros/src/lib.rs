@@ -186,8 +186,7 @@ fn parse_in_vm_args(attr: TokenStream) -> Result<InVmArgs, TokenStream> {
     // `Punctuated` does not implement `Parse` directly, so we use its
     // `parse_terminated` method via the `Parser` trait.
     use syn::parse::Parser;
-    let parser =
-        syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated;
+    let parser = syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated;
     let punctuated = match parser.parse(attr) {
         Ok(p) => p,
         Err(_) => {
@@ -241,12 +240,11 @@ fn parse_in_vm_args(attr: TokenStream) -> Result<InVmArgs, TokenStream> {
             backend_seen = true;
         } else if ident_str == "iommu" {
             if iommu {
-                return Err(syn::Error::new_spanned(
-                    ident,
-                    "duplicate `iommu` option in #[in_vm]",
-                )
-                .to_compile_error()
-                .into());
+                return Err(
+                    syn::Error::new_spanned(ident, "duplicate `iommu` option in #[in_vm]")
+                        .to_compile_error()
+                        .into(),
+                );
             }
             iommu = true;
         } else if is_known_option(&ident_str) {

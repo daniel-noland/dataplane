@@ -575,7 +575,11 @@ fn push_kernel_args(args: &mut Vec<String>, params: &TestVmParams<'_>) {
 /// When `iommu` is `true`, appends `iommu_platform=on,ats=on` so that
 /// the device performs DMA through the virtual IOMMU.
 fn push_fs_args(args: &mut Vec<String>, iommu: bool) {
-    let iommu_suffix = if iommu { ",iommu_platform=on,ats=on" } else { "" };
+    let iommu_suffix = if iommu {
+        ",iommu_platform=on,ats=on"
+    } else {
+        ""
+    };
     args.extend([
         "-chardev".into(),
         format!("socket,id=virtiofs0,path={VIRTIOFSD_SOCKET_PATH}"),
@@ -601,7 +605,11 @@ fn push_fs_args(args: &mut Vec<String>, iommu: bool) {
 /// host), while the [`TestVm`](crate::vm::TestVm) infrastructure
 /// expects Unix sockets at `$VHOST_SOCKET_$PORT` paths.
 fn push_vsock_args(args: &mut Vec<String>, iommu: bool) {
-    let iommu_suffix = if iommu { ",iommu_platform=on,ats=on" } else { "" };
+    let iommu_suffix = if iommu {
+        ",iommu_platform=on,ats=on"
+    } else {
+        ""
+    };
     args.extend([
         "-device".into(),
         format!(
@@ -629,7 +637,11 @@ fn push_vsock_args(args: &mut Vec<String>, iommu: bool) {
 /// `virtio-net-pci` device string so that network I/O is routed through
 /// the virtual IOMMU.
 fn push_network_args(args: &mut Vec<String>, iommu: bool) {
-    let iommu_suffix = if iommu { ",iommu_platform=on,ats=on" } else { "" };
+    let iommu_suffix = if iommu {
+        ",iommu_platform=on,ats=on"
+    } else {
+        ""
+    };
     for iface in [&IFACE_MGMT, &IFACE_FABRIC1, &IFACE_FABRIC2] {
         args.extend([
             "-netdev".into(),
@@ -1084,10 +1096,7 @@ mod tests {
                 dev.contains("iommu_platform=on"),
                 "device should have iommu_platform=on: {dev}",
             );
-            assert!(
-                dev.contains("ats=on"),
-                "device should have ats=on: {dev}",
-            );
+            assert!(dev.contains("ats=on"), "device should have ats=on: {dev}",);
         }
     }
 
