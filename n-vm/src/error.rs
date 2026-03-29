@@ -19,6 +19,7 @@
 //! when imposed by an external framework.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 // ── VM tier errors ───────────────────────────────────────────────────
 
@@ -45,7 +46,7 @@ pub enum VmError {
     #[error("test binary path does not contain a '/' separator: {path:?}")]
     InvalidBinaryPath {
         /// The argv\[0\] value that could not be split.
-        path: String,
+        path: PathBuf,
     },
 
     /// virtiofsd failed to start.
@@ -57,12 +58,12 @@ pub enum VmError {
     /// The container tier must bind Unix sockets for each
     /// [`VsockChannel`](n_vm_protocol::VsockChannel) *before* the VM boots.
     /// This error indicates one of those binds failed.
-    #[error("failed to bind vsock listener for channel `{label}` at {path}")]
+    #[error("failed to bind vsock listener for channel `{label}` at {path:?}")]
     VsockBind {
         /// Human-readable channel label (e.g. `"test-stdout"`).
         label: &'static str,
         /// Filesystem path that was passed to `bind()`.
-        path: String,
+        path: PathBuf,
         /// The underlying I/O error.
         #[source]
         source: std::io::Error,
@@ -101,19 +102,19 @@ pub enum VmError {
 
     /// A required socket did not appear on the filesystem within the
     /// polling timeout.
-    #[error("timed out waiting for socket {path} after {timeout_ms} ms")]
+    #[error("timed out waiting for socket {path:?} after {timeout:?}")]
     SocketTimeout {
         /// The socket path that was being polled.
-        path: String,
-        /// Total time spent polling, in milliseconds.
-        timeout_ms: u64,
+        path: PathBuf,
+        /// Total time spent polling.
+        timeout: Duration,
     },
 
     /// An I/O error occurred while polling for a socket's existence.
-    #[error("I/O error while waiting for socket {path}")]
+    #[error("I/O error while waiting for socket {path:?}")]
     SocketPoll {
         /// The socket path that was being polled.
-        path: String,
+        path: PathBuf,
         /// The underlying I/O error.
         #[source]
         source: std::io::Error,
@@ -180,10 +181,10 @@ pub enum ContainerError {
 
     /// A required device node (e.g. `/dev/kvm`) is not accessible on the
     /// host.
-    #[error("required device {path} is not accessible")]
+    #[error("required device {path:?} is not accessible")]
     DeviceNotAccessible {
         /// The device path that could not be stat'd.
-        path: String,
+        path: PathBuf,
         /// The underlying I/O error.
         #[source]
         source: std::io::Error,
