@@ -32,18 +32,20 @@
 //!
 //! # Protocol overview
 //!
-//! ```text
-//! Client                                QEMU
-//!   |                                     |
-//!   |<--- {"QMP": {"version": ...}} ------|  (greeting)
-//!   |---- {"execute": "qmp_capabilities"} -->|  (negotiate)
-//!   |<--- {"return": {}} ----------------|  (success)
-//!   |                                     |
-//!   |  ... command mode active ...        |
-//!   |                                     |
-//!   |<--- {"event": "SHUTDOWN", ...} ----|  (async event)
-//!   |---- {"execute": "quit"} ------------>|  (command)
-//!   |<--- {"return": {}} ----------------|  (response)
+//! ```mermaid
+//! sequenceDiagram
+//!     participant Client
+//!     participant QEMU
+//!
+//!     QEMU->>Client: {"QMP": {"version": ...}} (greeting)
+//!     Client->>QEMU: {"execute": "qmp_capabilities"} (negotiate)
+//!     QEMU->>Client: {"return": {}} (success)
+//!
+//!     note over Client,QEMU: command mode active
+//!
+//!     QEMU->>Client: {"event": "SHUTDOWN", ...} (async event)
+//!     Client->>QEMU: {"execute": "quit"} (command)
+//!     QEMU->>Client: {"return": {}} (response)
 //! ```
 //!
 //! After negotiation, the socket carries a mix of **responses** (to
