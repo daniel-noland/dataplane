@@ -188,9 +188,7 @@ impl<T> Ring<T> {
         let raw = Box::into_raw(item);
         // SAFETY: self.inner is a valid rte_ring pointer, and raw is a
         // valid heap pointer that we are intentionally leaking into the ring.
-        let ret = unsafe {
-            dpdk_sys::rte_ring_enqueue(self.inner.as_ptr(), raw.cast::<c_void>())
-        };
+        let ret = unsafe { dpdk_sys::rte_ring_enqueue(self.inner.as_ptr(), raw.cast::<c_void>()) };
         if ret == 0 {
             Ok(())
         } else {
@@ -206,9 +204,7 @@ impl<T> Ring<T> {
         let mut obj: *mut c_void = ptr::null_mut();
         // SAFETY: self.inner is a valid rte_ring pointer, and obj is a
         // valid stack-local pointer that DPDK will fill in.
-        let ret = unsafe {
-            dpdk_sys::rte_ring_dequeue(self.inner.as_ptr(), &mut obj)
-        };
+        let ret = unsafe { dpdk_sys::rte_ring_dequeue(self.inner.as_ptr(), &mut obj) };
         if ret == 0 {
             // SAFETY: the pointer was created by Box::into_raw in enqueue().
             Some(unsafe { Box::from_raw(obj.cast::<T>()) })
@@ -347,9 +343,7 @@ impl<T> Drop for Ring<T> {
         let mut obj: *mut c_void = ptr::null_mut();
         loop {
             // SAFETY: self.inner is valid until rte_ring_free below.
-            let ret = unsafe {
-                dpdk_sys::rte_ring_dequeue(self.inner.as_ptr(), &mut obj)
-            };
+            let ret = unsafe { dpdk_sys::rte_ring_dequeue(self.inner.as_ptr(), &mut obj) };
             if ret != 0 {
                 break;
             }
@@ -357,10 +351,7 @@ impl<T> Drop for Ring<T> {
             let _ = unsafe { Box::from_raw(obj.cast::<T>()) };
         }
 
-        debug!(
-            "Freeing DPDK ring '{name}'",
-            name = self.params.name(),
-        );
+        debug!("Freeing DPDK ring '{name}'", name = self.params.name(),);
         // SAFETY: self.inner was obtained from a successful rte_ring_create
         // and we have exclusive ownership.
         unsafe { dpdk_sys::rte_ring_free(self.inner.as_ptr()) };

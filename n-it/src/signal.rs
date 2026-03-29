@@ -73,16 +73,61 @@ pub struct SignalSpec {
 /// picks it up; no other code changes are required.
 pub const SIGNAL_TABLE: &[SignalSpec] = &[
     // ── Failure signals ──────────────────────────────────────────
-    SignalSpec { kind: SignalKind::terminate(),    signal: Signal::SIGTERM,  policy: SignalPolicy::Failure, label: "SIGTERM"  },
-    SignalSpec { kind: SignalKind::interrupt(),     signal: Signal::SIGINT,   policy: SignalPolicy::Failure, label: "SIGINT"   },
-    SignalSpec { kind: SignalKind::alarm(),         signal: Signal::SIGALRM,  policy: SignalPolicy::Failure, label: "SIGALRM"  },
-    SignalSpec { kind: SignalKind::pipe(),          signal: Signal::SIGPIPE,  policy: SignalPolicy::Failure, label: "SIGPIPE"  },
-    SignalSpec { kind: SignalKind::quit(),          signal: Signal::SIGQUIT,  policy: SignalPolicy::Failure, label: "SIGQUIT"  },
+    SignalSpec {
+        kind: SignalKind::terminate(),
+        signal: Signal::SIGTERM,
+        policy: SignalPolicy::Failure,
+        label: "SIGTERM",
+    },
+    SignalSpec {
+        kind: SignalKind::interrupt(),
+        signal: Signal::SIGINT,
+        policy: SignalPolicy::Failure,
+        label: "SIGINT",
+    },
+    SignalSpec {
+        kind: SignalKind::alarm(),
+        signal: Signal::SIGALRM,
+        policy: SignalPolicy::Failure,
+        label: "SIGALRM",
+    },
+    SignalSpec {
+        kind: SignalKind::pipe(),
+        signal: Signal::SIGPIPE,
+        policy: SignalPolicy::Failure,
+        label: "SIGPIPE",
+    },
+    SignalSpec {
+        kind: SignalKind::quit(),
+        signal: Signal::SIGQUIT,
+        policy: SignalPolicy::Failure,
+        label: "SIGQUIT",
+    },
     // ── Benign signals ───────────────────────────────────────────
-    SignalSpec { kind: SignalKind::hangup(),        signal: Signal::SIGHUP,   policy: SignalPolicy::Benign,  label: "SIGHUP"   },
-    SignalSpec { kind: SignalKind::user_defined1(), signal: Signal::SIGUSR1,  policy: SignalPolicy::Benign,  label: "SIGUSR1"  },
-    SignalSpec { kind: SignalKind::user_defined2(), signal: Signal::SIGUSR2,  policy: SignalPolicy::Benign,  label: "SIGUSR2"  },
-    SignalSpec { kind: SignalKind::window_change(), signal: Signal::SIGWINCH, policy: SignalPolicy::Benign,  label: "SIGWINCH" },
+    SignalSpec {
+        kind: SignalKind::hangup(),
+        signal: Signal::SIGHUP,
+        policy: SignalPolicy::Benign,
+        label: "SIGHUP",
+    },
+    SignalSpec {
+        kind: SignalKind::user_defined1(),
+        signal: Signal::SIGUSR1,
+        policy: SignalPolicy::Benign,
+        label: "SIGUSR1",
+    },
+    SignalSpec {
+        kind: SignalKind::user_defined2(),
+        signal: Signal::SIGUSR2,
+        policy: SignalPolicy::Benign,
+        label: "SIGUSR2",
+    },
+    SignalSpec {
+        kind: SignalKind::window_change(),
+        signal: Signal::SIGWINCH,
+        policy: SignalPolicy::Benign,
+        label: "SIGWINCH",
+    },
 ];
 
 /// A multiplexed receiver for all signals in a [`SignalSpec`] table.
@@ -287,9 +332,7 @@ mod tests {
     /// dispatch loop.  This test ensures it is never accidentally added.
     #[test]
     fn signal_table_does_not_contain_sigchld() {
-        let has_sigchld = SIGNAL_TABLE
-            .iter()
-            .any(|s| s.signal == Signal::SIGCHLD);
+        let has_sigchld = SIGNAL_TABLE.iter().any(|s| s.signal == Signal::SIGCHLD);
         assert!(
             !has_sigchld,
             "SIGNAL_TABLE should not contain SIGCHLD; \

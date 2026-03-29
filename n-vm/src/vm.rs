@@ -46,9 +46,9 @@ use cloud_hypervisor_client::models::{
 use command_fds::{CommandFdExt, FdMapping};
 use n_vm_protocol::{
     CLOUD_HYPERVISOR_BINARY_PATH, HYPERVISOR_API_SOCKET_PATH, INIT_BINARY_PATH,
-    KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH, VHOST_VSOCK_SOCKET_PATH,
-    VIRTIOFSD_BINARY_PATH, VIRTIOFSD_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VM_GUEST_CID,
-    VM_ROOT_SHARE_PATH, VM_RUN_DIR, VsockChannel,
+    KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH, VHOST_VSOCK_SOCKET_PATH, VIRTIOFS_ROOT_TAG,
+    VIRTIOFSD_BINARY_PATH, VIRTIOFSD_SOCKET_PATH, VM_GUEST_CID, VM_ROOT_SHARE_PATH, VM_RUN_DIR,
+    VsockChannel,
 };
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
@@ -194,10 +194,7 @@ impl ProcessOutput {
             Ok(output) => output,
             Err(err) => {
                 error!("failed to join {label} task: {err}");
-                format!(
-                    "!!!{} UNAVAILABLE: {err}!!!",
-                    label.to_uppercase()
-                )
+                format!("!!!{} UNAVAILABLE: {err}!!!", label.to_uppercase())
             }
         }
     }
@@ -569,9 +566,7 @@ impl TestVm {
 
     /// Spawns a virtiofsd process that shares `path` into the VM as a
     /// read-only virtiofs mount.
-    async fn launch_virtiofsd(
-        path: impl AsRef<Path>,
-    ) -> Result<tokio::process::Child, VmError> {
+    async fn launch_virtiofsd(path: impl AsRef<Path>) -> Result<tokio::process::Child, VmError> {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
         tokio::process::Command::new(VIRTIOFSD_BINARY_PATH)
@@ -793,7 +788,8 @@ impl TestVm {
         // The vsock readers complete when the guest-side streams close
         // (test process exits -> stdout/stderr close; n-it exits ->
         // init_trace closes).
-        let init_trace = ProcessOutput::join_task_or_fallback(init_trace, "init system trace").await;
+        let init_trace =
+            ProcessOutput::join_task_or_fallback(init_trace, "init system trace").await;
         let test_stdout = ProcessOutput::join_task_or_fallback(test_stdout, "test stdout").await;
         let test_stderr = ProcessOutput::join_task_or_fallback(test_stderr, "test stderr").await;
 
@@ -893,14 +889,13 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> Result<VmTestOutput, VmError> {
     let identity = crate::test_identity::TestIdentity::resolve::<F>();
     let test_name = identity.test_name;
 
-    let full_bin_path = std::env::args()
-        .next()
-        .ok_or(VmError::MissingArgv)?;
-    let (_, bin_name) = full_bin_path
-        .rsplit_once("/")
-        .ok_or_else(|| VmError::InvalidBinaryPath {
-            path: PathBuf::from(&full_bin_path),
-        })?;
+    let full_bin_path = std::env::args().next().ok_or(VmError::MissingArgv)?;
+    let (_, bin_name) =
+        full_bin_path
+            .rsplit_once("/")
+            .ok_or_else(|| VmError::InvalidBinaryPath {
+                path: PathBuf::from(&full_bin_path),
+            })?;
 
     let params = TestVmParams {
         full_bin_path: Path::new(&full_bin_path),
@@ -1042,7 +1037,11 @@ mod tests {
         let mem = TestVmParams::build_memory_config();
         assert_eq!(mem.hugepages, Some(true));
         assert_eq!(mem.hugepage_size, Some(VM_HUGEPAGE_BYTES));
-        assert_eq!(mem.shared, Some(true), "shared memory is required for virtiofs");
+        assert_eq!(
+            mem.shared,
+            Some(true),
+            "shared memory is required for virtiofs"
+        );
         assert_eq!(mem.mergeable, Some(true));
         assert_eq!(mem.thp, Some(true));
     }
@@ -1058,7 +1057,9 @@ mod tests {
     #[test]
     fn mgmt_interface_is_on_pci_segment_zero_with_standard_mtu() {
         let nets = TestVmParams::build_network_configs();
-        let mgmt = nets.iter().find(|n| n.id.as_deref() == Some("mgmt"))
+        let mgmt = nets
+            .iter()
+            .find(|n| n.id.as_deref() == Some("mgmt"))
             .expect("should have a 'mgmt' interface");
         assert_eq!(mgmt.pci_segment, Some(0));
         assert_eq!(mgmt.mtu, Some(MGMT_MTU));
@@ -1069,11 +1070,17 @@ mod tests {
     fn fabric_interfaces_are_on_pci_segment_one_with_jumbo_mtu() {
         let nets = TestVmParams::build_network_configs();
         for name in &["fabric1", "fabric2"] {
-            let iface = nets.iter().find(|n| n.id.as_deref() == Some(*name))
+            let iface = nets
+                .iter()
+                .find(|n| n.id.as_deref() == Some(*name))
                 .unwrap_or_else(|| panic!("should have a '{name}' interface"));
             assert_eq!(iface.pci_segment, Some(1), "{name} PCI segment");
             assert_eq!(iface.mtu, Some(FABRIC_MTU), "{name} MTU");
-            assert_eq!(iface.queue_size, Some(FABRIC_QUEUE_SIZE), "{name} queue size");
+            assert_eq!(
+                iface.queue_size,
+                Some(FABRIC_QUEUE_SIZE),
+                "{name} queue size"
+            );
         }
     }
 
@@ -1085,7 +1092,11 @@ mod tests {
         let mut deduped = macs.clone();
         deduped.sort();
         deduped.dedup();
-        assert_eq!(macs.len(), deduped.len(), "all MAC addresses should be unique");
+        assert_eq!(
+            macs.len(),
+            deduped.len(),
+            "all MAC addresses should be unique"
+        );
     }
 
     #[test]
@@ -1151,10 +1162,7 @@ mod tests {
         let config = params.build_vm_config();
         let serial = config.serial.expect("serial should be set");
         assert_eq!(serial.mode, Mode::Socket);
-        assert_eq!(
-            serial.socket.as_deref(),
-            Some(KERNEL_CONSOLE_SOCKET_PATH),
-        );
+        assert_eq!(serial.socket.as_deref(), Some(KERNEL_CONSOLE_SOCKET_PATH),);
     }
 
     #[test]
@@ -1172,7 +1180,11 @@ mod tests {
         let config = params.build_vm_config();
         assert_eq!(config.watchdog, Some(true), "watchdog should be enabled");
         assert_eq!(config.pvpanic, Some(true), "pvpanic should be enabled");
-        assert_eq!(config.iommu, Some(false), "iommu should be disabled at VM level");
+        assert_eq!(
+            config.iommu,
+            Some(false),
+            "iommu should be disabled at VM level"
+        );
     }
 
     #[test]

@@ -68,9 +68,7 @@ impl TestIdentity {
     pub fn resolve<F>() -> Self {
         let full_type_name = std::any::type_name::<F>().trim_start_matches('&');
         let (_, test_name) = full_type_name.split_once("::").unwrap_or_else(|| {
-            unreachable!(
-                "std::any::type_name::<F>() did not contain '::': {full_type_name:?}"
-            )
+            unreachable!("std::any::type_name::<F>() did not contain '::': {full_type_name:?}")
         });
         Self {
             full_type_name,

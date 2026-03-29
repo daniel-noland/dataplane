@@ -224,11 +224,7 @@ impl tokio_util::codec::Decoder for AsyncJsonStreamDecoder {
             // that is still being written to the pipe.  Return `Ok(None)`
             // to tell the framing layer to wait for more data rather than
             // treating it as a fatal parse error.
-            Some(Err(err))
-                if err.classify() == serde_json::error::Category::Eof =>
-            {
-                Ok(None)
-            }
+            Some(Err(err)) if err.classify() == serde_json::error::Category::Eof => Ok(None),
             Some(Err(err)) => Err(AsyncJsonStreamError::Json(err)),
             None => Ok(None),
         }
@@ -291,9 +287,7 @@ async fn drain_after_panic(
 /// The verdict is computed by [`compute_verdict`] from the collected
 /// events and a flag tracking whether any stream-level deserialization
 /// errors occurred.
-pub async fn watch(
-    receiver: tokio::net::unix::pipe::Receiver,
-) -> (Vec<Event>, HypervisorVerdict) {
+pub async fn watch(receiver: tokio::net::unix::pipe::Receiver) -> (Vec<Event>, HypervisorVerdict) {
     let decoder = AsyncJsonStreamDecoder::new();
 
     let mut reader = tokio_util::codec::FramedRead::new(receiver, decoder);
@@ -372,10 +366,7 @@ mod tests {
             event(Source::Vmm, EventType::Starting),
             event(Source::Vmm, EventType::Shutdown),
         ];
-        assert_eq!(
-            compute_verdict(&events, true),
-            HypervisorVerdict::Failure,
-        );
+        assert_eq!(compute_verdict(&events, true), HypervisorVerdict::Failure,);
     }
 
     #[test]
@@ -385,10 +376,7 @@ mod tests {
             event(Source::Guest, EventType::Panic),
             event(Source::Vmm, EventType::Shutdown),
         ];
-        assert_eq!(
-            compute_verdict(&events, false),
-            HypervisorVerdict::Failure,
-        );
+        assert_eq!(compute_verdict(&events, false), HypervisorVerdict::Failure,);
     }
 
     #[test]
@@ -397,10 +385,7 @@ mod tests {
             event(Source::Vmm, EventType::Starting),
             event(Source::Guest, EventType::Panic),
         ];
-        assert_eq!(
-            compute_verdict(&events, false),
-            HypervisorVerdict::Failure,
-        );
+        assert_eq!(compute_verdict(&events, false), HypervisorVerdict::Failure,);
     }
 
     #[test]
@@ -409,18 +394,12 @@ mod tests {
             event(Source::Vmm, EventType::Starting),
             event(Source::Vmm, EventType::Booting),
         ];
-        assert_eq!(
-            compute_verdict(&events, false),
-            HypervisorVerdict::Failure,
-        );
+        assert_eq!(compute_verdict(&events, false), HypervisorVerdict::Failure,);
     }
 
     #[test]
     fn empty_event_log_is_failure() {
-        assert_eq!(
-            compute_verdict(&[], false),
-            HypervisorVerdict::Failure,
-        );
+        assert_eq!(compute_verdict(&[], false), HypervisorVerdict::Failure,);
     }
 
     #[test]

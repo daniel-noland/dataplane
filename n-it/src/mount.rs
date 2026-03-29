@@ -42,11 +42,36 @@ struct MountEntry {
 ///
 /// All entries share the security flags `MS_NOSUID | MS_NOEXEC | MS_NODEV`.
 const ESSENTIAL_MOUNTS: &[MountEntry] = &[
-    MountEntry { source: "proc",    target: "/proc",          fstype: "proc",    data: None },
-    MountEntry { source: "sysfs",   target: "/sys",           fstype: "sysfs",   data: None },
-    MountEntry { source: "tmpfs",   target: "/tmp",           fstype: "tmpfs",   data: Some("mode=0600,size=5%") },
-    MountEntry { source: "tmpfs",   target: "/run",           fstype: "tmpfs",   data: Some("mode=0600,size=5%") },
-    MountEntry { source: "cgroup2", target: "/sys/fs/cgroup", fstype: "cgroup2", data: Some("nsdelegate,memory_recursiveprot") },
+    MountEntry {
+        source: "proc",
+        target: "/proc",
+        fstype: "proc",
+        data: None,
+    },
+    MountEntry {
+        source: "sysfs",
+        target: "/sys",
+        fstype: "sysfs",
+        data: None,
+    },
+    MountEntry {
+        source: "tmpfs",
+        target: "/tmp",
+        fstype: "tmpfs",
+        data: Some("mode=0600,size=5%"),
+    },
+    MountEntry {
+        source: "tmpfs",
+        target: "/run",
+        fstype: "tmpfs",
+        data: Some("mode=0600,size=5%"),
+    },
+    MountEntry {
+        source: "cgroup2",
+        target: "/sys/fs/cgroup",
+        fstype: "cgroup2",
+        data: Some("nsdelegate,memory_recursiveprot"),
+    },
 ];
 
 /// Maximum number of `EBUSY` retries per mount point before giving up.
@@ -75,7 +100,12 @@ pub fn mount_essential_filesystems() -> Result<(), MountError> {
 
 /// Performs a single mount with security flags.
 fn secure_mount(entry: &MountEntry) -> Result<(), MountError> {
-    let MountEntry { source, target, fstype, data } = entry;
+    let MountEntry {
+        source,
+        target,
+        fstype,
+        data,
+    } = entry;
     let target_path: &'static Path = Path::new(*target);
     debug!("mounting {}", target_path.display());
     mount(
@@ -86,8 +116,12 @@ fn secure_mount(entry: &MountEntry) -> Result<(), MountError> {
         *data,
     )
     .map_err(|e| match e {
-        Errno::UnknownErrno => MountError::Unknown { target: target_path },
-        Errno::EPERM => MountError::PermissionDenied { target: target_path },
+        Errno::UnknownErrno => MountError::Unknown {
+            target: target_path,
+        },
+        Errno::EPERM => MountError::PermissionDenied {
+            target: target_path,
+        },
         other => MountError::Failed {
             target: target_path,
             source: other,

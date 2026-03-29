@@ -33,10 +33,7 @@ impl Display for InvalidAclName {
         match self {
             InvalidAclName::NotAscii => write!(f, "ACL context name must be valid ASCII"),
             InvalidAclName::TooLong { len, max } => {
-                write!(
-                    f,
-                    "ACL context name is too long ({len} > {max} bytes)",
-                )
+                write!(f, "ACL context name is too long ({len} > {max} bytes)",)
             }
             InvalidAclName::Empty => write!(f, "ACL context name must not be empty"),
             InvalidAclName::ContainsNullBytes => {

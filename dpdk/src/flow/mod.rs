@@ -192,7 +192,9 @@ pub enum FlowError {
 /// This enum provides documented, IDE-friendly access to the full set of match item types
 /// supported by DPDK's `rte_flow` API.  Each variant maps 1:1 to its `RTE_FLOW_ITEM_TYPE_*`
 /// constant and carries the documentation from the DPDK headers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::FromRepr, strum::IntoStaticStr)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::FromRepr, strum::IntoStaticStr,
+)]
 #[repr(u32)]
 pub enum MatchType {
     /// \[META\]
@@ -771,7 +773,9 @@ fn hton_16<T: Debug + Into<u16>>(x: T) -> u16 {
     u16::to_be(x.into())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::FromRepr, strum::IntoStaticStr)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::FromRepr, strum::IntoStaticStr,
+)]
 #[repr(u32)]
 pub enum FlowActionType {
     /// End marker for action lists.
@@ -1017,7 +1021,9 @@ pub enum FlowAction {
 }
 
 /// Modify a field
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::FromRepr, strum::IntoStaticStr)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::FromRepr, strum::IntoStaticStr,
+)]
 #[repr(u32)]
 pub enum FieldModificationOperation {
     /// Set a field
@@ -1030,7 +1036,9 @@ pub enum FieldModificationOperation {
 
 /// A wrapper around a `rte_flow_action_modify_field` that specifies the
 /// field to modify and its new value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::FromRepr, strum::IntoStaticStr)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::FromRepr, strum::IntoStaticStr,
+)]
 #[repr(u32)]
 pub enum FlowFieldId {
     /// Start with a packet.
@@ -1281,62 +1289,84 @@ impl SetFlowField {
             SetFlowField::MacSrc(mac) => {
                 set_field(FlowFieldId::MacSrc, pack(&mac.0), size_of::<Mac>() as u32)
             }
-            SetFlowField::VlanType(et) => {
-                set_field(FlowFieldId::VlanType, pack(&et.as_u16().to_be_bytes()), size_of::<u16>() as u32)
-            }
+            SetFlowField::VlanType(et) => set_field(
+                FlowFieldId::VlanType,
+                pack(&et.as_u16().to_be_bytes()),
+                size_of::<u16>() as u32,
+            ),
             SetFlowField::VlanVid(vid) => {
                 let raw: u16 = (*vid).into();
-                set_field(FlowFieldId::VlanVid, pack(&raw.to_be_bytes()), size_of::<u16>() as u32)
+                set_field(
+                    FlowFieldId::VlanVid,
+                    pack(&raw.to_be_bytes()),
+                    size_of::<u16>() as u32,
+                )
             }
-            SetFlowField::EtherType(et) => {
-                set_field(FlowFieldId::EtherType, pack(&et.as_u16().to_be_bytes()), size_of::<u16>() as u32)
-            }
-            SetFlowField::Ipv4Dscp(dscp) => {
-                set_field(FlowFieldId::Ipv4Dscp, pack(&[dscp.value()]), size_of::<u8>() as u32)
-            }
+            SetFlowField::EtherType(et) => set_field(
+                FlowFieldId::EtherType,
+                pack(&et.as_u16().to_be_bytes()),
+                size_of::<u16>() as u32,
+            ),
+            SetFlowField::Ipv4Dscp(dscp) => set_field(
+                FlowFieldId::Ipv4Dscp,
+                pack(&[dscp.value()]),
+                size_of::<u8>() as u32,
+            ),
             SetFlowField::Ipv4Ttl(ttl) => {
                 set_field(FlowFieldId::Ipv4Ttl, pack(&[*ttl]), size_of::<u8>() as u32)
             }
-            SetFlowField::Ipv4Src(addr) => {
-                set_field(FlowFieldId::Ipv4Src, pack(&addr.octets()), 4)
-            }
-            SetFlowField::Ipv4Dst(addr) => {
-                set_field(FlowFieldId::Ipv4Dst, pack(&addr.octets()), 4)
-            }
-            SetFlowField::Ipv6Dscp(dscp) => {
-                set_field(FlowFieldId::Ipv6Dscp, pack(&[dscp.value()]), size_of::<u8>() as u32)
-            }
-            SetFlowField::Ipv6HopLimit(hl) => {
-                set_field(FlowFieldId::Ipv6HopLimit, pack(&[*hl]), size_of::<u8>() as u32)
-            }
+            SetFlowField::Ipv4Src(addr) => set_field(FlowFieldId::Ipv4Src, pack(&addr.octets()), 4),
+            SetFlowField::Ipv4Dst(addr) => set_field(FlowFieldId::Ipv4Dst, pack(&addr.octets()), 4),
+            SetFlowField::Ipv6Dscp(dscp) => set_field(
+                FlowFieldId::Ipv6Dscp,
+                pack(&[dscp.value()]),
+                size_of::<u8>() as u32,
+            ),
+            SetFlowField::Ipv6HopLimit(hl) => set_field(
+                FlowFieldId::Ipv6HopLimit,
+                pack(&[*hl]),
+                size_of::<u8>() as u32,
+            ),
             SetFlowField::Ipv6Src(addr) => {
                 // IPv6 address is exactly 16 bytes — fills the entire value buffer.
                 set_field(FlowFieldId::Ipv6Src, addr.octets(), 16)
             }
-            SetFlowField::Ipv6Dst(addr) => {
-                set_field(FlowFieldId::Ipv6Dst, addr.octets(), 16)
-            }
-            SetFlowField::TcpPortSrc(port) => {
-                set_field(FlowFieldId::TcpPortSrc, pack(&port.to_be_bytes()), size_of::<u16>() as u32)
-            }
-            SetFlowField::TcpPortDst(port) => {
-                set_field(FlowFieldId::TcpPortDst, pack(&port.to_be_bytes()), size_of::<u16>() as u32)
-            }
-            SetFlowField::TcpSeqNum(seq) => {
-                set_field(FlowFieldId::TcpSeqNum, pack(&seq.to_be_bytes()), size_of::<u32>() as u32)
-            }
-            SetFlowField::TcpAckNum(ack) => {
-                set_field(FlowFieldId::TcpAckNum, pack(&ack.to_be_bytes()), size_of::<u32>() as u32)
-            }
-            SetFlowField::TcpFlags(flags) => {
-                set_field(FlowFieldId::TcpFlags, pack(&flags.to_be_bytes()), size_of::<u16>() as u32)
-            }
-            SetFlowField::UdpPortSrc(port) => {
-                set_field(FlowFieldId::UdpPortSrc, pack(&port.to_be_bytes()), size_of::<u16>() as u32)
-            }
-            SetFlowField::UdpPortDst(port) => {
-                set_field(FlowFieldId::UdpPortDst, pack(&port.to_be_bytes()), size_of::<u16>() as u32)
-            }
+            SetFlowField::Ipv6Dst(addr) => set_field(FlowFieldId::Ipv6Dst, addr.octets(), 16),
+            SetFlowField::TcpPortSrc(port) => set_field(
+                FlowFieldId::TcpPortSrc,
+                pack(&port.to_be_bytes()),
+                size_of::<u16>() as u32,
+            ),
+            SetFlowField::TcpPortDst(port) => set_field(
+                FlowFieldId::TcpPortDst,
+                pack(&port.to_be_bytes()),
+                size_of::<u16>() as u32,
+            ),
+            SetFlowField::TcpSeqNum(seq) => set_field(
+                FlowFieldId::TcpSeqNum,
+                pack(&seq.to_be_bytes()),
+                size_of::<u32>() as u32,
+            ),
+            SetFlowField::TcpAckNum(ack) => set_field(
+                FlowFieldId::TcpAckNum,
+                pack(&ack.to_be_bytes()),
+                size_of::<u32>() as u32,
+            ),
+            SetFlowField::TcpFlags(flags) => set_field(
+                FlowFieldId::TcpFlags,
+                pack(&flags.to_be_bytes()),
+                size_of::<u16>() as u32,
+            ),
+            SetFlowField::UdpPortSrc(port) => set_field(
+                FlowFieldId::UdpPortSrc,
+                pack(&port.to_be_bytes()),
+                size_of::<u16>() as u32,
+            ),
+            SetFlowField::UdpPortDst(port) => set_field(
+                FlowFieldId::UdpPortDst,
+                pack(&port.to_be_bytes()),
+                size_of::<u16>() as u32,
+            ),
             SetFlowField::VxlanVni(vni) => {
                 // VNI is a 24-bit field.  Extract the lower 3 bytes from the
                 // big-endian representation of the underlying u32.
@@ -1344,18 +1374,26 @@ impl SetFlowField {
                 let be = raw.to_be_bytes();
                 set_field(FlowFieldId::VxlanVni, pack(&be[1..]), 3)
             }
-            SetFlowField::Tag(tag) => {
-                set_field(FlowFieldId::Tag, pack(&tag.data.0.to_be_bytes()), size_of::<u32>() as u32)
-            }
-            SetFlowField::Meta(meta) => {
-                set_field(FlowFieldId::Meta, pack(&meta.data.to_be_bytes()), size_of::<u32>() as u32)
-            }
-            SetFlowField::IpV4Ecn(ecn) => {
-                set_field(FlowFieldId::Ipv4Ecn, pack(&[ecn.value()]), size_of::<u8>() as u32)
-            }
-            SetFlowField::IpV6Ecn(ecn) => {
-                set_field(FlowFieldId::Ipv6Ecn, pack(&[ecn.value()]), size_of::<u8>() as u32)
-            }
+            SetFlowField::Tag(tag) => set_field(
+                FlowFieldId::Tag,
+                pack(&tag.data.0.to_be_bytes()),
+                size_of::<u32>() as u32,
+            ),
+            SetFlowField::Meta(meta) => set_field(
+                FlowFieldId::Meta,
+                pack(&meta.data.to_be_bytes()),
+                size_of::<u32>() as u32,
+            ),
+            SetFlowField::IpV4Ecn(ecn) => set_field(
+                FlowFieldId::Ipv4Ecn,
+                pack(&[ecn.value()]),
+                size_of::<u8>() as u32,
+            ),
+            SetFlowField::IpV6Ecn(ecn) => set_field(
+                FlowFieldId::Ipv6Ecn,
+                pack(&[ecn.value()]),
+                size_of::<u8>() as u32,
+            ),
         };
         SetFieldAction { rule: *self, conf }
     }
@@ -1590,14 +1628,12 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
                         ..Default::default()
                     },
                 };
-                let mask_c = fs.mask().map(|m| {
-                    dpdk_sys::rte_flow_item_ipv4 {
-                        hdr: dpdk_sys::rte_ipv4_hdr {
-                            src_addr: u32::from(m.src).to_be(),
-                            dst_addr: u32::from(m.dst).to_be(),
-                            ..Default::default()
-                        },
-                    }
+                let mask_c = fs.mask().map(|m| dpdk_sys::rte_flow_item_ipv4 {
+                    hdr: dpdk_sys::rte_ipv4_hdr {
+                        src_addr: u32::from(m.src).to_be(),
+                        dst_addr: u32::from(m.dst).to_be(),
+                        ..Default::default()
+                    },
                 });
                 let (spec_ptr, mask_ptr) = push_spec_mask(&mut storage, spec, mask_c);
                 items.push(dpdk_sys::rte_flow_item {
@@ -1630,14 +1666,12 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
                         ..Default::default()
                     },
                 };
-                let mask_c = fs.mask().map(|m| {
-                    dpdk_sys::rte_flow_item_udp {
-                        hdr: dpdk_sys::rte_udp_hdr {
-                            src_port: m.src_port.to_be(),
-                            dst_port: m.dst_port.to_be(),
-                            ..Default::default()
-                        },
-                    }
+                let mask_c = fs.mask().map(|m| dpdk_sys::rte_flow_item_udp {
+                    hdr: dpdk_sys::rte_udp_hdr {
+                        src_port: m.src_port.to_be(),
+                        dst_port: m.dst_port.to_be(),
+                        ..Default::default()
+                    },
                 });
                 let (spec_ptr, mask_ptr) = push_spec_mask(&mut storage, spec, mask_c);
                 items.push(dpdk_sys::rte_flow_item {
@@ -1655,14 +1689,12 @@ fn build_c_pattern(pattern: &[FlowMatch]) -> Result<CFlowPattern, FlowError> {
                         ..Default::default()
                     },
                 };
-                let mask_c = fs.mask().map(|m| {
-                    dpdk_sys::rte_flow_item_tcp {
-                        hdr: dpdk_sys::rte_tcp_hdr {
-                            src_port: m.src_port.to_be(),
-                            dst_port: m.dst_port.to_be(),
-                            ..Default::default()
-                        },
-                    }
+                let mask_c = fs.mask().map(|m| dpdk_sys::rte_flow_item_tcp {
+                    hdr: dpdk_sys::rte_tcp_hdr {
+                        src_port: m.src_port.to_be(),
+                        dst_port: m.dst_port.to_be(),
+                        ..Default::default()
+                    },
                 });
                 let (spec_ptr, mask_ptr) = push_spec_mask(&mut storage, spec, mask_c);
                 items.push(dpdk_sys::rte_flow_item {
@@ -1871,7 +1903,9 @@ fn build_c_actions(actions: &[FlowAction]) -> Result<CFlowActions, FlowError> {
                 });
             }
             FlowAction::RawEncap { data, mask } => {
-                if let Some(m) = mask && m.len() != data.len() {
+                if let Some(m) = mask
+                    && m.len() != data.len()
+                {
                     return Err(FlowError::RawEncapMaskLengthMismatch {
                         data_len: data.len(),
                         mask_len: m.len(),
@@ -2061,11 +2095,7 @@ impl FlowRule {
         // SAFETY: We own the flow rule and the pointer was obtained from
         // a successful rte_flow_create.
         let ret = unsafe {
-            dpdk_sys::rte_flow_destroy(
-                self.port.as_u16(),
-                self.flow.as_ptr(),
-                &mut flow_err,
-            )
+            dpdk_sys::rte_flow_destroy(self.port.as_u16(), self.flow.as_ptr(), &mut flow_err)
         };
 
         // Prevent Drop from running — we already attempted destruction.
@@ -2087,9 +2117,7 @@ impl FlowRule {
         let mut flow_err = dpdk_sys::rte_flow_error::default();
 
         // SAFETY: port.as_u16() is a valid DPDK port ID.
-        let ret = unsafe {
-            dpdk_sys::rte_flow_flush(port.as_u16(), &mut flow_err)
-        };
+        let ret = unsafe { dpdk_sys::rte_flow_flush(port.as_u16(), &mut flow_err) };
 
         if ret == 0 {
             Ok(())
@@ -2112,11 +2140,7 @@ impl Drop for FlowRule {
         // SAFETY: self.flow is a valid pointer obtained from a successful
         // rte_flow_create.  We own it exclusively.
         let ret = unsafe {
-            dpdk_sys::rte_flow_destroy(
-                self.port.as_u16(),
-                self.flow.as_ptr(),
-                &mut flow_err,
-            )
+            dpdk_sys::rte_flow_destroy(self.port.as_u16(), self.flow.as_ptr(), &mut flow_err)
         };
 
         if ret != 0 {

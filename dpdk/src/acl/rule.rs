@@ -186,7 +186,9 @@ impl fmt::Display for AclField {
 impl PartialEq for AclField {
     fn eq(&self, other: &Self) -> bool {
         // SAFETY: same rationale as Debug — u64 is the widest union member.
-        unsafe { self.value.u64_ == other.value.u64_ && self.mask_range.u64_ == other.mask_range.u64_ }
+        unsafe {
+            self.value.u64_ == other.value.u64_ && self.mask_range.u64_ == other.mask_range.u64_
+        }
     }
 }
 

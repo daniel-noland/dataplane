@@ -96,7 +96,10 @@ fn init_devices(eal: &Eal) -> Vec<StartedDev> {
         .collect()
 }
 
-fn start_rte_workers(devices: &[StartedDev], setup_pipeline: &(impl Sync + Fn() -> DynPipeline<Mbuf>)) {
+fn start_rte_workers(
+    devices: &[StartedDev],
+    setup_pipeline: &(impl Sync + Fn() -> DynPipeline<Mbuf>),
+) {
     LCoreId::iter().enumerate().for_each(|(i, lcore_id)| {
         info!("Starting RTE Worker on {lcore_id:?}");
         WorkerThread::launch(lcore_id, move || {

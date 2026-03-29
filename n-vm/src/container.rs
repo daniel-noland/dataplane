@@ -258,11 +258,18 @@ impl ContainerParams {
                 format!("{ENV_IN_TEST_CONTAINER}={ENV_MARKER_VALUE}"),
                 "RUST_BACKTRACE=1".into(),
             ]),
-            user: Some(format!("{uid}:{gid}", uid = self.uid.as_raw(), gid = self.gid.as_raw())),
+            user: Some(format!(
+                "{uid}:{gid}",
+                uid = self.uid.as_raw(),
+                gid = self.gid.as_raw()
+            )),
             host_config: Some(HostConfig {
                 devices: Some(Self::build_device_mappings()),
                 group_add: Some(
-                    self.device_groups.iter().map(|g| g.as_raw().to_string()).collect(),
+                    self.device_groups
+                        .iter()
+                        .map(|g| g.as_raw().to_string())
+                        .collect(),
                 ),
                 init: Some(true),
                 network_mode: Some("none".into()),
@@ -322,10 +329,7 @@ impl ContainerParams {
         let bin_dir = self.bin_dir_str();
         vec![
             Self::read_only_bind_mount(bin_dir, bin_dir.to_owned()),
-            Self::read_only_bind_mount(
-                bin_dir,
-                format!("{VM_ROOT_SHARE_PATH}/{bin_dir}"),
-            ),
+            Self::read_only_bind_mount(bin_dir, format!("{VM_ROOT_SHARE_PATH}/{bin_dir}")),
         ]
     }
 
@@ -358,9 +362,7 @@ impl ContainerParams {
             typ: Some(bollard::secret::MountTypeEnum::BIND),
             read_only: Some(true),
             bind_options: Some(MountBindOptions {
-                propagation: Some(
-                    bollard::secret::MountBindOptionsPropagationEnum::PRIVATE,
-                ),
+                propagation: Some(bollard::secret::MountBindOptionsPropagationEnum::PRIVATE),
                 non_recursive: Some(true),
                 create_mountpoint: Some(true),
                 ..Default::default()
@@ -442,9 +444,7 @@ impl CleanupThread {
                 };
 
                 rt.block_on(async {
-                    let opts = RemoveContainerOptionsBuilder::default()
-                        .force(true)
-                        .build();
+                    let opts = RemoveContainerOptionsBuilder::default().force(true).build();
                     match client.remove_container(&container_id, Some(opts)).await {
                         Ok(()) => tracing::warn!(
                             %container_id,
@@ -708,9 +708,7 @@ impl Drop for ContainerGuard<'_> {
 /// Returns [`ContainerError`] if any part of the container lifecycle fails
 /// (Docker connection, container creation/start, log streaming, inspection,
 /// or cleanup).
-pub fn run_test_in_vm<F: FnOnce()>(
-    _test_fn: F,
-) -> Result<ContainerTestResult, ContainerError> {
+pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> Result<ContainerTestResult, ContainerError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -720,8 +718,8 @@ pub fn run_test_in_vm<F: FnOnce()>(
         let params = ContainerParams::resolve::<F>()?;
         let config = params.build_config();
 
-        let client = bollard::Docker::connect_with_unix_defaults()
-            .map_err(ContainerError::DockerConnect)?;
+        let client =
+            bollard::Docker::connect_with_unix_defaults().map_err(ContainerError::DockerConnect)?;
 
         // The guard is armed at creation -- if anything between here and
         // the explicit cleanup panics or returns early, the CleanupThread
@@ -903,10 +901,13 @@ mod tests {
     fn mounts_include_bin_dir_at_original_path() {
         let params = sample_params();
         let mounts = params.build_mounts();
-        let direct = mounts.iter().find(|m| {
-            m.target.as_deref() == Some("/target/debug/deps")
-        });
-        assert!(direct.is_some(), "should mount bin_dir at its original path");
+        let direct = mounts
+            .iter()
+            .find(|m| m.target.as_deref() == Some("/target/debug/deps"));
+        assert!(
+            direct.is_some(),
+            "should mount bin_dir at its original path"
+        );
         let direct = direct.unwrap();
         assert_eq!(direct.source.as_deref(), Some("/target/debug/deps"));
         assert_eq!(direct.read_only, Some(true));
@@ -918,9 +919,9 @@ mod tests {
         let mounts = params.build_mounts();
         let bin_dir = params.bin_dir_str();
         let expected_target = format!("{VM_ROOT_SHARE_PATH}/{bin_dir}");
-        let mirror = mounts.iter().find(|m| {
-            m.target.as_deref() == Some(expected_target.as_str())
-        });
+        let mirror = mounts
+            .iter()
+            .find(|m| m.target.as_deref() == Some(expected_target.as_str()));
         assert!(
             mirror.is_some(),
             "should mount bin_dir mirror under VM_ROOT_SHARE_PATH: expected target {expected_target}",
@@ -935,10 +936,7 @@ mod tests {
         let params = sample_params();
         let mounts = params.build_mounts();
         for mount in &mounts {
-            assert_eq!(
-                mount.typ,
-                Some(bollard::secret::MountTypeEnum::BIND),
-            );
+            assert_eq!(mount.typ, Some(bollard::secret::MountTypeEnum::BIND),);
             let opts = mount.bind_options.as_ref().expect("bind_options");
             assert_eq!(
                 opts.propagation,
@@ -968,10 +966,7 @@ mod tests {
 
     #[test]
     fn read_only_bind_mount_sets_expected_fields() {
-        let mount = ContainerParams::read_only_bind_mount(
-            "/src/dir",
-            "/dst/dir".to_string(),
-        );
+        let mount = ContainerParams::read_only_bind_mount("/src/dir", "/dst/dir".to_string());
         assert_eq!(mount.source.as_deref(), Some("/src/dir"));
         assert_eq!(mount.target.as_deref(), Some("/dst/dir"));
         assert_eq!(mount.read_only, Some(true));

@@ -149,11 +149,7 @@ impl Pool {
     pub fn alloc_bulk(&self, num: usize) -> Vec<Mbuf> {
         let mut ptrs: Vec<*mut dpdk_sys::rte_mbuf> = vec![null_mut(); num];
         let ret = unsafe {
-            dpdk_sys::rte_pktmbuf_alloc_bulk(
-                self.0.as_mut_ptr(),
-                ptrs.as_mut_ptr(),
-                num as c_uint,
-            )
+            dpdk_sys::rte_pktmbuf_alloc_bulk(self.0.as_mut_ptr(), ptrs.as_mut_ptr(), num as c_uint)
         };
         EalErrno::assert(ret);
         // SAFETY: On success (ret == 0, enforced by EalErrno::assert above),

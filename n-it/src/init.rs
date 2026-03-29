@@ -27,7 +27,7 @@ use tracing::{debug, error, info};
 use crate::child;
 use crate::error::TerminateOutcome;
 use crate::mount;
-use crate::signal::{SignalPolicy, SignalSet, SIGNAL_TABLE};
+use crate::signal::{SIGNAL_TABLE, SignalPolicy, SignalSet};
 
 /// Minimal init system for running tests inside a cloud-hypervisor VM.
 ///
@@ -58,11 +58,7 @@ impl InitSystem {
         debug!("signal handlers registered");
 
         // ── Filesystem setup ─────────────────────────────────────
-        match tokio::task::spawn_blocking(|| {
-            mount::mount_essential_filesystems()
-        })
-        .await
-        {
+        match tokio::task::spawn_blocking(|| mount::mount_essential_filesystems()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => fatal!("filesystem setup failed: {e}"),
             Err(e) => fatal!("mount filesystem task panicked: {e}"),
@@ -75,8 +71,8 @@ impl InitSystem {
         };
         let pid = match test_child.id() {
             Some(id) => {
-                let id = i32::try_from(id)
-                    .unwrap_or_else(|_| fatal!("child PID {id} overflows i32"));
+                let id =
+                    i32::try_from(id).unwrap_or_else(|_| fatal!("child PID {id} overflows i32"));
                 Pid::from_raw(id)
             }
             None => fatal!("unable to determine PID of spawned test process"),

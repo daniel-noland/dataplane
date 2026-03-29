@@ -18,8 +18,8 @@ use crate::queue::rx::{RxQueue, RxQueueConfig, RxQueueIndex};
 use crate::queue::tx::{TxQueue, TxQueueConfig, TxQueueIndex};
 use crate::socket::SocketId;
 use dpdk_sys::rte_eth_rx_mq_mode::RTE_ETH_MQ_RX_RSS;
-use dpdk_sys::rte_eth_tx_mq_mode::RTE_ETH_MQ_TX_NONE;
 use dpdk_sys::rte_eth_rx_offload;
+use dpdk_sys::rte_eth_tx_mq_mode::RTE_ETH_MQ_TX_NONE;
 use dpdk_sys::*;
 use errno::{Errno, ErrorCode, StandardErrno};
 use queue::{rx, tx};
@@ -797,63 +797,69 @@ impl From<RxOffloadConfig> for RxOffload {
                 RX_OFFLOAD_TCP_CKSUM
             } else {
                 0
-            } | if value.tcp_lro {
-                RX_OFFLOAD_TCP_LRO
-            } else {
-                0
-            } | if value.qinq_strip {
-                RX_OFFLOAD_QINQ_STRIP
-            } else {
-                0
-            } | if value.outer_ipv4_cksum {
-                RX_OFFLOAD_OUTER_IPV4_CKSUM
-            } else {
-                0
-            } | if value.macsec_strip {
-                RX_OFFLOAD_MACSEC_STRIP
-            } else {
-                0
-            } | if value.vlan_filter {
-                RX_OFFLOAD_VLAN_FILTER
-            } else {
-                0
-            } | if value.vlan_extend {
-                RX_OFFLOAD_VLAN_EXTEND
-            } else {
-                0
-            } | if value.scatter {
-                RX_OFFLOAD_SCATTER
-            } else {
-                0
-            } | if value.timestamp {
-                RX_OFFLOAD_TIMESTAMP
-            } else {
-                0
-            } | if value.security {
-                RX_OFFLOAD_SECURITY
-            } else {
-                0
-            } | if value.keep_crc {
-                RX_OFFLOAD_KEEP_CRC
-            } else {
-                0
-            } | if value.sctp_cksum {
-                RX_OFFLOAD_SCTP_CKSUM
-            } else {
-                0
-            } | if value.outer_udp_cksum {
-                RX_OFFLOAD_OUTER_UDP_CKSUM
-            } else {
-                0
-            } | if value.rss_hash {
-                RX_OFFLOAD_RSS_HASH
-            } else {
-                0
-            } | if value.buffer_split {
-                RX_OFFLOAD_BUFFER_SPLIT
-            } else {
-                0
-            } | value.unknown,
+            } | if value.tcp_lro { RX_OFFLOAD_TCP_LRO } else { 0 }
+                | if value.qinq_strip {
+                    RX_OFFLOAD_QINQ_STRIP
+                } else {
+                    0
+                }
+                | if value.outer_ipv4_cksum {
+                    RX_OFFLOAD_OUTER_IPV4_CKSUM
+                } else {
+                    0
+                }
+                | if value.macsec_strip {
+                    RX_OFFLOAD_MACSEC_STRIP
+                } else {
+                    0
+                }
+                | if value.vlan_filter {
+                    RX_OFFLOAD_VLAN_FILTER
+                } else {
+                    0
+                }
+                | if value.vlan_extend {
+                    RX_OFFLOAD_VLAN_EXTEND
+                } else {
+                    0
+                }
+                | if value.scatter { RX_OFFLOAD_SCATTER } else { 0 }
+                | if value.timestamp {
+                    RX_OFFLOAD_TIMESTAMP
+                } else {
+                    0
+                }
+                | if value.security {
+                    RX_OFFLOAD_SECURITY
+                } else {
+                    0
+                }
+                | if value.keep_crc {
+                    RX_OFFLOAD_KEEP_CRC
+                } else {
+                    0
+                }
+                | if value.sctp_cksum {
+                    RX_OFFLOAD_SCTP_CKSUM
+                } else {
+                    0
+                }
+                | if value.outer_udp_cksum {
+                    RX_OFFLOAD_OUTER_UDP_CKSUM
+                } else {
+                    0
+                }
+                | if value.rss_hash {
+                    RX_OFFLOAD_RSS_HASH
+                } else {
+                    0
+                }
+                | if value.buffer_split {
+                    RX_OFFLOAD_BUFFER_SPLIT
+                } else {
+                    0
+                }
+                | value.unknown,
         )
     }
 }
@@ -1056,7 +1062,10 @@ impl Dev {
     /// Configure a new [`RxQueue`].
     ///
     /// Returns the index of the newly created queue on success.
-    pub fn new_rx_queue(&mut self, config: RxQueueConfig) -> Result<RxQueueIndex, rx::ConfigFailure> {
+    pub fn new_rx_queue(
+        &mut self,
+        config: RxQueueConfig,
+    ) -> Result<RxQueueIndex, rx::ConfigFailure> {
         let idx = config.queue_index;
         let rx_queue = RxQueue::setup(self, config)?;
         self.rx_queues.push(rx_queue);
@@ -1066,7 +1075,10 @@ impl Dev {
     /// Configure a new [`TxQueue`].
     ///
     /// Returns the index of the newly created queue on success.
-    pub fn new_tx_queue(&mut self, config: TxQueueConfig) -> Result<TxQueueIndex, tx::ConfigFailure> {
+    pub fn new_tx_queue(
+        &mut self,
+        config: TxQueueConfig,
+    ) -> Result<TxQueueIndex, tx::ConfigFailure> {
         let idx = config.queue_index;
         let tx_queue = TxQueue::setup(self, config)?;
         self.tx_queues.push(tx_queue);

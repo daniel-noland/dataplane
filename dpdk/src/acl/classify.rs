@@ -278,9 +278,6 @@ mod tests {
     fn into_dpdk_type() {
         let alg = ClassifyAlgorithm::Avx2;
         let raw: dpdk_sys::rte_acl_classify_alg::Type = alg.into();
-        assert_eq!(
-            raw,
-            dpdk_sys::rte_acl_classify_alg::RTE_ACL_CLASSIFY_AVX2
-        );
+        assert_eq!(raw, dpdk_sys::rte_acl_classify_alg::RTE_ACL_CLASSIFY_AVX2);
     }
 }

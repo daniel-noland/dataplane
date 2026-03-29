@@ -97,7 +97,10 @@ mod tests {
         let handle = guard.into_inner();
         handle.await.expect("task should complete successfully");
 
-        assert!(completed.load(Ordering::SeqCst), "task should have completed");
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "task should have completed"
+        );
     }
 
     #[tokio::test]

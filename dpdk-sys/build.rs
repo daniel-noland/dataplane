@@ -98,7 +98,7 @@ fn main() {
         "rte_argparse",
         "rte_kvargs",
         "rte_telemetry", // todo: see if you can't remove telemetry
-        "rte_log", // todo: see if you can't remove log
+        "rte_log",       // todo: see if you can't remove log
         "ibverbs",
         "mlx5",
         "mlx4",

@@ -61,7 +61,8 @@ fn main() -> Infallible {
         });
     runtime.block_on(async {
         eprintln!("init system runtime started: connecting to tracing vsock");
-        let tracing_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::INIT_TRACE.port.as_raw());
+        let tracing_addr =
+            vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::INIT_TRACE.port.as_raw());
         let tracing_vsock = VsockWriter::new(
             vsock::VsockStream::connect(&tracing_addr).unwrap_or_else(|e| {
                 eprintln!("FATAL: failed to connect tracing vsock to host: {e}");
@@ -81,7 +82,10 @@ fn main() -> Infallible {
         let init_span = tracing::span!(tracing::Level::INFO, "init");
         let _guard = init_span.enter();
         if process::id() != child::INIT_PID {
-            fatal!("this program must be run as PID {} (init process)", child::INIT_PID);
+            fatal!(
+                "this program must be run as PID {} (init process)",
+                child::INIT_PID
+            );
         }
         InitSystem::run().await
     })

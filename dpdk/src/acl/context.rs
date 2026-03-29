@@ -47,7 +47,9 @@ use tracing::{debug, error, info, trace};
 
 use super::classify::ClassifyAlgorithm;
 use super::config::{AclBuildConfig, AclCreateParams};
-use super::error::{AclAddRulesError, AclBuildError, AclClassifyError, AclCreateError, AclSetAlgorithmError};
+use super::error::{
+    AclAddRulesError, AclBuildError, AclClassifyError, AclCreateError, AclSetAlgorithmError,
+};
 use super::rule::Rule;
 
 // ---------------------------------------------------------------------------
@@ -346,10 +348,7 @@ impl<const N: usize> AclContext<N, Configuring> {
             });
         }
 
-        debug!(
-            "Added {num} rules to ACL context '{}'",
-            self.name(),
-        );
+        debug!("Added {num} rules to ACL context '{}'", self.name(),);
         Ok(())
     }
 
@@ -402,10 +401,7 @@ impl<const N: usize> AclContext<N, Configuring> {
         let ret = unsafe { dpdk_sys::rte_acl_build(self.ctx.as_ptr(), &raw_cfg) };
 
         if ret != 0 {
-            error!(
-                "rte_acl_build failed for '{}': ret = {ret}",
-                self.name(),
-            );
+            error!("rte_acl_build failed for '{}': ret = {ret}", self.name(),);
             let error = match ret {
                 errno::NEG_ENOMEM => AclBuildError::OutOfMemory,
                 errno::NEG_EINVAL => AclBuildError::InvalidConfig,
@@ -579,9 +575,8 @@ impl<const N: usize> AclContext<N, Built> {
         algorithm: ClassifyAlgorithm,
     ) -> Result<(), AclSetAlgorithmError> {
         // SAFETY: ctx is guaranteed non-null; algorithm maps to a valid constant.
-        let ret = unsafe {
-            dpdk_sys::rte_acl_set_ctx_classify(self.ctx.as_ptr(), algorithm.into())
-        };
+        let ret =
+            unsafe { dpdk_sys::rte_acl_set_ctx_classify(self.ctx.as_ptr(), algorithm.into()) };
 
         if ret != 0 {
             error!(
@@ -642,12 +637,12 @@ impl<const N: usize> AclContext<N, Built> {
         })?;
 
         // The results slice must be large enough for `num * categories` entries.
-        let required = (num as usize).checked_mul(categories as usize).ok_or_else(|| {
-            error!(
-                "Overflow computing required results size: {num} * {categories}",
-            );
-            AclClassifyError::InvalidArgs
-        })?;
+        let required = (num as usize)
+            .checked_mul(categories as usize)
+            .ok_or_else(|| {
+                error!("Overflow computing required results size: {num} * {categories}",);
+                AclClassifyError::InvalidArgs
+            })?;
 
         if results.len() < required {
             error!(

@@ -68,36 +68,39 @@ pub async fn spawn_main_process() -> Result<Child, SpawnError> {
     // Connect vsock streams for stdout and stderr.  The container tier
     // has already bound Unix listeners at the corresponding paths, so
     // these connections succeed immediately.
-    let stdout_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDOUT.port.as_raw());
-    let stdout_stream = vsock::VsockStream::connect(&stdout_addr).map_err(|e| {
-        SpawnError::VsockConnect {
+    let stdout_addr =
+        vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDOUT.port.as_raw());
+    let stdout_stream =
+        vsock::VsockStream::connect(&stdout_addr).map_err(|e| SpawnError::VsockConnect {
             channel: VsockChannel::TEST_STDOUT,
             source: e,
-        }
-    })?;
+        })?;
 
-    let stderr_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDERR.port.as_raw());
-    let stderr_stream = vsock::VsockStream::connect(&stderr_addr).map_err(|e| {
-        SpawnError::VsockConnect {
+    let stderr_addr =
+        vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDERR.port.as_raw());
+    let stderr_stream =
+        vsock::VsockStream::connect(&stderr_addr).map_err(|e| SpawnError::VsockConnect {
             channel: VsockChannel::TEST_STDERR,
             source: e,
-        }
-    })?;
+        })?;
 
     let stdout_stdio = vsock_stream_to_stdio(stdout_stream);
     let stderr_stdio = vsock_stream_to_stdio(stderr_stream);
 
-    let child = Command::new(args.next().expect("argv[1] missing: no test binary specified"))
-        .args(args)
-        .kill_on_drop(true)
-        .stdin(Stdio::inherit())
-        .stdout(stdout_stdio)
-        .stderr(stderr_stdio)
-        .env(ENV_IN_VM, ENV_MARKER_VALUE)
-        .env("PATH", "/bin")
-        .env("LD_LIBRARY_PATH", "/lib")
-        .env("RUST_BACKTRACE", "1")
-        .spawn()?;
+    let child = Command::new(
+        args.next()
+            .expect("argv[1] missing: no test binary specified"),
+    )
+    .args(args)
+    .kill_on_drop(true)
+    .stdin(Stdio::inherit())
+    .stdout(stdout_stdio)
+    .stderr(stderr_stdio)
+    .env(ENV_IN_VM, ENV_MARKER_VALUE)
+    .env("PATH", "/bin")
+    .env("LD_LIBRARY_PATH", "/lib")
+    .env("RUST_BACKTRACE", "1")
+    .spawn()?;
 
     if let Some(pid) = child.id() {
         debug!("main process spawned with PID: {pid}");
@@ -180,10 +183,7 @@ pub fn send_signal_to_all_processes(
             Ok(BroadcastSignalOutcome::NoProcesses)
         }
         Err(Errno::EPERM) => Err(BroadcastSignalError::PermissionDenied { signal }),
-        Err(e) => Err(BroadcastSignalError::Failed {
-            signal,
-            source: e,
-        }),
+        Err(e) => Err(BroadcastSignalError::Failed { signal, source: e }),
     }
 }
 
@@ -323,8 +323,7 @@ pub async fn list_child_processes() -> Result<Vec<Pid>, ListChildrenError> {
             continue;
         };
         if ppid == INIT_PID {
-            let pid_i32 =
-                i32::try_from(pid).map_err(|_| ListChildrenError::PidOverflow { pid })?;
+            let pid_i32 = i32::try_from(pid).map_err(|_| ListChildrenError::PidOverflow { pid })?;
             children.push(Pid::from_raw(pid_i32));
         }
     }
