@@ -521,9 +521,18 @@ impl TestVm {
             .into_blocking_fd()
             .map_err(VmError::EventSenderFd)?;
 
-        tokio::fs::try_exists("/dev/kvm")
-            .await
-            .map_err(VmError::KvmNotAccessible)?;
+        match tokio::fs::try_exists("/dev/kvm").await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(VmError::KvmNotAccessible(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "/dev/kvm does not exist",
+                )));
+            }
+            Err(err) => {
+                return Err(VmError::KvmNotAccessible(err));
+            }
+        }
 
         let hypervisor = tokio::process::Command::new(CLOUD_HYPERVISOR_BINARY_PATH)
             .args([
