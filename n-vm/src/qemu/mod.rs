@@ -69,7 +69,7 @@ use crate::backend::{HypervisorBackend, HypervisorVerdict, LaunchedHypervisor};
 use crate::error::VmError;
 use crate::vm::{TestVmParams, check_kvm_accessible, wait_for_socket};
 
-use self::qmp::{EventDisplay, QmpConnection, QmpEventStream, QmpWriter};
+use self::qmp::{EventDisplay, QmpCommandName, QmpConnection, QmpEventStream, QmpWriter};
 
 // ── Constants ────────────────────────────────────────────────────────
 //
@@ -231,9 +231,11 @@ impl HypervisorBackend for Qemu {
         // button event, and `quit` forcefully terminates the VMM.
         let mut writer = controller.writer.lock().await;
         writer
-            .send_command_fire_and_forget("system_powerdown")
+            .send_command_fire_and_forget(QmpCommandName::SystemPowerdown)
             .await;
-        writer.send_command_fire_and_forget("quit").await;
+        writer
+            .send_command_fire_and_forget(QmpCommandName::Quit)
+            .await;
     }
 
     fn spawn_vsock_reader(channel: &VsockChannel) -> Result<AbortOnDrop<String>, VmError> {

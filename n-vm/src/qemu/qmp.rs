@@ -127,15 +127,44 @@ impl std::fmt::Display for EventDisplay<'_> {
 
 // ── QMP command (outbound) ───────────────────────────────────────────
 
-/// A QMP command to send to QEMU.
+/// Enumerates the QMP commands used by this backend.
 ///
-/// This is intentionally untyped: the shutdown path only needs
-/// `system_powerdown` and `quit`, both of which take no arguments.
-/// Using a plain string avoids pulling in the full `qapi_qmp` command
-/// types for fire-and-forget operations.
+/// Each variant serializes to the wire-format command name that QEMU
+/// expects in the `"execute"` field of a QMP command message.
+/// Only argument-free commands are needed; the shutdown path uses
+/// [`SystemPowerdown`](Self::SystemPowerdown) and [`Quit`](Self::Quit),
+/// while connection setup uses
+/// [`QmpCapabilities`](Self::QmpCapabilities).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) enum QmpCommandName {
+    /// Enter command mode after the initial greeting.
+    #[serde(rename = "qmp_capabilities")]
+    QmpCapabilities,
+    /// Send an ACPI power-button event to the guest.
+    #[serde(rename = "system_powerdown")]
+    SystemPowerdown,
+    /// Immediately terminate the QEMU process.
+    #[serde(rename = "quit")]
+    Quit,
+}
+
+impl std::fmt::Display for QmpCommandName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QmpCapabilities => f.write_str("qmp_capabilities"),
+            Self::SystemPowerdown => f.write_str("system_powerdown"),
+            Self::Quit => f.write_str("quit"),
+        }
+    }
+}
+
+/// A QMP command message to send to QEMU.
+///
+/// Serializes to `{"execute": "<command_name>"}`, which is the format
+/// QEMU expects for commands without arguments.
 #[derive(Debug, Serialize)]
-struct QmpCommand<'a> {
-    execute: &'a str,
+struct QmpCommand {
+    execute: QmpCommandName,
 }
 
 // ── QMP connection ───────────────────────────────────────────────────
@@ -186,7 +215,7 @@ impl QmpConnection {
         );
 
         // ── Phase 2: negotiate capabilities ──────────────────────────
-        send_command(&mut writer, "qmp_capabilities").await?;
+        send_command(&mut writer, QmpCommandName::QmpCapabilities).await?;
 
         let msg =
             read_line_json::<qapi_qmp::QmpMessageAny>(&mut reader).await?;
@@ -264,7 +293,7 @@ impl QmpWriter {
     /// This is suitable for best-effort operations like shutdown where
     /// the caller does not need to know whether the command succeeded.
     /// Errors are logged at debug level but not propagated.
-    pub async fn send_command_fire_and_forget(&mut self, command: &str) {
+    pub async fn send_command_fire_and_forget(&mut self, command: QmpCommandName) {
         if let Err(err) = send_command(&mut self.writer, command).await {
             debug!("QMP command `{command}` send failed (best-effort): {err}");
         }
@@ -363,10 +392,13 @@ async fn read_line_json<T: serde::de::DeserializeOwned>(
 
 /// Serializes and sends a QMP command as a newline-terminated JSON
 /// message.
-async fn send_command(writer: &mut OwnedWriteHalf, command: &str) -> Result<(), QemuError> {
+async fn send_command(
+    writer: &mut OwnedWriteHalf,
+    command: QmpCommandName,
+) -> Result<(), QemuError> {
     let cmd = QmpCommand { execute: command };
     let mut payload = serde_json::to_string(&cmd).map_err(|e| QemuError::QmpCommand {
-        command: command.to_owned(),
+        command: command.to_string(),
         reason: format!("serialization failed: {e}"),
     })?;
     payload.push('\n');
