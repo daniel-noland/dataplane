@@ -1,35 +1,34 @@
 //! Init system orchestrator.
 //!
-//! This module ties together the [`mount`](crate::mount) and
-//! [`child`](crate::child) subsystems into the main init system
-//! lifecycle:
+//! This module ties together the [`mount`](crate::mount),
+//! [`child`](crate::child), and [`signal`](crate::signal) subsystems
+//! into the main init system lifecycle:
 //!
-//! 1. Register signal handlers.
+//! 1. Register signal handlers ([`SignalSet`](crate::signal::SignalSet)).
 //! 2. Mount essential filesystems.
 //! 3. Spawn the test process.
 //! 4. Enter the event loop — forward signals and wait for exit.
 //! 5. Shut down cleanly (terminate children, unmount, power off / abort).
 //!
-//! Each phase delegates to a focused module where possible, so the
-//! orchestrator itself requires only local reasoning about sequencing.
+//! Each phase delegates to a focused module, so the orchestrator itself
+//! requires only local reasoning about sequencing.
 
 use std::convert::Infallible;
 
 use nix::sys::reboot::{RebootMode, reboot};
-use nix::sys::signal::Signal;
 use nix::unistd::Pid;
-use tokio::signal::unix::{SignalKind, signal};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info};
 
 use crate::child;
 use crate::mount;
+use crate::signal::{SignalPolicy, SignalSet, SIGNAL_TABLE};
 
 /// Minimal init system for running tests inside a cloud-hypervisor VM.
 ///
 /// This unit struct groups the top-level orchestration methods.  It is
 /// intended to run as PID 1 and delegates filesystem mounting, process
-/// lifecycle management, and clean shutdown to the [`mount`] and
-/// [`child`] modules.
+/// lifecycle management, signal forwarding, and clean shutdown to the
+/// [`mount`], [`child`], and [`signal`] modules.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct InitSystem;
@@ -45,35 +44,11 @@ impl InitSystem {
     /// This function never returns (its return type is [`Infallible`]).
     #[tracing::instrument(level = "info")]
     pub async fn run() -> Infallible {
-        /// Registers a Unix signal handler, aborting via [`fatal!`] on failure.
-        ///
-        /// An init system that cannot register signal handlers is in an
-        /// unrecoverable state, so failure here is fatal.
-        fn must_register_signal(kind: SignalKind) -> tokio::signal::unix::Signal {
-            signal(kind)
-                .unwrap_or_else(|e| fatal!("failed to register signal handler: {e}"))
-        }
-
         info!("starting init system");
+
+        // ── Signal registration ──────────────────────────────────
         debug!("registering signal handlers");
-
-        // signals to handle in init system
-        let mut sigterm = must_register_signal(SignalKind::terminate());
-
-        // benign signals to forward to main process
-        // NOTE: we intentionally do not handle SIGCHLD yet.
-        // If the test is leaking processes that is a failure criteria we will catch after the main process exits.
-        let mut sighup = must_register_signal(SignalKind::hangup());
-        let mut siguser1 = must_register_signal(SignalKind::user_defined1());
-        let mut siguser2 = must_register_signal(SignalKind::user_defined2());
-        let mut sigwindow = must_register_signal(SignalKind::window_change());
-
-        // signals which represent failure if received, but which should still be forwarded to main process
-        let mut sigint = must_register_signal(SignalKind::interrupt());
-        let mut sigalarm = must_register_signal(SignalKind::alarm());
-        let mut sigpipe = must_register_signal(SignalKind::pipe());
-        let mut sigquit = must_register_signal(SignalKind::quit());
-
+        let mut signals = SignalSet::register(SIGNAL_TABLE);
         debug!("signal handlers registered");
 
         // ── Filesystem setup ─────────────────────────────────────
@@ -93,19 +68,16 @@ impl InitSystem {
 
         // ── Event loop ───────────────────────────────────────────
         loop {
-            // any non-terminating exit of this loop should cause us to reap orphaned child processes
             tokio::select! {
-                // Main process completion
                 result = test_child.wait() => {
                     match result {
+                        Ok(status) if status.success() => {
+                            debug!("main process exited successfully with status {status}");
+                        }
                         Ok(status) => {
-                            if status.success() {
-                                debug!("main process exited successfully with status {status}");
-                            } else {
-                                error!("main process exited with failure status {status}");
-                                success = false;
-                            }
-                        },
+                            error!("main process exited with failure status {status}");
+                            success = false;
+                        }
                         Err(e) => {
                             error!("main process error: {e}");
                             success = false;
@@ -113,46 +85,17 @@ impl InitSystem {
                     }
                     break;
                 }
-                _ = sigterm.recv() => {
-                    debug!("received SIGTERM");
-                    success = false;
-                    child::forward_signal(pid, Signal::SIGTERM);
-                }
-                _ = sigint.recv() => {
-                    warn!("forwarding SIGINT");
-                    success = false;
-                    child::forward_signal(pid, Signal::SIGINT);
-                }
-                _ = sigalarm.recv() => {
-                    warn!("forwarding SIGALRM");
-                    success = false;
-                    child::forward_signal(pid, Signal::SIGALRM);
-                }
-                _ = sigpipe.recv() => {
-                    warn!("forwarding PIPE");
-                    success = false;
-                    child::forward_signal(pid, Signal::SIGPIPE);
-                }
-                _ = sigquit.recv() => {
-                    warn!("forwarding QUIT");
-                    success = false;
-                    child::forward_signal(pid, Signal::SIGQUIT);
-                }
-                _ = sighup.recv() => {
-                    debug!("forwarding SIGHUP");
-                    child::forward_signal(pid, Signal::SIGHUP);
-                }
-                _ = siguser1.recv() => {
-                    debug!("forwarding SIGUSR1");
-                    child::forward_signal(pid, Signal::SIGUSR1);
-                }
-                _ = siguser2.recv() => {
-                    debug!("forwarding SIGUSR2");
-                    child::forward_signal(pid, Signal::SIGUSR2);
-                }
-                _ = sigwindow.recv() => {
-                    trace!("forwarding WINDOW");
-                    child::forward_signal(pid, Signal::SIGWINCH);
+                spec = signals.recv() => {
+                    match spec.policy {
+                        SignalPolicy::Failure => {
+                            debug!("received failure signal {}, forwarding and marking failed", spec.label);
+                            success = false;
+                        }
+                        SignalPolicy::Benign => {
+                            debug!("forwarding benign signal {}", spec.label);
+                        }
+                    }
+                    child::forward_signal(pid, spec.signal);
                 }
             }
         }
