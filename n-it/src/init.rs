@@ -454,9 +454,9 @@ impl InitSystem {
                     Self::forward_signal(pid, Signal::SIGINT);
                 }
                 _ = sigalarm.recv() => {
-                    warn!("forwarding ALARM");
+                    warn!("forwarding SIGALRM");
                     success = false;
-                    Self::forward_signal(pid, Signal::SIGUSR2);
+                    Self::forward_signal(pid, Signal::SIGALRM);
                 }
                 _ = sigpipe.recv() => {
                     warn!("forwarding PIPE");
