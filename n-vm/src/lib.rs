@@ -10,9 +10,9 @@
 //!
 //! - **Host tier** ([`run_test_in_vm`]) -- launches a Docker container with the
 //!   required devices and capabilities.
-//! - **Container tier** ([`run_in_vm`] / [`TestVm`]) -- launches a VM via
-//!   a pluggable [`HypervisorBackend`], monitors lifecycle events, and
-//!   collects test output.
+//! - **Container tier** ([`run_in_vm`] / [`TestVm`]) -- launches a VM via a
+//!   pluggable [`HypervisorBackend`], monitors lifecycle events, and collects
+//!   test output.
 //!
 //! The innermost tier (the VM guest init system) is provided by the `n-it`
 //! crate.
@@ -20,11 +20,13 @@
 //! # Hypervisor backends
 //!
 //! The [`backend`] module defines the [`HypervisorBackend`] trait that
-//! abstracts over different hypervisors.  The
-//! [`cloud_hypervisor`] module provides the default implementation
-//! ([`CloudHypervisor`]).  [`TestVm`] is generic over the backend, and
-//! the convenience function [`run_in_vm`] currently hardcodes the
-//! [`CloudHypervisor`] backend.
+//! abstracts over different hypervisors.  The [`cloud_hypervisor`] module
+//! provides the default implementation ([`CloudHypervisor`]).
+//!
+//! [`TestVm`], [`run_in_vm`], and [`run_container_tier`] are all generic
+//! over the backend.  The `#[in_vm]` proc macro currently instantiates
+//! them with [`CloudHypervisor`], but callers can substitute any backend
+//! that implements [`HypervisorBackend`].
 //!
 //! # Error handling
 //!

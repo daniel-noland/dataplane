@@ -3,6 +3,14 @@
 
 //! Tier dispatch helpers for the `#[in_vm]` proc macro.
 //!
+//! Both [`run_container_tier`] and [`run_host_tier`] are generic over a
+//! [`HypervisorBackend`](crate::backend::HypervisorBackend) so that the
+//! proc macro can select the backend at code-generation time.  The
+//! `#[in_vm]` macro currently hardcodes
+//! [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor), but
+//! future extensions (e.g. `#[in_vm(qemu)]`) can substitute a different
+//! backend without changing any runtime code.
+//!
 //! The [`in_vm`](crate::in_vm) attribute macro rewrites a test function into a
 //! three-tier dispatch (host -> container -> VM guest).  Rather than generating
 //! all of that runtime logic inline -- which makes changes require proc-macro
@@ -20,6 +28,7 @@
 //! error formatting, exit-code interpretation) lives here in normal,
 //! testable Rust rather than inside `quote!` blocks.
 
+use crate::backend::HypervisorBackend;
 use n_vm_protocol::{ENV_IN_TEST_CONTAINER, ENV_IN_VM, ENV_MARKER_VALUE};
 
 /// Returns `true` when running inside the VM guest (Tier 3).
@@ -66,9 +75,13 @@ fn init_tracing() {
 ///
 /// 1. Builds a single-threaded tokio runtime.
 /// 2. Initialises a tracing subscriber (best-effort, idempotent).
-/// 3. Calls [`run_in_vm`](crate::run_in_vm) to launch a cloud-hypervisor
-///    VM and collect the test output.
+/// 3. Calls [`run_in_vm`](crate::run_in_vm) to launch the VM using
+///    backend `B` and collect the test output.
 /// 4. Prints the collected output and asserts success.
+///
+/// The type parameter `B` selects the hypervisor backend.  The `#[in_vm]`
+/// proc macro currently passes
+/// [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor).
 ///
 /// The type parameter `F` is used only to derive the test name via
 /// [`std::any::type_name`]; the function value itself is never called in
@@ -80,7 +93,7 @@ fn init_tracing() {
 /// - The tokio runtime cannot be created.
 /// - The VM infrastructure returns an error.
 /// - The test running inside the VM reports failure.
-pub fn run_container_tier<F: FnOnce()>(test_fn: F) {
+pub fn run_container_tier<B: HypervisorBackend, F: FnOnce()>(test_fn: F) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -95,7 +108,7 @@ pub fn run_container_tier<F: FnOnce()>(test_fn: F) {
         let init_span = tracing::span!(tracing::Level::INFO, "hypervisor");
         let _guard = init_span.enter();
 
-        let output = crate::run_in_vm(test_fn)
+        let output = crate::run_in_vm::<B, _>(test_fn)
             .await
             .unwrap_or_else(|err| panic!("VM infrastructure error: {err:#?}"));
 

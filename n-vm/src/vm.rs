@@ -550,8 +550,8 @@ impl<B: HypervisorBackend> TestVm<B> {
 
 // ── run_in_vm ────────────────────────────────────────────────────────
 
-/// Boots a VM using the [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor)
-/// backend and runs the test function inside it.
+/// Boots a VM using the given [`HypervisorBackend`] and runs the test
+/// function inside it.
 ///
 /// This is the **container-tier** entry point, called from the code generated
 /// by `#[in_vm]` when `IN_TEST_CONTAINER=YES`.  It:
@@ -559,6 +559,12 @@ impl<B: HypervisorBackend> TestVm<B> {
 /// 1. Resolves the test identity from the type parameter and `argv[0]`.
 /// 2. Delegates to [`TestVm::launch`] to prepare and boot the VM.
 /// 3. Delegates to [`TestVm::collect`] to wait for the test and gather output.
+///
+/// The type parameter `B` selects the hypervisor backend.  The `#[in_vm]`
+/// proc macro currently passes
+/// [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor), but
+/// callers can substitute any backend that implements
+/// [`HypervisorBackend`].
 ///
 /// The type parameter `F` is used only to derive the test name via
 /// [`std::any::type_name`]; the function itself is never called in this tier.
@@ -568,9 +574,9 @@ impl<B: HypervisorBackend> TestVm<B> {
 /// Returns [`VmError`] if any part of the VM launch sequence fails.
 /// Output collection is best-effort and never fails -- see
 /// [`TestVm::collect`].
-pub async fn run_in_vm<F: FnOnce()>(
+pub async fn run_in_vm<B: HypervisorBackend, F: FnOnce()>(
     _: F,
-) -> Result<VmTestOutput<crate::cloud_hypervisor::CloudHypervisor>, VmError> {
+) -> Result<VmTestOutput<B>, VmError> {
     let identity = crate::test_identity::TestIdentity::resolve::<F>();
     let test_name = identity.test_name;
 
@@ -588,6 +594,6 @@ pub async fn run_in_vm<F: FnOnce()>(
         test_name,
     };
 
-    let vm = TestVm::<crate::cloud_hypervisor::CloudHypervisor>::launch(&params).await?;
+    let vm = TestVm::<B>::launch(&params).await?;
     Ok(vm.collect().await)
 }

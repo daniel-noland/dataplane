@@ -147,7 +147,7 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
 
             // Tier 2: Docker container -> VM
             if ::n_vm::is_in_test_container() {
-                ::n_vm::run_container_tier(#ident);
+                ::n_vm::run_container_tier::<::n_vm::CloudHypervisor, _>(#ident);
                 return;
             }
 
