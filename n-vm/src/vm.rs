@@ -75,6 +75,32 @@ const VSOCK_READER_CAPACITY: usize = 32_768;
 /// It must match the `--event-monitor fd=N` argument.
 const EVENT_MONITOR_FD: RawFd = 3;
 
+// ── VM configuration constants ───────────────────────────────────────
+
+/// Total guest memory in bytes (512 MiB).
+const VM_MEMORY_BYTES: i64 = 512 * 1024 * 1024;
+
+/// Hugepage size in bytes (2 MiB).
+const VM_HUGEPAGE_BYTES: i64 = 2 * 1024 * 1024;
+
+/// Number of 2 MiB hugepages to reserve on the kernel command line.
+const VM_HUGEPAGE_COUNT: u32 = 16;
+
+/// MTU for the management network interface (standard Ethernet).
+const MGMT_MTU: i32 = 1500;
+
+/// MTU for fabric-facing network interfaces (jumbo frames).
+const FABRIC_MTU: i32 = 9500;
+
+/// Virtio queue depth for the management network interface.
+const MGMT_QUEUE_SIZE: i32 = 512;
+
+/// Virtio queue depth for fabric-facing network interfaces.
+const FABRIC_QUEUE_SIZE: i32 = 8192;
+
+/// Virtio queue depth for the virtiofs filesystem device.
+const VIRTIOFS_QUEUE_SIZE: i32 = 1024;
+
 // ── Helper: socket polling ───────────────────────────────────────────
 
 /// Polls the filesystem until `path` exists, returning an error on timeout
@@ -234,7 +260,7 @@ impl<'a> TestVmParams<'a> {
                  root=root \
                  default_hugepagesz=2M \
                  hugepagesz=2M \
-                 hugepages=16 \
+                 hugepages={VM_HUGEPAGE_COUNT} \
                  init={INIT_BINARY_PATH} \
                  -- {full_bin_path} {test_name} --exact --no-capture --format=terse",
                 full_bin_path = self.full_bin_path.display(),
@@ -260,14 +286,14 @@ impl<'a> TestVmParams<'a> {
         }
     }
 
-    /// Builds the memory configuration: 512 MiB with 2 MiB hugepages.
+    /// Builds the memory configuration.
     fn build_memory_config() -> MemoryConfig {
         MemoryConfig {
-            size: 512 * 1024 * 1024, // 512 MiB
+            size: VM_MEMORY_BYTES,
             mergeable: Some(true),
             shared: Some(true),
             hugepages: Some(true),
-            hugepage_size: Some(2 * 1024 * 1024), // 2 MiB
+            hugepage_size: Some(VM_HUGEPAGE_BYTES),
             thp: Some(true),
             ..Default::default()
         }
@@ -286,10 +312,10 @@ impl<'a> TestVmParams<'a> {
                 ip: Some("fe80::ffff:1".into()),
                 mask: Some("ffff:ffff:ffff:ffff::".into()),
                 mac: Some("02:DE:AD:BE:EF:01".into()),
-                mtu: Some(1500),
+                mtu: Some(MGMT_MTU),
                 id: Some("mgmt".into()),
                 pci_segment: Some(0),
-                queue_size: Some(512),
+                queue_size: Some(MGMT_QUEUE_SIZE),
                 ..Default::default()
             },
             NetConfig {
@@ -297,10 +323,10 @@ impl<'a> TestVmParams<'a> {
                 ip: Some("fe80::1".into()),
                 mask: Some("ffff:ffff:ffff:ffff::".into()),
                 mac: Some("02:CA:FE:BA:BE:01".into()),
-                mtu: Some(9500),
+                mtu: Some(FABRIC_MTU),
                 id: Some("fabric1".into()),
                 pci_segment: Some(1),
-                queue_size: Some(8192),
+                queue_size: Some(FABRIC_QUEUE_SIZE),
                 ..Default::default()
             },
             NetConfig {
@@ -308,10 +334,10 @@ impl<'a> TestVmParams<'a> {
                 ip: Some("fe80::2".into()),
                 mask: Some("ffff:ffff:ffff:ffff::".into()),
                 mac: Some("02:CA:FE:BA:BE:02".into()),
-                mtu: Some(9500),
+                mtu: Some(FABRIC_MTU),
                 id: Some("fabric2".into()),
                 pci_segment: Some(1),
-                queue_size: Some(8192),
+                queue_size: Some(FABRIC_QUEUE_SIZE),
                 ..Default::default()
             },
         ]
@@ -324,7 +350,7 @@ impl<'a> TestVmParams<'a> {
             tag: VIRTIOFS_ROOT_TAG.into(),
             socket: VIRTIOFSD_SOCKET_PATH.into(),
             num_queues: 1,
-            queue_size: 1024,
+            queue_size: VIRTIOFS_QUEUE_SIZE,
             id: Some(VIRTIOFS_ROOT_TAG.into()),
             ..Default::default()
         }]
