@@ -165,3 +165,135 @@ impl SignalSet {
             .unwrap_or_else(|| fatal!("signal dispatch channel closed unexpectedly"))
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn signal_table_is_non_empty() {
+        assert!(
+            !SIGNAL_TABLE.is_empty(),
+            "SIGNAL_TABLE should contain at least one entry",
+        );
+    }
+
+    #[test]
+    fn signal_table_has_no_duplicate_nix_signals() {
+        let mut seen = HashSet::new();
+        for spec in SIGNAL_TABLE {
+            assert!(
+                seen.insert(spec.signal),
+                "duplicate nix::Signal in SIGNAL_TABLE: {:?} (label {:?})",
+                spec.signal,
+                spec.label,
+            );
+        }
+    }
+
+    #[test]
+    fn signal_table_has_no_duplicate_labels() {
+        let mut seen = HashSet::new();
+        for spec in SIGNAL_TABLE {
+            assert!(
+                seen.insert(spec.label),
+                "duplicate label in SIGNAL_TABLE: {:?}",
+                spec.label,
+            );
+        }
+    }
+
+    #[test]
+    fn signal_table_labels_are_non_empty() {
+        for spec in SIGNAL_TABLE {
+            assert!(
+                !spec.label.is_empty(),
+                "signal table entry for {:?} has an empty label",
+                spec.signal,
+            );
+        }
+    }
+
+    #[test]
+    fn signal_table_labels_match_signal_names() {
+        // nix::Signal's Debug output is the signal name (e.g. "SIGTERM").
+        // We verify that each label matches its signal's name so they
+        // don't drift out of sync.
+        for spec in SIGNAL_TABLE {
+            let signal_name = format!("{:?}", spec.signal);
+            assert_eq!(
+                spec.label, signal_name,
+                "label {:?} does not match signal name {:?}",
+                spec.label, signal_name,
+            );
+        }
+    }
+
+    #[test]
+    fn signal_table_contains_sigterm_as_failure() {
+        let sigterm = SIGNAL_TABLE
+            .iter()
+            .find(|s| s.signal == Signal::SIGTERM)
+            .expect("SIGNAL_TABLE should contain SIGTERM");
+        assert_eq!(
+            sigterm.policy,
+            SignalPolicy::Failure,
+            "SIGTERM should be a failure signal",
+        );
+    }
+
+    #[test]
+    fn signal_table_contains_sigint_as_failure() {
+        let sigint = SIGNAL_TABLE
+            .iter()
+            .find(|s| s.signal == Signal::SIGINT)
+            .expect("SIGNAL_TABLE should contain SIGINT");
+        assert_eq!(
+            sigint.policy,
+            SignalPolicy::Failure,
+            "SIGINT should be a failure signal",
+        );
+    }
+
+    #[test]
+    fn signal_table_has_at_least_one_benign_signal() {
+        let benign_count = SIGNAL_TABLE
+            .iter()
+            .filter(|s| s.policy == SignalPolicy::Benign)
+            .count();
+        assert!(
+            benign_count > 0,
+            "SIGNAL_TABLE should contain at least one benign signal",
+        );
+    }
+
+    #[test]
+    fn signal_table_has_at_least_one_failure_signal() {
+        let failure_count = SIGNAL_TABLE
+            .iter()
+            .filter(|s| s.policy == SignalPolicy::Failure)
+            .count();
+        assert!(
+            failure_count > 0,
+            "SIGNAL_TABLE should contain at least one failure signal",
+        );
+    }
+
+    /// SIGCHLD is intentionally excluded from the table — child reaping
+    /// is handled after the main test process exits, not via the signal
+    /// dispatch loop.  This test ensures it is never accidentally added.
+    #[test]
+    fn signal_table_does_not_contain_sigchld() {
+        let has_sigchld = SIGNAL_TABLE
+            .iter()
+            .any(|s| s.signal == Signal::SIGCHLD);
+        assert!(
+            !has_sigchld,
+            "SIGNAL_TABLE should not contain SIGCHLD; \
+             child reaping is handled separately during shutdown",
+        );
+    }
+}
