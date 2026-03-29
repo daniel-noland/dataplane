@@ -461,7 +461,16 @@ pub fn run_test_in_vm<F: FnOnce()>(
         let client = bollard::Docker::connect_with_unix_defaults()
             .map_err(ContainerError::DockerConnect)?;
         let container_id = create_and_start_container(&client, config).await?;
-        stream_container_logs(&client, &container_id).await?;
-        collect_and_cleanup(&client, &container_id).await
+
+        // Always attempt cleanup even if log streaming fails, to avoid
+        // leaking Docker containers (auto_remove is disabled so that we
+        // can inspect the exit status).
+        let log_result = stream_container_logs(&client, &container_id).await;
+        let cleanup_result = collect_and_cleanup(&client, &container_id).await;
+
+        // Propagate the log streaming error first if it occurred — it is
+        // the root cause.  Otherwise return the cleanup result.
+        log_result?;
+        cleanup_result
     })
 }
