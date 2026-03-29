@@ -43,7 +43,6 @@ pub mod backend;
 pub mod cloud_hypervisor;
 pub mod dispatch;
 pub mod error;
-pub mod hypervisor;
 
 mod abort_on_drop;
 mod container;

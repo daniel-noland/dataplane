@@ -13,11 +13,17 @@
 //!   an `--event-monitor` pipe and `--api-socket`.
 //! - **Lifecycle control** -- creating and booting the VM via the REST API,
 //!   and performing best-effort shutdown.
-//! - **Event monitoring** -- delegating to [`hypervisor::watch`] to consume
+//! - **Event monitoring** -- delegating to [`events::watch`] to consume
 //!   the event stream and produce a [`HypervisorVerdict`].
 //!
 //! Nothing in this module is used by the generic [`TestVm`](crate::vm::TestVm)
 //! machinery except through the [`HypervisorBackend`] trait.
+//!
+//! The [`events`] submodule contains the cloud-hypervisor event monitor
+//! JSON stream decoder and the [`events::watch`] function that consumes
+//! the event stream.
+
+pub(crate) mod events;
 
 use std::os::unix::io::RawFd;
 use std::process::Stdio;
@@ -103,7 +109,7 @@ pub struct CloudHypervisorController {
 /// The [`Display`](std::fmt::Display) implementation produces one line per
 /// event in a human-readable format suitable for test failure diagnostics.
 #[derive(Debug, Default)]
-pub struct CloudHypervisorEventLog(pub Vec<crate::hypervisor::Event>);
+pub struct CloudHypervisorEventLog(pub Vec<events::Event>);
 
 impl std::fmt::Display for CloudHypervisorEventLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -145,7 +151,7 @@ impl HypervisorBackend for CloudHypervisor {
             })?;
 
         let event_watcher = AbortOnDrop::spawn(async {
-            let (events, verdict) = crate::hypervisor::watch(event_receiver).await;
+            let (events, verdict) = events::watch(event_receiver).await;
             (CloudHypervisorEventLog(events), verdict)
         });
 
@@ -720,16 +726,16 @@ mod tests {
         use std::time::Duration;
 
         let log = CloudHypervisorEventLog(vec![
-            crate::hypervisor::Event {
+            events::Event {
                 timestamp: Duration::from_secs(0),
-                source: crate::hypervisor::Source::Vmm,
-                event: crate::hypervisor::EventType::Starting,
+                source: events::Source::Vmm,
+                event: events::EventType::Starting,
                 properties: BTreeMap::new(),
             },
-            crate::hypervisor::Event {
+            events::Event {
                 timestamp: Duration::from_secs(1),
-                source: crate::hypervisor::Source::Vmm,
-                event: crate::hypervisor::EventType::Shutdown,
+                source: events::Source::Vmm,
+                event: events::EventType::Shutdown,
                 properties: BTreeMap::new(),
             },
         ]);
