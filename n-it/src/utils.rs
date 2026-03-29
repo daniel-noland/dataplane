@@ -2,7 +2,7 @@
 // It is important that we flush stdout and stderr before exiting, and panic!
 // does not do that correctly in the case of an init system.
 macro_rules! fatal {
-    ($msg:expr) => {
+    ($($arg:tt)*) => {
         {
             use ::std::io::Write as _;
             // quick best effort flush of stdout and stderr before logging fatal error
@@ -13,7 +13,7 @@ macro_rules! fatal {
             let mut stderr_lock = ::std::io::stderr().lock();
             let _ = stdout_lock.flush();
             let _ = stderr_lock.flush();
-            ::tracing::error!($msg);
+            ::tracing::error!($($arg)*);
             ::tracing::error!("NOTE: test or test fixture failed! Expect a general protection fault and a kernel panic.");
             ::tracing::error!("see other logs for cause of failure.  The general protection fault is expected.");
             let _ = stdout_lock.flush();
