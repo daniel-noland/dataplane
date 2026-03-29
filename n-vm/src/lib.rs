@@ -47,11 +47,12 @@ pub mod dispatch;
 pub mod error;
 pub mod qemu;
 
-mod abort_on_drop;
+pub mod abort_on_drop;
 mod container;
 mod test_identity;
 mod vm;
 
+pub use abort_on_drop::AbortOnDrop;
 pub use backend::{HypervisorBackend, HypervisorVerdict, LaunchedHypervisor};
 pub use cloud_hypervisor::CloudHypervisor;
 pub use qemu::Qemu;

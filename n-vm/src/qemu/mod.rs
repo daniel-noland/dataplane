@@ -29,31 +29,22 @@
 //! | Shutdown | `shutdown_vm()` + `shutdown_vmm()` | `system_powerdown` + `quit` |
 //! | Config | JSON `VmConfig` body | Command-line arguments |
 //!
-//! # Known limitations
-//!
-//! ## vsock bridging
+//! # vsock bridging
 //!
 //! Cloud-hypervisor has a built-in vhost-user-vsock implementation that
 //! transparently maps guest vsock connections to host-side Unix sockets
-//! at `$VHOST_SOCKET_$PORT`.  The [`TestVm`](crate::vm::TestVm)
-//! infrastructure binds [`UnixListener`](tokio::net::UnixListener)s at
-//! those paths before booting the VM.
+//! at `$VHOST_SOCKET_$PORT`.  Its
+//! [`spawn_vsock_reader`](crate::backend::HypervisorBackend::spawn_vsock_reader)
+//! implementation binds [`UnixListener`](tokio::net::UnixListener)s at
+//! those paths.
 //!
 //! QEMU's `vhost-vsock-pci` device uses the kernel's vhost-vsock module
-//! instead, which surfaces guest connections as `AF_VSOCK` sockets on the
-//! host rather than Unix sockets.  For the existing
-//! [`TestVm::spawn_vsock_reader`](crate::vm::TestVm) to work with QEMU,
-//! one of the following is needed:
-//!
-//! - A `vhost-user-vsock` daemon that provides the same Unix socket
-//!   mapping as cloud-hypervisor's built-in implementation.
-//! - A change to [`TestVm`](crate::vm::TestVm) to support `AF_VSOCK`
-//!   listeners as an alternative to `UnixListener`, selected by the
-//!   backend.
-//!
-//! Until one of these is implemented, the QEMU backend will boot the VM
-//! and monitor QMP events correctly, but test output collection via vsock
-//! channels will not function.
+//! instead, which surfaces guest connections as `AF_VSOCK` sockets on
+//! the host.  This backend's
+//! [`spawn_vsock_reader`](Qemu::spawn_vsock_reader) implementation uses
+//! [`tokio_vsock::VsockListener`] bound to `VMADDR_CID_ANY` on the
+//! channel's port, so the kernel routes guest vsock connections directly
+//! to the listener without any intermediate Unix socket mapping.
 //!
 //! The [`qmp`] submodule contains the QMP protocol client and wire types.
 
@@ -68,9 +59,10 @@ use std::time::Duration;
 
 use n_vm_protocol::{
     HYPERVISOR_API_SOCKET_PATH, INIT_BINARY_PATH, KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH,
-    QEMU_BINARY_PATH, VIRTIOFSD_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VM_GUEST_CID,
+    QEMU_BINARY_PATH, VIRTIOFSD_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VM_GUEST_CID, VsockChannel,
 };
-use tracing::{debug, warn};
+use tokio::io::AsyncReadExt;
+use tracing::{debug, error, warn};
 
 use crate::abort_on_drop::AbortOnDrop;
 use crate::backend::{HypervisorBackend, HypervisorVerdict, LaunchedHypervisor};
@@ -111,6 +103,9 @@ const VM_SOCKETS: u32 = 1;
 
 /// Virtio queue depth for the virtiofs filesystem device.
 const VIRTIOFS_QUEUE_SIZE: u32 = 1024;
+
+/// Initial buffer capacity for vsock reader tasks.
+const VSOCK_READER_CAPACITY: usize = 32_768;
 
 /// Duration to continue draining QMP events after a guest panic is
 /// detected.
@@ -238,6 +233,46 @@ impl HypervisorBackend for Qemu {
             .send_command_fire_and_forget("system_powerdown")
             .await;
         writer.send_command_fire_and_forget("quit").await;
+    }
+
+    fn spawn_vsock_reader(channel: &VsockChannel) -> Result<AbortOnDrop<String>, VmError> {
+        let port = channel.port.as_raw();
+        let label = channel.label;
+
+        // Bind an AF_VSOCK listener on VMADDR_CID_ANY so the kernel's
+        // vhost-vsock module will route guest connections to us.
+        let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, port);
+        let listener =
+            tokio_vsock::VsockListener::bind(addr).map_err(|source| VmError::VsockBind {
+                label,
+                path: format!("vsock://any:{port}").into(),
+                source,
+            })?;
+
+        Ok(AbortOnDrop::spawn(async move {
+            let mut buf = Vec::with_capacity(VSOCK_READER_CAPACITY);
+            let mut connection = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    error!("failed to accept {label} vsock connection: {e}");
+                    return format!(
+                        "!!!{} UNAVAILABLE: accept failed: {e}!!!",
+                        label.to_uppercase()
+                    );
+                }
+            };
+            loop {
+                match connection.read_buf(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("error reading {label} vsock stream: {e}");
+                        break;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }))
     }
 }
 

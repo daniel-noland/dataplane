@@ -58,9 +58,6 @@ const SOCKET_POLL_MAX_ATTEMPTS: u32 = 100;
 /// Interval between socket existence checks.
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
-/// Initial buffer capacity for vsock reader tasks.
-const VSOCK_READER_CAPACITY: usize = 32_768;
-
 // ── Utilities ────────────────────────────────────────────────────────
 
 /// Polls the filesystem until `path` exists, returning an error on timeout
@@ -329,50 +326,6 @@ pub struct TestVm<B: HypervisorBackend> {
 }
 
 impl<B: HypervisorBackend> TestVm<B> {
-    /// Binds a Unix listener for the given [`VsockChannel`], then spawns a
-    /// task that accepts a single connection and reads it to EOF.
-    ///
-    /// This pattern is shared by the init-system tracing channel, test
-    /// stdout, and test stderr -- all of which are vsock streams that the
-    /// VM guest connects to via `vhost_vsock`.
-    ///
-    /// The listener must be bound *before* the VM boots so that the
-    /// guest-side `vsock::VsockStream::connect()` succeeds immediately.
-    fn spawn_vsock_reader(channel: &VsockChannel) -> Result<AbortOnDrop<String>, VmError> {
-        let path = channel.listener_path();
-        let label = channel.label;
-        let listen =
-            tokio::net::UnixListener::bind(&path).map_err(|source| VmError::VsockBind {
-                label,
-                path: path.clone(),
-                source,
-            })?;
-        Ok(AbortOnDrop::spawn(async move {
-            let mut buf = Vec::with_capacity(VSOCK_READER_CAPACITY);
-            let mut connection = match listen.accept().await {
-                Ok((stream, _)) => stream,
-                Err(e) => {
-                    error!("failed to accept {label} vsock connection: {e}");
-                    return format!(
-                        "!!!{} UNAVAILABLE: accept failed: {e}!!!",
-                        label.to_uppercase()
-                    );
-                }
-            };
-            loop {
-                match connection.read_buf(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("error reading {label} vsock stream: {e}");
-                        break;
-                    }
-                }
-            }
-            String::from_utf8_lossy(&buf).into_owned()
-        }))
-    }
-
     /// Spawns a virtiofsd process that shares `path` into the VM as a
     /// read-only virtiofs mount.
     async fn launch_virtiofsd(path: impl AsRef<Path>) -> Result<tokio::process::Child, VmError> {
@@ -434,8 +387,8 @@ impl<B: HypervisorBackend> TestVm<B> {
     ///
     /// 1. [`launch_virtiofsd`](Self::launch_virtiofsd) -- share the
     ///    container filesystem into the VM.
-    /// 2. [`spawn_vsock_reader`](Self::spawn_vsock_reader) -- bind vsock
-    ///    listeners for all channels.
+    /// 2. [`B::spawn_vsock_reader`](HypervisorBackend::spawn_vsock_reader)
+    ///    -- bind backend-specific vsock listeners for all channels.
     /// 3. [`B::launch`](HypervisorBackend::launch) -- delegate to the
     ///    backend for hypervisor-specific process spawning, VM
     ///    configuration, boot, and event monitoring.
@@ -449,10 +402,12 @@ impl<B: HypervisorBackend> TestVm<B> {
     pub async fn launch(params: &TestVmParams<'_>) -> Result<Self, VmError> {
         let virtiofsd = Self::launch_virtiofsd(VM_ROOT_SHARE_PATH).await?;
         // All listeners must be bound *before* the VM boots so that the
-        // guest-side vsock connections succeed immediately.
-        let init_trace = Self::spawn_vsock_reader(&VsockChannel::INIT_TRACE)?;
-        let test_stdout = Self::spawn_vsock_reader(&VsockChannel::TEST_STDOUT)?;
-        let test_stderr = Self::spawn_vsock_reader(&VsockChannel::TEST_STDERR)?;
+        // guest-side vsock connections succeed immediately.  The listener
+        // type is backend-specific: cloud-hypervisor uses Unix sockets,
+        // QEMU uses AF_VSOCK via the kernel's vhost-vsock module.
+        let init_trace = B::spawn_vsock_reader(&VsockChannel::INIT_TRACE)?;
+        let test_stdout = B::spawn_vsock_reader(&VsockChannel::TEST_STDOUT)?;
+        let test_stderr = B::spawn_vsock_reader(&VsockChannel::TEST_STDERR)?;
 
         let launched = B::launch(params).await?;
 

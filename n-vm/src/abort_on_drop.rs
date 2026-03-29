@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 /// let join_handle = handle.into_inner();
 /// ```
 #[derive(Debug)]
-pub(crate) struct AbortOnDrop<T> {
+pub struct AbortOnDrop<T> {
     inner: Option<JoinHandle<T>>,
 }
 

@@ -42,9 +42,10 @@ use command_fds::{CommandFdExt, FdMapping};
 use n_vm_protocol::{
     CLOUD_HYPERVISOR_BINARY_PATH, HYPERVISOR_API_SOCKET_PATH, INIT_BINARY_PATH,
     KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH, VHOST_VSOCK_SOCKET_PATH, VIRTIOFS_ROOT_TAG,
-    VIRTIOFSD_SOCKET_PATH, VM_GUEST_CID, VM_RUN_DIR,
+    VIRTIOFSD_SOCKET_PATH, VM_GUEST_CID, VM_RUN_DIR, VsockChannel,
 };
-use tracing::debug;
+use tokio::io::AsyncReadExt;
+use tracing::{debug, error};
 
 use crate::abort_on_drop::AbortOnDrop;
 use crate::backend::{HypervisorBackend, LaunchedHypervisor};
@@ -82,6 +83,9 @@ const FABRIC_QUEUE_SIZE: i32 = 8192;
 
 /// Virtio queue depth for the virtiofs filesystem device.
 const VIRTIOFS_QUEUE_SIZE: i32 = 1024;
+
+/// Initial buffer capacity for vsock reader tasks.
+const VSOCK_READER_CAPACITY: usize = 32_768;
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -193,6 +197,41 @@ impl HypervisorBackend for CloudHypervisor {
         if let Err(err) = controller.client.lock().await.shutdown_vmm().await as Result<(), _> {
             debug!("vmm shutdown: {err}");
         }
+    }
+
+    fn spawn_vsock_reader(channel: &VsockChannel) -> Result<AbortOnDrop<String>, VmError> {
+        let path = channel.listener_path();
+        let label = channel.label;
+        let listen =
+            tokio::net::UnixListener::bind(&path).map_err(|source| VmError::VsockBind {
+                label,
+                path: path.clone(),
+                source,
+            })?;
+        Ok(AbortOnDrop::spawn(async move {
+            let mut buf = Vec::with_capacity(VSOCK_READER_CAPACITY);
+            let mut connection = match listen.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    error!("failed to accept {label} vsock connection: {e}");
+                    return format!(
+                        "!!!{} UNAVAILABLE: accept failed: {e}!!!",
+                        label.to_uppercase()
+                    );
+                }
+            };
+            loop {
+                match connection.read_buf(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("error reading {label} vsock stream: {e}");
+                        break;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }))
     }
 }
 

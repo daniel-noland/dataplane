@@ -18,6 +18,8 @@
 //! [`LaunchedHypervisor`], which bundles the child process, a background
 //! event-monitoring task, and a backend-specific lifecycle controller.
 
+use n_vm_protocol::VsockChannel;
+
 use crate::abort_on_drop::AbortOnDrop;
 use crate::error::VmError;
 use crate::vm::TestVmParams;
@@ -288,4 +290,29 @@ pub trait HypervisorBackend: Send + Sized + 'static {
     /// Implementations should log but not propagate errors, since this
     /// is a best-effort operation that must not prevent output collection.
     async fn shutdown(controller: &Self::Controller);
+
+    /// Binds a listener for the given [`VsockChannel`] and spawns a
+    /// background task that accepts a single connection and reads it to
+    /// EOF, returning the contents as a `String`.
+    ///
+    /// The listener **must** be bound before the VM boots so that the
+    /// guest-side `vsock::VsockStream::connect()` succeeds immediately.
+    ///
+    /// The mechanism for binding differs by backend:
+    ///
+    /// - **cloud-hypervisor** has a built-in vhost-user-vsock
+    ///   implementation that maps guest vsock ports to Unix sockets at
+    ///   `$VHOST_SOCKET_$PORT`.  The listener is a
+    ///   [`tokio::net::UnixListener`] bound at
+    ///   [`VsockChannel::listener_path()`].
+    ///
+    /// - **QEMU** uses the kernel's `vhost-vsock` module, which surfaces
+    ///   guest vsock connections as `AF_VSOCK` sockets on the host.  The
+    ///   listener is a [`tokio_vsock::VsockListener`] bound to the
+    ///   channel's port on `VMADDR_CID_ANY`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VmError::VsockBind`] if the listener cannot be bound.
+    fn spawn_vsock_reader(channel: &VsockChannel) -> Result<AbortOnDrop<String>, VmError>;
 }
