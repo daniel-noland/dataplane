@@ -41,14 +41,10 @@ pub enum QemuError {
 
     /// The QMP greeting was not received or could not be parsed.
     ///
-    /// Upon connection, QEMU sends a JSON greeting message:
-    ///
-    /// ```json
-    /// {"QMP": {"version": {...}, "capabilities": [...]}}
-    /// ```
-    ///
-    /// This error indicates the greeting was absent, malformed, or could
-    /// not be deserialized.
+    /// Upon connection, QEMU sends a JSON greeting message that is
+    /// deserialized as [`qapi_qmp::QapiCapabilities`].  This error
+    /// indicates the greeting was absent, malformed, or could not be
+    /// deserialized into that type.
     #[error("QMP greeting not received or malformed: {reason}")]
     QmpGreeting {
         /// Description of what went wrong with the greeting.

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Open Network Fabric Authors
 
-//! QEMU Machine Protocol (QMP) client.
+//! QEMU Machine Protocol (QMP) client backed by [`qapi-rs`] type
+//! definitions.
 //!
 //! QMP is a JSON-based protocol that QEMU exposes over a Unix socket for
-//! machine lifecycle control and event monitoring.  This module provides a
-//! minimal, purpose-built client covering only the operations needed by
-//! the [`Qemu`](super::Qemu) hypervisor backend:
+//! machine lifecycle control and event monitoring.  This module provides
+//! a purpose-built client covering only the operations needed by the
+//! [`Qemu`](super::Qemu) hypervisor backend:
 //!
 //! 1. **Connection and negotiation** -- connect to the QMP socket, receive
 //!    the greeting, and enter command mode via `qmp_capabilities`.
@@ -14,6 +15,20 @@
 //!    best-effort shutdown (`system_powerdown`, `quit`).
 //! 3. **Event monitoring** -- read and deserialize async QMP events for
 //!    the event watcher task.
+//!
+//! Wire types (events, error classes, version info, greeting structure)
+//! are provided by the [`qapi_qmp`] crate, which is code-generated from
+//! the upstream QEMU QAPI schema.  This gives us:
+//!
+//! - **Typed events** -- [`qapi_qmp::Event`] is an enum with variants
+//!   like `SHUTDOWN`, `GUEST_PANICKED`, `RESUME`, etc., each carrying
+//!   its schema-defined data payload.  Verdict computation can use
+//!   pattern matching instead of string comparison.
+//! - **Typed error classes** -- [`qapi_spec::ErrorClass`] enumerates the
+//!   QMP error categories (`GenericError`, `CommandNotFound`, etc.).
+//! - **Version information** -- [`qapi_qmp::VersionInfo`] and
+//!   [`qapi_qmp::VersionTriple`] provide structured QEMU version data
+//!   from the greeting.
 //!
 //! # Protocol overview
 //!
@@ -48,12 +63,15 @@
 //!
 //! The writer sends commands fire-and-forget (no response reading).  The
 //! event stream consumes everything from the read half, discarding
-//! command responses and yielding only [`QmpEvent`]s.  This avoids the
-//! need for a multiplexer while keeping the API simple.
+//! command responses and yielding only [`qapi_qmp::Event`]s.  This
+//! avoids the need for a multiplexer while keeping the API simple.
+//!
+//! [`qapi-rs`]: https://github.com/arcnmx/qapi-rs
 
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use qapi_qmp::QmpMessage;
+use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -61,126 +79,61 @@ use tracing::{debug, trace, warn};
 
 use super::error::QemuError;
 
-// ── QMP wire types ───────────────────────────────────────────────────
+// ── Event display ────────────────────────────────────────────────────
 
-/// The initial greeting sent by QEMU when a QMP client connects.
+/// Wrapper for human-readable [`Display`](std::fmt::Display) of a
+/// [`qapi_qmp::Event`].
 ///
-/// ```text
-/// {"QMP": {"version": {"qemu": {"major": 9, ...}, ...}, "capabilities": ["oob"]}}
-/// ```
-#[derive(Debug, Deserialize)]
-pub(crate) struct QmpGreeting {
-    /// The `"QMP"` envelope.
-    #[serde(rename = "QMP")]
-    pub qmp: QmpGreetingInner,
+/// Produces a concise one-line representation showing the event name
+/// followed by its data payload (if non-empty), suitable for diagnostic
+/// output in test failure reports.
+///
+/// # Examples
+///
+/// An event with payload displays as `SHUTDOWN {"guest":true,"reason":"guest-shutdown"}`.
+/// An event with an empty data struct displays as just `STOP`.
+pub struct EventDisplay<'a>(pub &'a qapi_qmp::Event);
+
+impl std::fmt::Display for EventDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Serialize to JSON to extract the event name and data fields.
+        // `qapi_qmp::Event` is `#[serde(tag = "event")]`, so the JSON
+        // object always contains an `"event"` key with the variant name.
+        let Ok(json) = serde_json::to_value(self.0) else {
+            // Fallback to Debug if serialization somehow fails.
+            return write!(f, "{:?}", self.0);
+        };
+
+        let name = json
+            .get("event")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN");
+        write!(f, "{name}")?;
+
+        // Append the data payload unless it is an empty object (which
+        // is the serialized form of events that carry no payload, e.g.
+        // `STOP`, `RESUME`).
+        if let Some(data) = json.get("data") {
+            if !data.as_object().is_some_and(serde_json::Map::is_empty) {
+                write!(f, " {data}")?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
-/// Contents of the QMP greeting envelope.
-#[derive(Debug, Deserialize)]
-pub(crate) struct QmpGreetingInner {
-    /// QEMU version information.
-    pub version: QmpVersion,
-    /// Server-advertised capabilities.
-    #[serde(default)]
-    #[allow(dead_code, reason = "deserialized from QMP greeting; used in tests")]
-    pub capabilities: Vec<String>,
-}
-
-/// QEMU version information from the QMP greeting.
-#[derive(Debug, Deserialize)]
-pub(crate) struct QmpVersion {
-    /// Structured QEMU version numbers.
-    pub qemu: QmpVersionNumbers,
-    /// Package version string (distribution-specific).
-    #[serde(default)]
-    pub package: String,
-}
-
-/// Structured QEMU version numbers.
-#[derive(Debug, Deserialize)]
-pub(crate) struct QmpVersionNumbers {
-    /// Major version.
-    pub major: u32,
-    /// Minor version.
-    pub minor: u32,
-    /// Micro (patch) version.
-    pub micro: u32,
-}
+// ── QMP command (outbound) ───────────────────────────────────────────
 
 /// A QMP command to send to QEMU.
+///
+/// This is intentionally untyped: the shutdown path only needs
+/// `system_powerdown` and `quit`, both of which take no arguments.
+/// Using a plain string avoids pulling in the full `qapi_qmp` command
+/// types for fire-and-forget operations.
 #[derive(Debug, Serialize)]
 struct QmpCommand<'a> {
     execute: &'a str,
-}
-
-/// A message received from the QMP socket after capability negotiation.
-///
-/// QMP interleaves three kinds of messages on the same socket:
-///
-/// - **Return** -- successful response to a command.
-/// - **Error** -- failed response to a command.
-/// - **Event** -- unsolicited lifecycle event.
-///
-/// Uses `#[serde(untagged)]` because the three forms are distinguished
-/// by their top-level JSON key (`"return"`, `"error"`, `"event"`) rather
-/// than by an explicit tag field.  Variant order matters: serde tries
-/// each in declaration order, so `Return` (most common after commands)
-/// comes first.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum QmpMessage {
-    /// Successful command response.
-    Return {
-        /// The return value (usually `{}`).
-        #[serde(rename = "return")]
-        _value: serde_json::Value,
-    },
-    /// An async lifecycle event from QEMU.
-    Event(QmpEvent),
-    /// Failed command response.
-    Error {
-        /// The error details.
-        error: QmpErrorInfo,
-    },
-}
-
-/// Error details from a failed QMP command.
-#[derive(Debug, Deserialize)]
-pub(crate) struct QmpErrorInfo {
-    /// Error class (e.g. `"GenericError"`).
-    pub class: String,
-    /// Human-readable error description.
-    pub desc: String,
-}
-
-/// An async event from QEMU's QMP socket.
-///
-/// Events are sent unsolicited whenever a lifecycle transition occurs
-/// (shutdown, reset, guest panic, device changes, etc.).
-///
-/// The [`Display`](std::fmt::Display) implementation produces a concise
-/// one-line representation suitable for diagnostic output, showing the
-/// event name followed by its data payload (if present).
-#[derive(Debug, Clone, Deserialize)]
-pub struct QmpEvent {
-    /// Event name (e.g. `"SHUTDOWN"`, `"GUEST_PANICKED"`, `"RESET"`).
-    pub event: String,
-    /// Event-specific data payload (may be `null` or absent).
-    #[serde(default)]
-    pub data: serde_json::Value,
-    /// QEMU-provided timestamp (`{"seconds": N, "microseconds": M}`).
-    #[serde(default)]
-    pub timestamp: serde_json::Value,
-}
-
-impl std::fmt::Display for QmpEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.event)?;
-        if !self.data.is_null() {
-            write!(f, " {}", self.data)?;
-        }
-        Ok(())
-    }
 }
 
 // ── QMP connection ───────────────────────────────────────────────────
@@ -200,6 +153,10 @@ impl QmpConnection {
     /// Connects to the QMP socket at `path`, reads the greeting, and
     /// negotiates capabilities.
     ///
+    /// The greeting is deserialized as [`qapi_qmp::QapiCapabilities`],
+    /// which provides typed access to the QEMU version and advertised
+    /// capabilities.
+    ///
     /// After this returns successfully, the connection is in command mode
     /// and ready to send commands or read events.
     ///
@@ -217,34 +174,43 @@ impl QmpConnection {
         let mut writer = write_half;
 
         // ── Phase 1: read the QMP greeting ───────────────────────────
-        let greeting = read_line_json::<QmpGreeting>(&mut reader).await?;
+        let greeting =
+            read_line_json::<qapi_qmp::QapiCapabilities>(&mut reader).await?;
+
+        let v = &greeting.QMP.version;
         debug!(
             "QMP greeting: QEMU {}.{}.{} (package: {:?})",
-            greeting.qmp.version.qemu.major,
-            greeting.qmp.version.qemu.minor,
-            greeting.qmp.version.qemu.micro,
-            greeting.qmp.version.package,
+            v.qemu.major, v.qemu.minor, v.qemu.micro, v.package,
         );
 
         // ── Phase 2: negotiate capabilities ──────────────────────────
         send_command(&mut writer, "qmp_capabilities").await?;
 
-        let msg = read_line_json::<QmpMessage>(&mut reader).await?;
+        let msg =
+            read_line_json::<qapi_qmp::QmpMessageAny>(&mut reader).await?;
         match msg {
-            QmpMessage::Return { .. } => {
-                debug!("QMP capabilities negotiated successfully");
-            }
-            QmpMessage::Error { error } => {
-                return Err(QemuError::QmpNegotiate {
-                    reason: format!("{}: {}", error.class, error.desc),
-                });
-            }
+            QmpMessage::Response(resp) => match resp.result() {
+                Ok(_) => {
+                    debug!("QMP capabilities negotiated successfully");
+                }
+                Err(error) => {
+                    return Err(QemuError::QmpNegotiate {
+                        reason: format!("{:?}: {}", error.class, error.desc),
+                    });
+                }
+            },
             QmpMessage::Event(event) => {
                 // Events during negotiation are unexpected but not
                 // impossible (e.g. a race with early device init).
-                warn!("unexpected QMP event during negotiation: {event}");
+                warn!(
+                    "unexpected QMP event during negotiation: {}",
+                    EventDisplay(&event),
+                );
                 return Err(QemuError::QmpNegotiate {
-                    reason: format!("unexpected event during negotiation: {event}"),
+                    reason: format!(
+                        "unexpected event during negotiation: {}",
+                        EventDisplay(&event),
+                    ),
                 });
             }
         }
@@ -309,9 +275,9 @@ impl QmpWriter {
 /// background task.
 ///
 /// Reads newline-delimited JSON messages from the QMP socket and yields
-/// [`QmpEvent`]s.  Command responses (`Return` / `Error`) that arrive
-/// on the stream are logged and discarded, since the writer sends
-/// commands fire-and-forget.
+/// [`qapi_qmp::Event`]s.  Command responses that arrive on the stream
+/// are logged and discarded, since the writer sends commands
+/// fire-and-forget.
 pub(crate) struct QmpEventStream {
     reader: BufReader<OwnedReadHalf>,
 }
@@ -328,7 +294,7 @@ impl QmpEventStream {
     /// # Errors
     ///
     /// Returns [`QemuError`] on I/O or deserialization errors.
-    pub async fn next_event(&mut self) -> Result<Option<QmpEvent>, QemuError> {
+    pub async fn next_event(&mut self) -> Result<Option<qapi_qmp::Event>, QemuError> {
         loop {
             let mut line = String::new();
             let bytes_read = self
@@ -349,24 +315,26 @@ impl QmpEventStream {
 
             trace!("QMP recv: {trimmed}");
 
-            let msg: QmpMessage =
+            let msg: qapi_qmp::QmpMessageAny =
                 serde_json::from_str(trimmed).map_err(QemuError::QmpDeserialize)?;
 
             match msg {
                 QmpMessage::Event(event) => return Ok(Some(event)),
-                QmpMessage::Return { .. } => {
-                    // Discard command responses -- the writer doesn't wait
-                    // for them.
-                    trace!("QMP: discarding command success response");
-                }
-                QmpMessage::Error { error } => {
-                    // Log command errors but don't propagate -- the writer
-                    // sent fire-and-forget.
-                    debug!(
-                        "QMP: discarding command error response: {}: {}",
-                        error.class, error.desc
-                    );
-                }
+                QmpMessage::Response(resp) => match resp.result() {
+                    Ok(_) => {
+                        // Discard command responses -- the writer
+                        // doesn't wait for them.
+                        trace!("QMP: discarding command success response");
+                    }
+                    Err(error) => {
+                        // Log command errors but don't propagate -- the
+                        // writer sent fire-and-forget.
+                        debug!(
+                            "QMP: discarding command error response: {:?}: {}",
+                            error.class, error.desc,
+                        );
+                    }
+                },
             }
         }
     }
@@ -415,131 +383,167 @@ async fn send_command(writer: &mut OwnedWriteHalf, command: &str) -> Result<(), 
 mod tests {
     use super::*;
 
+    // ── Greeting deserialization ─────────────────────────────────────
+
     #[test]
     fn deserialize_greeting() {
         let json = r#"{"QMP": {"version": {"qemu": {"micro": 0, "minor": 2, "major": 9}, "package": "v9.2.0"}, "capabilities": ["oob"]}}"#;
-        let greeting: QmpGreeting = serde_json::from_str(json).unwrap();
-        assert_eq!(greeting.qmp.version.qemu.major, 9);
-        assert_eq!(greeting.qmp.version.qemu.minor, 2);
-        assert_eq!(greeting.qmp.version.qemu.micro, 0);
-        assert_eq!(greeting.qmp.capabilities, vec!["oob"]);
+        let greeting: qapi_qmp::QapiCapabilities = serde_json::from_str(json).unwrap();
+        assert_eq!(greeting.QMP.version.qemu.major, 9);
+        assert_eq!(greeting.QMP.version.qemu.minor, 2);
+        assert_eq!(greeting.QMP.version.qemu.micro, 0);
     }
 
     #[test]
     fn deserialize_greeting_without_capabilities() {
-        let json = r#"{"QMP": {"version": {"qemu": {"micro": 1, "minor": 0, "major": 8}, "package": ""}}}"#;
-        let greeting: QmpGreeting = serde_json::from_str(json).unwrap();
-        assert_eq!(greeting.qmp.version.qemu.major, 8);
-        assert!(greeting.qmp.capabilities.is_empty());
+        let json = r#"{"QMP": {"version": {"qemu": {"micro": 1, "minor": 0, "major": 8}, "package": ""}, "capabilities": []}}"#;
+        let greeting: qapi_qmp::QapiCapabilities = serde_json::from_str(json).unwrap();
+        assert_eq!(greeting.QMP.version.qemu.major, 8);
+        assert!(greeting.QMP.capabilities.is_empty());
     }
+
+    // ── Response deserialization ─────────────────────────────────────
 
     #[test]
     fn deserialize_return_response() {
         let json = r#"{"return": {}}"#;
-        let msg: QmpMessage = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, QmpMessage::Return { .. }));
+        let msg: qapi_qmp::QmpMessageAny = serde_json::from_str(json).unwrap();
+        match msg {
+            QmpMessage::Response(resp) => {
+                resp.result().expect("expected successful response");
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
     }
 
     #[test]
     fn deserialize_return_with_data() {
         let json = r#"{"return": {"status": "running", "singlestep": false}}"#;
-        let msg: QmpMessage = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, QmpMessage::Return { .. }));
+        let msg: qapi_qmp::QmpMessageAny = serde_json::from_str(json).unwrap();
+        match msg {
+            QmpMessage::Response(resp) => {
+                resp.result().expect("expected successful response");
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
     }
 
     #[test]
     fn deserialize_error_response() {
         let json =
             r#"{"error": {"class": "GenericError", "desc": "something went wrong"}}"#;
-        let msg: QmpMessage = serde_json::from_str(json).unwrap();
+        let msg: qapi_qmp::QmpMessageAny = serde_json::from_str(json).unwrap();
         match msg {
-            QmpMessage::Error { error } => {
-                assert_eq!(error.class, "GenericError");
-                assert_eq!(error.desc, "something went wrong");
-            }
-            other => panic!("expected Error, got {other:?}"),
+            QmpMessage::Response(resp) => match resp.result() {
+                Err(error) => {
+                    assert_eq!(
+                        error.class,
+                        qapi_spec::ErrorClass::GenericError,
+                    );
+                    assert_eq!(error.desc, "something went wrong");
+                }
+                Ok(_) => panic!("expected error response, got success"),
+            },
+            QmpMessage::Event(e) => panic!("expected response, got event: {e:?}"),
         }
     }
+
+    // ── Event deserialization ────────────────────────────────────────
 
     #[test]
     fn deserialize_shutdown_event() {
         let json = r#"{"event": "SHUTDOWN", "data": {"guest": true, "reason": "guest-shutdown"}, "timestamp": {"seconds": 1234, "microseconds": 5678}}"#;
-        let msg: QmpMessage = serde_json::from_str(json).unwrap();
+        let msg: qapi_qmp::QmpMessageAny = serde_json::from_str(json).unwrap();
         match msg {
-            QmpMessage::Event(event) => {
-                assert_eq!(event.event, "SHUTDOWN");
-                assert_eq!(event.data["guest"], true);
-                assert_eq!(event.data["reason"], "guest-shutdown");
+            QmpMessage::Event(qapi_qmp::Event::SHUTDOWN { data, .. }) => {
+                assert!(data.guest);
+                assert_eq!(
+                    data.reason,
+                    qapi_qmp::ShutdownCause::guest_shutdown,
+                );
             }
-            other => panic!("expected Event, got {other:?}"),
+            other => panic!("expected SHUTDOWN event, got {other:?}"),
         }
     }
 
     #[test]
     fn deserialize_guest_panicked_event() {
         let json = r#"{"event": "GUEST_PANICKED", "data": {"action": "pause"}, "timestamp": {"seconds": 42, "microseconds": 0}}"#;
-        let msg: QmpMessage = serde_json::from_str(json).unwrap();
+        let msg: qapi_qmp::QmpMessageAny = serde_json::from_str(json).unwrap();
         match msg {
-            QmpMessage::Event(event) => {
-                assert_eq!(event.event, "GUEST_PANICKED");
-                assert_eq!(event.data["action"], "pause");
+            QmpMessage::Event(qapi_qmp::Event::GUEST_PANICKED { data, .. }) => {
+                assert_eq!(data.action, qapi_qmp::GuestPanicAction::pause);
             }
-            other => panic!("expected Event, got {other:?}"),
+            other => panic!("expected GUEST_PANICKED event, got {other:?}"),
         }
     }
 
     #[test]
     fn deserialize_event_without_data() {
         let json = r#"{"event": "STOP", "timestamp": {"seconds": 10, "microseconds": 0}}"#;
-        let msg: QmpMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            QmpMessage::Event(event) => {
-                assert_eq!(event.event, "STOP");
-                assert!(event.data.is_null());
-            }
-            other => panic!("expected Event, got {other:?}"),
-        }
+        let msg: qapi_qmp::QmpMessageAny = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(msg, QmpMessage::Event(qapi_qmp::Event::STOP { .. })),
+            "expected STOP event, got {msg:?}",
+        );
     }
+
+    // ── Event display ────────────────────────────────────────────────
 
     #[test]
     fn event_display_with_data() {
-        let event = QmpEvent {
-            event: "SHUTDOWN".into(),
-            data: serde_json::json!({"guest": true}),
-            timestamp: serde_json::Value::Null,
-        };
-        assert_eq!(format!("{event}"), r#"SHUTDOWN {"guest":true}"#);
+        let event: qapi_qmp::Event = serde_json::from_str(
+            r#"{"event": "SHUTDOWN", "data": {"guest": true, "reason": "guest-shutdown"}, "timestamp": {"seconds": 0, "microseconds": 0}}"#,
+        )
+        .unwrap();
+        let display = format!("{}", EventDisplay(&event));
+        assert!(
+            display.starts_with("SHUTDOWN"),
+            "expected display to start with SHUTDOWN, got: {display}",
+        );
+        // The typed data includes both `guest` and `reason` fields.
+        assert!(
+            display.contains("guest"),
+            "expected display to contain guest data, got: {display}",
+        );
     }
 
     #[test]
     fn event_display_without_data() {
-        let event = QmpEvent {
-            event: "STOP".into(),
-            data: serde_json::Value::Null,
-            timestamp: serde_json::Value::Null,
-        };
-        assert_eq!(format!("{event}"), "STOP");
+        let event: qapi_qmp::Event = serde_json::from_str(
+            r#"{"event": "STOP", "timestamp": {"seconds": 0, "microseconds": 0}}"#,
+        )
+        .unwrap();
+        // STOP carries no payload, so the display should be just the
+        // event name with no trailing data.
+        assert_eq!(format!("{}", EventDisplay(&event)), "STOP");
     }
+
+    // ── Message disambiguation ───────────────────────────────────────
 
     #[test]
     fn messages_deserialize_unambiguously() {
         // Verify that each message type deserializes to the correct
         // variant and does not accidentally match another variant.
         let return_json = r#"{"return": {"id": 1}}"#;
-        let error_json = r#"{"error": {"class": "X", "desc": "Y"}}"#;
-        let event_json = r#"{"event": "RESET", "timestamp": {"seconds": 0, "microseconds": 0}}"#;
+        let error_json = r#"{"error": {"class": "GenericError", "desc": "Y"}}"#;
+        let event_json = r#"{"event": "RESET", "data": {"guest": false, "reason": "host-qmp-system-reset"}, "timestamp": {"seconds": 0, "microseconds": 0}}"#;
 
+        match serde_json::from_str::<qapi_qmp::QmpMessageAny>(return_json).unwrap() {
+            QmpMessage::Response(r) => {
+                r.result().expect("return_json should be a success response");
+            }
+            other => panic!("expected Response for return_json, got {other:?}"),
+        }
+        match serde_json::from_str::<qapi_qmp::QmpMessageAny>(error_json).unwrap() {
+            QmpMessage::Response(r) => {
+                r.result().expect_err("error_json should be an error response");
+            }
+            other => panic!("expected Response for error_json, got {other:?}"),
+        }
         assert!(matches!(
-            serde_json::from_str::<QmpMessage>(return_json).unwrap(),
-            QmpMessage::Return { .. }
-        ));
-        assert!(matches!(
-            serde_json::from_str::<QmpMessage>(error_json).unwrap(),
-            QmpMessage::Error { .. }
-        ));
-        assert!(matches!(
-            serde_json::from_str::<QmpMessage>(event_json).unwrap(),
-            QmpMessage::Event(_)
+            serde_json::from_str::<qapi_qmp::QmpMessageAny>(event_json).unwrap(),
+            QmpMessage::Event(qapi_qmp::Event::RESET { .. }),
         ));
     }
 }

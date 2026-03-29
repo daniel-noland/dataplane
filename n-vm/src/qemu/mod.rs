@@ -69,7 +69,7 @@ use crate::backend::{HypervisorBackend, HypervisorVerdict, LaunchedHypervisor};
 use crate::error::VmError;
 use crate::vm::{TestVmParams, check_kvm_accessible, wait_for_socket};
 
-use self::qmp::{QmpConnection, QmpEvent, QmpEventStream, QmpWriter};
+use self::qmp::{EventDisplay, QmpConnection, QmpEventStream, QmpWriter};
 
 // ── Constants ────────────────────────────────────────────────────────
 //
@@ -174,13 +174,14 @@ pub struct QemuController {
 /// The [`Display`](std::fmt::Display) implementation produces one line per
 /// event in a human-readable format suitable for test failure diagnostics.
 #[derive(Debug, Default)]
-pub struct QemuEventLog(pub Vec<QmpEvent>);
+pub struct QemuEventLog(pub Vec<qapi_qmp::Event>);
 
 impl std::fmt::Display for QemuEventLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for event in &self.0 {
-            write!(f, "[{:?}] ", event.timestamp)?;
-            writeln!(f, "{event}")?;
+            let ts = event.timestamp();
+            write!(f, "[{ts:?}] ")?;
+            writeln!(f, "{}", EventDisplay(event))?;
         }
         Ok(())
     }
@@ -289,15 +290,17 @@ impl HypervisorBackend for Qemu {
 ///
 /// The verdict is computed by [`compute_verdict`] from the collected
 /// events and a flag tracking whether any stream-level errors occurred.
-async fn watch_events(mut stream: QmpEventStream) -> (Vec<QmpEvent>, HypervisorVerdict) {
+async fn watch_events(mut stream: QmpEventStream) -> (Vec<qapi_qmp::Event>, HypervisorVerdict) {
     let mut log = Vec::with_capacity(16);
     let mut had_errors = false;
 
     loop {
         match stream.next_event().await {
             Ok(Some(event)) => {
-                let is_shutdown = event.event == "SHUTDOWN";
-                let is_panic = event.event == "GUEST_PANICKED";
+                let is_shutdown =
+                    matches!(event, qapi_qmp::Event::SHUTDOWN { .. });
+                let is_panic =
+                    matches!(event, qapi_qmp::Event::GUEST_PANICKED { .. });
                 log.push(event);
 
                 if is_shutdown || is_panic {
@@ -327,7 +330,7 @@ async fn watch_events(mut stream: QmpEventStream) -> (Vec<QmpEvent>, HypervisorV
 ///
 /// This gives QEMU time to emit subsequent events (e.g. `SHUTDOWN`) that
 /// aid diagnosis.
-async fn drain_after_panic(stream: &mut QmpEventStream, log: &mut Vec<QmpEvent>) {
+async fn drain_after_panic(stream: &mut QmpEventStream, log: &mut Vec<qapi_qmp::Event>) {
     let deadline = tokio::time::sleep(POST_PANIC_DRAIN_TIMEOUT);
     tokio::pin!(deadline);
     loop {
@@ -361,19 +364,22 @@ async fn drain_after_panic(stream: &mut QmpEventStream, log: &mut Vec<QmpEvent>)
 /// 3. No stream-level errors occurred (indicated by `had_stream_errors`).
 ///
 /// Otherwise the verdict is [`Failure`](HypervisorVerdict::Failure).
-pub fn compute_verdict(events: &[QmpEvent], had_stream_errors: bool) -> HypervisorVerdict {
+pub fn compute_verdict(events: &[qapi_qmp::Event], had_stream_errors: bool) -> HypervisorVerdict {
     let mut tainted = had_stream_errors;
 
     for event in events {
-        if event.event == "SHUTDOWN" {
-            return if tainted {
-                HypervisorVerdict::Failure
-            } else {
-                HypervisorVerdict::CleanShutdown
-            };
-        }
-        if event.event == "GUEST_PANICKED" {
-            tainted = true;
+        match event {
+            qapi_qmp::Event::SHUTDOWN { .. } => {
+                return if tainted {
+                    HypervisorVerdict::Failure
+                } else {
+                    HypervisorVerdict::CleanShutdown
+                };
+            }
+            qapi_qmp::Event::GUEST_PANICKED { .. } => {
+                tainted = true;
+            }
+            _ => {}
         }
     }
 
@@ -961,15 +967,22 @@ mod tests {
     #[test]
     fn event_log_displays_one_line_per_event() {
         let log = QemuEventLog(vec![
-            QmpEvent {
-                event: "SHUTDOWN".into(),
-                data: serde_json::json!({"guest": true}),
-                timestamp: serde_json::json!({"seconds": 1, "microseconds": 0}),
+            qapi_qmp::Event::SHUTDOWN {
+                data: qapi_qmp::SHUTDOWN {
+                    guest: true,
+                    reason: qapi_qmp::ShutdownCause::guest_shutdown,
+                },
+                timestamp: serde_json::from_str(
+                    r#"{"seconds": 1, "microseconds": 0}"#,
+                )
+                .unwrap(),
             },
-            QmpEvent {
-                event: "STOP".into(),
-                data: serde_json::Value::Null,
-                timestamp: serde_json::json!({"seconds": 2, "microseconds": 0}),
+            qapi_qmp::Event::STOP {
+                data: qapi_qmp::STOP {},
+                timestamp: serde_json::from_str(
+                    r#"{"seconds": 2, "microseconds": 0}"#,
+                )
+                .unwrap(),
             },
         ]);
         let output = format!("{log}");
@@ -981,17 +994,41 @@ mod tests {
 
     // ── Verdict computation ──────────────────────────────────────────
 
-    fn event(name: &str) -> QmpEvent {
-        QmpEvent {
-            event: name.into(),
-            data: serde_json::Value::Null,
-            timestamp: serde_json::Value::Null,
+    /// A zero-valued timestamp for use in test events.
+    fn ts() -> qapi_spec::Timestamp {
+        serde_json::from_str(r#"{"seconds": 0, "microseconds": 0}"#).unwrap()
+    }
+
+    fn resume_event() -> qapi_qmp::Event {
+        qapi_qmp::Event::RESUME {
+            data: qapi_qmp::RESUME {},
+            timestamp: ts(),
+        }
+    }
+
+    fn shutdown_event() -> qapi_qmp::Event {
+        qapi_qmp::Event::SHUTDOWN {
+            data: qapi_qmp::SHUTDOWN {
+                guest: true,
+                reason: qapi_qmp::ShutdownCause::guest_shutdown,
+            },
+            timestamp: ts(),
+        }
+    }
+
+    fn panic_event() -> qapi_qmp::Event {
+        qapi_qmp::Event::GUEST_PANICKED {
+            data: qapi_qmp::GUEST_PANICKED {
+                action: qapi_qmp::GuestPanicAction::pause,
+                info: None,
+            },
+            timestamp: ts(),
         }
     }
 
     #[test]
     fn clean_shutdown_without_errors() {
-        let events = vec![event("RESUME"), event("SHUTDOWN")];
+        let events = vec![resume_event(), shutdown_event()];
         assert_eq!(
             compute_verdict(&events, false),
             HypervisorVerdict::CleanShutdown,
@@ -1000,29 +1037,25 @@ mod tests {
 
     #[test]
     fn shutdown_with_stream_errors_is_failure() {
-        let events = vec![event("RESUME"), event("SHUTDOWN")];
+        let events = vec![resume_event(), shutdown_event()];
         assert_eq!(compute_verdict(&events, true), HypervisorVerdict::Failure);
     }
 
     #[test]
     fn panic_before_shutdown_is_failure() {
-        let events = vec![
-            event("RESUME"),
-            event("GUEST_PANICKED"),
-            event("SHUTDOWN"),
-        ];
+        let events = vec![resume_event(), panic_event(), shutdown_event()];
         assert_eq!(compute_verdict(&events, false), HypervisorVerdict::Failure);
     }
 
     #[test]
     fn panic_without_shutdown_is_failure() {
-        let events = vec![event("RESUME"), event("GUEST_PANICKED")];
+        let events = vec![resume_event(), panic_event()];
         assert_eq!(compute_verdict(&events, false), HypervisorVerdict::Failure);
     }
 
     #[test]
     fn stream_ended_without_shutdown_is_failure() {
-        let events = vec![event("RESUME")];
+        let events = vec![resume_event()];
         assert_eq!(compute_verdict(&events, false), HypervisorVerdict::Failure);
     }
 
@@ -1033,11 +1066,7 @@ mod tests {
 
     #[test]
     fn events_after_shutdown_are_ignored_for_verdict() {
-        let events = vec![
-            event("RESUME"),
-            event("SHUTDOWN"),
-            event("GUEST_PANICKED"),
-        ];
+        let events = vec![resume_event(), shutdown_event(), panic_event()];
         assert_eq!(
             compute_verdict(&events, false),
             HypervisorVerdict::CleanShutdown,
