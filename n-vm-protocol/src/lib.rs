@@ -3,9 +3,9 @@
 //! This crate defines the implicit contract between the three tiers of the
 //! nested test environment:
 //!
-//! 1. **Host** — launches a Docker container via [`n-vm`](../n-vm).
-//! 2. **Container** — launches a cloud-hypervisor VM via [`n-vm`](../n-vm).
-//! 3. **VM guest** — runs an init system ([`n-it`](../n-it)) that spawns the
+//! 1. **Host** -- launches a Docker container via [`n-vm`](../n-vm).
+//! 2. **Container** -- launches a cloud-hypervisor VM via [`n-vm`](../n-vm).
+//! 3. **VM guest** -- runs an init system ([`n-it`](../n-it)) that spawns the
 //!    test binary.
 //!
 //! All magic numbers, filesystem paths, and environment variable names that
@@ -113,7 +113,7 @@ impl VsockCid {
     /// Panics if `cid` is 0 (`VMADDR_CID_HYPERVISOR`), 1
     /// (`VMADDR_CID_LOCAL`), or 2 (`VMADDR_CID_HOST`).  These CIDs have
     /// fixed kernel-level semantics and must not be used as arbitrary guest
-    /// identifiers — use the named constants [`Self::HYPERVISOR`],
+    /// identifiers -- use the named constants [`Self::HYPERVISOR`],
     /// [`Self::LOCAL`], or [`Self::HOST`] instead.
     #[must_use]
     pub const fn new(cid: u64) -> Self {
@@ -203,7 +203,7 @@ impl VsockChannel {
 
     /// Channel for the test process's **stderr**.
     ///
-    /// See [`TEST_STDOUT`](Self::TEST_STDOUT) for the general mechanism —
+    /// See [`TEST_STDOUT`](Self::TEST_STDOUT) for the general mechanism --
     /// this channel carries stderr instead of stdout, giving the host
     /// proper separation of the two streams.
     pub const TEST_STDERR: Self = Self {
