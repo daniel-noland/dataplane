@@ -62,7 +62,7 @@ impl InitSystem {
     /// configuration.
     ///
     /// Calls [`fatal!`] (which aborts the process) if any mount fails.
-    pub fn mount_essential_filesystems() -> Result<(), std::io::Error> {
+    pub fn mount_essential_filesystems() {
         /// Performs a single mount with security flags, aborting on failure.
         fn secure_mount(entry: &MountEntry) {
             let MountEntry { source, target, fstype, data } = entry;
@@ -87,7 +87,6 @@ impl InitSystem {
         }
 
         debug!("all essential filesystems mounted successfully");
-        Ok(())
     }
 
     /// Spawns the test binary as the main child process.
@@ -276,11 +275,19 @@ impl InitSystem {
         return Some(());
     }
 
+    /// Maximum number of `EBUSY` retries per mount point before giving up.
+    ///
+    /// At 1 ms per retry this gives each mount point up to ~1 second to
+    /// become idle — more than enough for well-behaved tests.
+    const UMOUNT_MAX_EBUSY_RETRIES: u32 = 1_000;
+
     /// Unmounts all [`ESSENTIAL_MOUNTS`] in reverse order.
     ///
     /// Syncs the filesystem before and after each unmount.  Uses
-    /// `MNT_DETACH` to handle busy mount points, retrying on `EBUSY`.
-    /// Calls [`fatal!`] on `EINVAL` or unexpected errors.
+    /// `MNT_DETACH` to handle busy mount points, retrying on `EBUSY` up
+    /// to [`Self::UMOUNT_MAX_EBUSY_RETRIES`] times per mount point.
+    /// Calls [`fatal!`] on `EINVAL`, unexpected errors, or if retries are
+    /// exhausted.
     #[tracing::instrument(level = "info")]
     pub fn unmount_filesystems() {
         debug!("syncing filesystems");
@@ -291,6 +298,7 @@ impl InitSystem {
         for mount_point in ESSENTIAL_MOUNTS.iter().rev().map(|e| e.target) {
             debug!("umounting {mount_point}");
             sync();
+            let mut attempts: u32 = 0;
             loop {
                 match nix::mount::umount2(
                     mount_point,
@@ -302,7 +310,18 @@ impl InitSystem {
                         break;
                     }
                     Err(Errno::EBUSY) => {
-                        warn!("{mount_point} can not be un-mounted yet: busy");
+                        attempts += 1;
+                        if attempts >= Self::UMOUNT_MAX_EBUSY_RETRIES {
+                            fatal!(
+                                "{mount_point} still busy after {attempts} retries; \
+                                 a leaked process is likely holding a file descriptor open"
+                            );
+                        }
+                        if attempts.is_multiple_of(100) {
+                            warn!(
+                                "{mount_point} still busy after {attempts} retries"
+                            );
+                        }
                         sync();
                         std::thread::sleep(Duration::from_millis(1));
                     }
@@ -406,8 +425,7 @@ impl InitSystem {
 
         // Mount essential filesystems
         match tokio::task::spawn_blocking(Self::mount_essential_filesystems).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => fatal!("failed to mount essential filesystems: {e}"),
+            Ok(()) => {}
             Err(e) => fatal!("mount filesystem task panicked: {e}"),
         }
 
@@ -514,10 +532,9 @@ impl InitSystem {
                 continue;
             };
             if ppid == 1 {
-                if pid > i32::MAX as u32 {
-                    fatal!("pid overflow");
-                }
-                children.push(Pid::from_raw(pid as i32));
+                let pid = i32::try_from(pid)
+                    .unwrap_or_else(|_| fatal!("child pid {pid} overflows i32"));
+                children.push(Pid::from_raw(pid));
             }
         }
         children
