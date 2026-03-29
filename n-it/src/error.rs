@@ -9,6 +9,7 @@
 //! deciding how to handle each error — typically by logging context and
 //! aborting via [`fatal!`].
 
+use n_vm_protocol::VsockChannel;
 use nix::errno::Errno;
 use nix::sys::signal::Signal;
 
@@ -86,8 +87,8 @@ pub enum SpawnError {
     /// Failed to connect a vsock stream for child I/O redirection.
     #[error("failed to connect {channel} vsock: {source}")]
     VsockConnect {
-        /// Human-readable channel label (e.g. `"stdout"`, `"stderr"`).
-        channel: &'static str,
+        /// The vsock channel that could not be connected.
+        channel: VsockChannel,
         /// The underlying I/O error.
         source: std::io::Error,
     },
