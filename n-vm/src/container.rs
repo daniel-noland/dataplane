@@ -111,7 +111,7 @@ struct ContainerParams {
     /// GIDs of the groups that own the required device nodes and the Docker
     /// socket.  These are added via `--group-add` so the container process
     /// can access the devices without running as root.
-    device_groups: Vec<String>,
+    device_groups: Vec<nix::unistd::Gid>,
 }
 
 impl ContainerParams {
@@ -182,7 +182,7 @@ impl ContainerParams {
     ///
     /// Returns [`ContainerError::DeviceNotAccessible`] if any required
     /// device or the Docker socket cannot be `stat`'d.
-    fn resolve_device_groups() -> Result<Vec<String>, ContainerError> {
+    fn resolve_device_groups() -> Result<Vec<nix::unistd::Gid>, ContainerError> {
         use std::os::unix::fs::MetadataExt;
 
         // Resolve the Docker socket path from DOCKER_HOST, if it points
@@ -213,11 +213,11 @@ impl ContainerParams {
             .chain(docker_socket_path)
             .collect();
 
-        let mut groups: Vec<String> = required_files
+        let mut groups: Vec<nix::unistd::Gid> = required_files
             .iter()
             .map(|path| {
                 std::fs::metadata(path)
-                    .map(|m| m.gid().to_string())
+                    .map(|m| nix::unistd::Gid::from_raw(m.gid()))
                     .map_err(|source| ContainerError::DeviceNotAccessible {
                         path: PathBuf::from(path),
                         source,
@@ -225,8 +225,8 @@ impl ContainerParams {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        groups.sort_unstable();
-        groups.dedup();
+        groups.sort_unstable_by_key(|g| g.as_raw());
+        groups.dedup_by_key(|g| g.as_raw());
         Ok(groups)
     }
 
@@ -279,7 +279,9 @@ impl ContainerParams {
             user: Some(format!("{uid}:{gid}", uid = self.uid.as_raw(), gid = self.gid.as_raw())),
             host_config: Some(HostConfig {
                 devices: Some(Self::build_device_mappings()),
-                group_add: Some(self.device_groups.clone()),
+                group_add: Some(
+                    self.device_groups.iter().map(|g| g.as_raw().to_string()).collect(),
+                ),
                 init: Some(true),
                 network_mode: Some("none".into()),
                 restart_policy: Some(RestartPolicy {
