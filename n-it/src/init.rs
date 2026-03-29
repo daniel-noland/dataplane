@@ -74,7 +74,11 @@ impl InitSystem {
             Err(e) => fatal!("failed to start test process: {e}"),
         };
         let pid = match test_child.id() {
-            Some(id) => Pid::from_raw(id as i32),
+            Some(id) => {
+                let id = i32::try_from(id)
+                    .unwrap_or_else(|_| fatal!("child PID {id} overflows i32"));
+                Pid::from_raw(id)
+            }
             None => fatal!("unable to determine PID of spawned test process"),
         };
 
