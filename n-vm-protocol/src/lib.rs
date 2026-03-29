@@ -49,6 +49,66 @@ pub const ENV_MARKER_VALUE: &str = "YES";
 
 // ── Vsock ────────────────────────────────────────────────────────────
 
+/// A vsock port number.
+///
+/// This newtype prevents accidentally passing an arbitrary [`u32`] (such as
+/// a GID, file descriptor, or CID) where a vsock port is expected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VsockPort(u32);
+
+impl VsockPort {
+    /// Creates a new [`VsockPort`] from a raw port number.
+    #[must_use]
+    pub const fn new(port: u32) -> Self {
+        Self(port)
+    }
+
+    /// Returns the raw `u32` port number.
+    ///
+    /// Use this at API boundaries that require a bare integer (e.g.
+    /// [`vsock::VsockAddr::new`]).
+    #[must_use]
+    pub const fn as_raw(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for VsockPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A vsock context identifier (CID).
+///
+/// This newtype prevents accidentally passing an arbitrary [`u64`] (such as
+/// a byte count or timeout) where a vsock CID is expected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VsockCid(u64);
+
+impl VsockCid {
+    /// Creates a new [`VsockCid`] from a raw CID value.
+    #[must_use]
+    pub const fn new(cid: u64) -> Self {
+        Self(cid)
+    }
+
+    /// Returns the raw `u64` CID value.
+    ///
+    /// Use this at API boundaries that require a bare integer (e.g.
+    /// cloud-hypervisor's [`VsockConfig`]).
+    #[must_use]
+    pub const fn as_raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for VsockCid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// A typed vsock communication channel between the VM guest and the
 /// container host.
 ///
@@ -77,13 +137,13 @@ pub const ENV_MARKER_VALUE: &str = "YES";
 ///
 /// ```ignore
 /// use tokio_vsock::VMADDR_CID_HOST;
-/// let addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDOUT.port);
+/// let addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDOUT.port.as_raw());
 /// let stream = vsock::VsockStream::connect(&addr)?;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VsockChannel {
     /// The vsock port number for this channel.
-    pub port: u32,
+    pub port: VsockPort,
     /// A human-readable label used in log messages and error reports.
     pub label: &'static str,
 }
@@ -95,7 +155,7 @@ impl VsockChannel {
     /// streams structured [`tracing`] output so that the container tier
     /// can include it in [`VmTestOutput::init_trace`](../n_vm/struct.VmTestOutput.html).
     pub const INIT_TRACE: Self = Self {
-        port: 123_456,
+        port: VsockPort::new(123_456),
         label: "init-trace",
     };
 
@@ -106,7 +166,7 @@ impl VsockChannel {
     /// binds a Unix listener at [`listener_path`](Self::listener_path)
     /// *before* booting the VM so that the connection succeeds immediately.
     pub const TEST_STDOUT: Self = Self {
-        port: 123_457,
+        port: VsockPort::new(123_457),
         label: "test-stdout",
     };
 
@@ -116,7 +176,7 @@ impl VsockChannel {
     /// this channel carries stderr instead of stdout, giving the host
     /// proper separation of the two streams.
     pub const TEST_STDERR: Self = Self {
-        port: 123_458,
+        port: VsockPort::new(123_458),
         label: "test-stderr",
     };
 
@@ -127,18 +187,18 @@ impl VsockChannel {
     /// vsock port that a guest connects to.  The host-side listener must
     /// bind to this path *before* the VM boots.
     pub fn listener_path(&self) -> PathBuf {
-        PathBuf::from(format!("{VHOST_VSOCK_SOCKET_PATH}_{}", self.port))
+        PathBuf::from(format!("{VHOST_VSOCK_SOCKET_PATH}_{}", self.port.as_raw()))
     }
 }
 
 impl std::fmt::Display for VsockChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} (vsock port {})", self.label, self.port)
+        write!(f, "{} (vsock port {})", self.label, self.port.as_raw())
     }
 }
 
 /// The vsock context identifier (CID) assigned to the VM guest.
-pub const VM_GUEST_CID: u64 = 3;
+pub const VM_GUEST_CID: VsockCid = VsockCid::new(3);
 
 // ── Filesystem paths (inside the container / VM working directory) ───
 
