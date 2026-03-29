@@ -360,113 +360,156 @@ pub struct TestVmParams<'a> {
     pub test_name: &'a str,
 }
 
+/// Builds the kernel payload configuration, including the kernel command
+/// line that passes the test binary path and name to the init system.
+fn build_payload_config(params: &TestVmParams<'_>) -> PayloadConfig {
+    PayloadConfig {
+        firmware: None,
+        kernel: Some(KERNEL_IMAGE_PATH.into()),
+        cmdline: Some(format!(
+            "iommu=on \
+             intel_iommu=on \
+             amd_iommu=on \
+             vfio.enable_unsafe_noiommu_mode=1 \
+             earlyprintk=ttyS0 \
+             console=ttyS0 \
+             ro \
+             rootfstype=virtiofs \
+             root=root \
+             default_hugepagesz=2M \
+             hugepagesz=2M \
+             hugepages=16 \
+             init={INIT_BINARY_PATH} \
+             -- {full_bin_path} {test_name} --exact --no-capture --format=terse",
+            full_bin_path = params.full_bin_path,
+            test_name = params.test_name,
+        )),
+        ..Default::default()
+    }
+}
+
+/// Builds the CPU topology: 6 vCPUs arranged as 3 dies × 1 core × 2 threads.
+fn build_cpu_config() -> CpusConfig {
+    CpusConfig {
+        boot_vcpus: 6,
+        max_vcpus: 6,
+        topology: Some(CpuTopology {
+            threads_per_core: Some(2),
+            cores_per_die: Some(1),
+            dies_per_package: Some(3),
+            packages: Some(1),
+        }),
+        ..Default::default()
+    }
+}
+
+/// Builds the memory configuration: 512 MiB with 2 MiB hugepages.
+fn build_memory_config() -> MemoryConfig {
+    MemoryConfig {
+        size: 512 * 1024 * 1024, // 512 MiB
+        mergeable: Some(true),
+        shared: Some(true),
+        hugepages: Some(true),
+        hugepage_size: Some(2 * 1024 * 1024), // 2 MiB
+        thp: Some(true),
+        ..Default::default()
+    }
+}
+
+/// Builds the network interface configurations.
+///
+/// Returns three interfaces:
+/// - **mgmt** — management network on PCI segment 0 (1500 MTU).
+/// - **fabric1** / **fabric2** — fabric-facing interfaces on PCI segment 1
+///   (9500 MTU jumbo frames).
+fn build_network_configs() -> Vec<NetConfig> {
+    vec![
+        NetConfig {
+            tap: Some("mgmt".into()),
+            ip: Some("fe80::ffff:1".into()),
+            mask: Some("ffff:ffff:ffff:ffff::".into()),
+            mac: Some("02:DE:AD:BE:EF:01".into()),
+            mtu: Some(1500),
+            id: Some("mgmt".into()),
+            pci_segment: Some(0),
+            queue_size: Some(512),
+            ..Default::default()
+        },
+        NetConfig {
+            tap: Some("fabric1".into()),
+            ip: Some("fe80::1".into()),
+            mask: Some("ffff:ffff:ffff:ffff::".into()),
+            mac: Some("02:CA:FE:BA:BE:01".into()),
+            mtu: Some(9500),
+            id: Some("fabric1".into()),
+            pci_segment: Some(1),
+            queue_size: Some(8192),
+            ..Default::default()
+        },
+        NetConfig {
+            tap: Some("fabric2".into()),
+            ip: Some("fe80::2".into()),
+            mask: Some("ffff:ffff:ffff:ffff::".into()),
+            mac: Some("02:CA:FE:BA:BE:02".into()),
+            mtu: Some(9500),
+            id: Some("fabric2".into()),
+            pci_segment: Some(1),
+            queue_size: Some(8192),
+            ..Default::default()
+        },
+    ]
+}
+
+/// Builds the virtiofs filesystem configuration for sharing the container
+/// filesystem into the VM.
+fn build_fs_config() -> Vec<FsConfig> {
+    vec![FsConfig {
+        tag: VIRTIOFS_ROOT_TAG.into(),
+        socket: VIRTIOFSD_SOCKET_PATH.into(),
+        num_queues: 1,
+        queue_size: 1024,
+        id: Some(VIRTIOFS_ROOT_TAG.into()),
+        ..Default::default()
+    }]
+}
+
+/// Builds the platform metadata configuration, embedding the test binary
+/// name and test name in OEM strings for identification.
+fn build_platform_config(params: &TestVmParams<'_>) -> PlatformConfig {
+    PlatformConfig {
+        serial_number: Some("dataplane-test".into()),
+        uuid: Some("dff9c8dd-492d-4148-a007-7931f94db852".into()), // arbitrary uuid4
+        oem_strings: Some(vec![
+            format!("exe={}", params.bin_name),
+            format!("test={}", params.test_name),
+        ]),
+        num_pci_segments: Some(2),
+        ..Default::default()
+    }
+}
+
 /// Builds the cloud-hypervisor [`VmConfig`] for a test run.
 ///
-/// This function separates the **what** (infrastructure defaults such as
-/// CPU topology, memory size, network layout) from the **where** (test
-/// binary path, test name) so that the lifecycle code in [`TestVm`] stays
-/// focused on resource management.
+/// This function composes the VM configuration from focused sub-builders,
+/// each responsible for a single aspect of the configuration (payload, CPU,
+/// memory, network, filesystem, platform).  The sub-builders can be tested
+/// and evolved independently.
 ///
 /// The virtio-console is disabled (`Mode::Off`) because test stdout/stderr
 /// are forwarded via dedicated [`VsockChannel`]s instead.
 fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
-    let TestVmParams {
-        full_bin_path,
-        bin_name,
-        test_name,
-    } = params;
-
     VmConfig {
-        payload: PayloadConfig {
-            firmware: None,
-            kernel: Some(KERNEL_IMAGE_PATH.into()),
-            cmdline: Some(format!(
-                "iommu=on \
-                 intel_iommu=on \
-                 amd_iommu=on \
-                 vfio.enable_unsafe_noiommu_mode=1 \
-                 earlyprintk=ttyS0 \
-                 console=ttyS0 \
-                 ro \
-                 rootfstype=virtiofs \
-                 root=root \
-                 default_hugepagesz=2M \
-                 hugepagesz=2M \
-                 hugepages=16 \
-                 init={INIT_BINARY_PATH} \
-                 -- {full_bin_path} {test_name} --exact --no-capture --format=terse"
-            )),
-            ..Default::default()
-        },
+        payload: build_payload_config(params),
         vsock: Some(VsockConfig {
             cid: VM_GUEST_CID as _,
             socket: VHOST_VSOCK_SOCKET_PATH.into(),
             pci_segment: Some(0),
             ..Default::default()
         }),
-        cpus: Some(CpusConfig {
-            boot_vcpus: 6,
-            max_vcpus: 6,
-            topology: Some(CpuTopology {
-                threads_per_core: Some(2),
-                cores_per_die: Some(1),
-                dies_per_package: Some(3),
-                packages: Some(1),
-            }),
-            ..Default::default()
-        }),
-        memory: Some(MemoryConfig {
-            size: 512 * 1024 * 1024, // 512 MiB
-            mergeable: Some(true),
-            shared: Some(true),
-            hugepages: Some(true),
-            hugepage_size: Some(2 * 1024 * 1024), // 2 MiB
-            thp: Some(true),
-            ..Default::default()
-        }),
-        net: Some(vec![
-            NetConfig {
-                tap: Some("mgmt".into()),
-                ip: Some("fe80::ffff:1".into()),
-                mask: Some("ffff:ffff:ffff:ffff::".into()),
-                mac: Some("02:DE:AD:BE:EF:01".into()),
-                mtu: Some(1500),
-                id: Some("mgmt".into()),
-                pci_segment: Some(0),
-                queue_size: Some(512),
-                ..Default::default()
-            },
-            NetConfig {
-                tap: Some("fabric1".into()),
-                ip: Some("fe80::1".into()),
-                mask: Some("ffff:ffff:ffff:ffff::".into()),
-                mac: Some("02:CA:FE:BA:BE:01".into()),
-                mtu: Some(9500),
-                id: Some("fabric1".into()),
-                pci_segment: Some(1),
-                queue_size: Some(8192),
-                ..Default::default()
-            },
-            NetConfig {
-                tap: Some("fabric2".into()),
-                ip: Some("fe80::2".into()),
-                mask: Some("ffff:ffff:ffff:ffff::".into()),
-                mac: Some("02:CA:FE:BA:BE:02".into()),
-                mtu: Some(9500),
-                id: Some("fabric2".into()),
-                pci_segment: Some(1),
-                queue_size: Some(8192),
-                ..Default::default()
-            },
-        ]),
-        fs: Some(vec![FsConfig {
-            tag: VIRTIOFS_ROOT_TAG.into(),
-            socket: VIRTIOFSD_SOCKET_PATH.into(),
-            num_queues: 1,
-            queue_size: 1024,
-            id: Some(VIRTIOFS_ROOT_TAG.into()),
-            ..Default::default()
-        }]),
+        cpus: Some(build_cpu_config()),
+        memory: Some(build_memory_config()),
+        net: Some(build_network_configs()),
+        fs: Some(build_fs_config()),
         // The virtio-console is disabled: test stdout/stderr travel over
         // dedicated VsockChannels (TEST_STDOUT / TEST_STDERR).
         console: Some(ConsoleConfig::new(Mode::Off)),
@@ -477,16 +520,7 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
         }),
         iommu: Some(false),
         watchdog: Some(true),
-        platform: Some(PlatformConfig {
-            serial_number: Some("dataplane-test".into()),
-            uuid: Some("dff9c8dd-492d-4148-a007-7931f94db852".into()), // arbitrary uuid4
-            oem_strings: Some(vec![
-                format!("exe={bin_name}"),
-                format!("test={test_name}"),
-            ]),
-            num_pci_segments: Some(2),
-            ..Default::default()
-        }),
+        platform: Some(build_platform_config(params)),
         pvpanic: Some(true),
         landlock_enable: Some(true),
         landlock_rules: Some(vec![LandlockConfig {
