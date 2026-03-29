@@ -23,6 +23,7 @@
 //! JSON stream decoder and the [`events::watch`] function that consumes
 //! the event stream.
 
+pub mod error;
 pub(crate) mod events;
 
 use std::os::unix::io::RawFd;
@@ -46,8 +47,9 @@ use tracing::debug;
 use crate::abort_on_drop::AbortOnDrop;
 use crate::backend::{HypervisorBackend, LaunchedHypervisor};
 use crate::error::VmError;
-
 use crate::vm::{TestVmParams, wait_for_socket};
+
+use self::error::CloudHypervisorError;
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -124,6 +126,14 @@ impl std::fmt::Display for CloudHypervisorEventLog {
     }
 }
 
+// ── Error conversion ─────────────────────────────────────────────────
+
+impl From<CloudHypervisorError> for VmError {
+    fn from(err: CloudHypervisorError) -> Self {
+        VmError::Backend(Box::new(err))
+    }
+}
+
 // ── HypervisorBackend ────────────────────────────────────────────────
 
 impl HypervisorBackend for CloudHypervisor {
@@ -146,7 +156,7 @@ impl HypervisorBackend for CloudHypervisor {
             .await
             .create_vm(config)
             .await
-            .map_err(|e| VmError::VmCreate {
+            .map_err(|e| CloudHypervisorError::VmCreate {
                 reason: format!("{e:?}"),
             })?;
 
@@ -160,7 +170,7 @@ impl HypervisorBackend for CloudHypervisor {
             .await
             .boot_vm()
             .await
-            .map_err(|e| VmError::VmBoot {
+            .map_err(|e| CloudHypervisorError::VmBoot {
                 reason: format!("{e:?}"),
             })?;
 
@@ -196,10 +206,10 @@ impl HypervisorBackend for CloudHypervisor {
 async fn spawn_hypervisor_process()
 -> Result<(tokio::process::Child, tokio::net::unix::pipe::Receiver), VmError> {
     let (event_sender, event_receiver) =
-        tokio::net::unix::pipe::pipe().map_err(VmError::EventPipe)?;
+        tokio::net::unix::pipe::pipe().map_err(CloudHypervisorError::EventPipe)?;
     let event_sender = event_sender
         .into_blocking_fd()
-        .map_err(VmError::EventSenderFd)?;
+        .map_err(CloudHypervisorError::EventSenderFd)?;
 
     match tokio::fs::try_exists("/dev/kvm").await {
         Ok(true) => {}
@@ -229,7 +239,7 @@ async fn spawn_hypervisor_process()
             parent_fd: event_sender,
             child_fd: EVENT_MONITOR_FD,
         }])
-        .map_err(|e| VmError::FdMapping(format!("{e:?}")))?
+        .map_err(|e| CloudHypervisorError::FdMapping(format!("{e:?}")))?
         .spawn()
         .map_err(VmError::HypervisorSpawn)?;
 
@@ -239,7 +249,7 @@ async fn spawn_hypervisor_process()
     event_receiver
         .readable()
         .await
-        .map_err(VmError::EventMonitorNotReadable)?;
+        .map_err(CloudHypervisorError::EventMonitorNotReadable)?;
     wait_for_socket(HYPERVISOR_API_SOCKET_PATH).await?;
 
     Ok((hypervisor, event_receiver))

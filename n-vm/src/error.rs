@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Open Network Fabric Authors
+
 //! Dedicated error types for the `n-vm` test infrastructure.
 //!
 //! These replace the bare `.expect()` / `panic!()` calls that previously
@@ -13,16 +16,31 @@
 //! - [`ContainerError`] -- failures in the **host -> container** tier
 //!   ([`run_test_in_vm`](crate::run_test_in_vm)).
 //!
-//! Cloud-hypervisor API errors are captured as `String` descriptions
-//! because the generated client crate's error types do not implement
-//! [`std::error::Error`].  Per project guidelines this is acceptable
-//! when imposed by an external framework.
+//! `VmError` contains only variants that are common to every hypervisor
+//! backend (process spawning, socket polling, vsock, virtiofsd, etc.).
+//! Backend-specific errors (e.g. cloud-hypervisor's event-monitor pipe or
+//! REST API failures) are represented by the [`Backend`](VmError::Backend)
+//! variant, which wraps a `Box<dyn Error>`.  Each backend module defines
+//! its own error enum (e.g.
+//! [`CloudHypervisorError`](crate::cloud_hypervisor::error::CloudHypervisorError))
+//! that is boxed into this variant at the [`HypervisorBackend::launch`]
+//! call site.
+//!
+//! [`HypervisorBackend::launch`]: crate::backend::HypervisorBackend::launch
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Errors that can occur while launching or managing a cloud-hypervisor VM
-/// in the container tier.
+/// Errors that can occur while launching or managing a VM in the
+/// container tier.
+///
+/// This enum covers failure modes common to **all** hypervisor backends:
+/// binary-path resolution, virtiofsd spawning, vsock listener binding,
+/// KVM accessibility, hypervisor process spawning, and socket polling.
+///
+/// Backend-specific errors are wrapped in the [`Backend`](Self::Backend)
+/// variant so that [`VmError`] does not need to know about any particular
+/// hypervisor's internals.
 ///
 /// Returned by [`TestVm::launch`](crate::vm::TestVm::launch) and
 /// [`run_in_vm`](crate::run_in_vm).
@@ -67,39 +85,28 @@ pub enum VmError {
         source: std::io::Error,
     },
 
-    /// The event-monitor pipe between the host and cloud-hypervisor could
-    /// not be created.
-    #[error("failed to create event monitor pipe")]
-    EventPipe(#[source] std::io::Error),
-
-    /// The event-monitor pipe sender could not be converted to a blocking
-    /// file descriptor for fd-mapping into the hypervisor process.
-    #[error("failed to convert event monitor sender to blocking fd")]
-    EventSenderFd(#[source] std::io::Error),
-
     /// `/dev/kvm` is missing or inaccessible inside the container.
+    ///
+    /// Both cloud-hypervisor and QEMU require KVM for hardware-accelerated
+    /// virtualisation.  This error is raised during the pre-flight check
+    /// before the hypervisor process is spawned.
     #[error("/dev/kvm is not accessible")]
     KvmNotAccessible(#[source] std::io::Error),
 
-    /// File-descriptor mapping for the cloud-hypervisor child process
-    /// failed (e.g. the `command-fds` crate detected an fd collision).
+    /// The hypervisor binary could not be spawned.
     ///
-    /// The inner value is a stringified `command_fds::FdMappingCollision`
-    /// because that type does not implement [`std::error::Error`].
-    #[error("failed to set up fd mappings for cloud-hypervisor: {0}")]
-    FdMapping(String),
-
-    /// The cloud-hypervisor binary could not be spawned.
-    #[error("failed to spawn cloud-hypervisor")]
+    /// This is the `Command::spawn()` call for whatever hypervisor binary
+    /// the active backend uses (e.g. `cloud-hypervisor`, `qemu-system-x86_64`).
+    #[error("failed to spawn hypervisor process")]
     HypervisorSpawn(#[source] std::io::Error),
-
-    /// The event-monitor pipe was not readable after the hypervisor
-    /// process started, indicating the VMM did not emit its initial event.
-    #[error("event monitor pipe not readable after hypervisor start")]
-    EventMonitorNotReadable(#[source] std::io::Error),
 
     /// A required socket did not appear on the filesystem within the
     /// polling timeout.
+    ///
+    /// Several sockets (API socket, virtiofsd socket, etc.) are created
+    /// asynchronously by child processes.  This error means the polling
+    /// loop in [`wait_for_socket`](crate::vm::wait_for_socket) exhausted
+    /// its retry budget without finding the socket.
     #[error("timed out waiting for socket {path:?} after {timeout:?}")]
     SocketTimeout {
         /// The socket path that was being polled.
@@ -118,19 +125,21 @@ pub enum VmError {
         source: std::io::Error,
     },
 
-    /// The cloud-hypervisor API rejected the `create_vm` request.
-    #[error("failed to create VM via hypervisor API: {reason}")]
-    VmCreate {
-        /// Stringified error from the cloud-hypervisor API client.
-        reason: String,
-    },
-
-    /// The cloud-hypervisor API rejected the `boot_vm` request.
-    #[error("failed to boot VM via hypervisor API: {reason}")]
-    VmBoot {
-        /// Stringified error from the cloud-hypervisor API client.
-        reason: String,
-    },
+    /// A backend-specific error occurred during the hypervisor launch
+    /// sequence.
+    ///
+    /// Each [`HypervisorBackend`](crate::backend::HypervisorBackend)
+    /// implementation defines its own error type covering failure modes
+    /// unique to that hypervisor (e.g. cloud-hypervisor's event-monitor
+    /// pipe setup, REST API calls; QEMU's QMP handshake, etc.).  Those
+    /// errors are boxed into this variant so that [`VmError`] remains
+    /// backend-agnostic.
+    ///
+    /// The full error chain is preserved through the
+    /// [`source()`](std::error::Error::source) method on the inner error,
+    /// so `{err:#?}` formatting will show the complete chain.
+    #[error(transparent)]
+    Backend(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Errors that can occur while launching or managing a Docker container
