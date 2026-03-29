@@ -405,10 +405,14 @@ pub mod test {
         println!("{rendered}");
     }
 
-    #[ignore = "temporarily disabled during vm test runner refactor"]
     #[n_vm::in_vm]
-    #[tokio::test]
-    async fn test_sample_config() {
+    #[test]
+    fn test_sample_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime for test_sample_config");
+        rt.block_on(async {
         get_trace_ctl()
             .setup_from_string("cpi=debug,mgmt=debug,routing=debug")
             .unwrap();
@@ -494,5 +498,6 @@ pub mod test {
         /* stop the router */
         debug!("Stopping the router...");
         router.stop();
+        }); // rt.block_on
     }
 }
