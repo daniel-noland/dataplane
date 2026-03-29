@@ -277,7 +277,8 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
                  default_hugepagesz=2M \
                  hugepagesz=2M \
                  hugepages=16 \
-                 init={INIT_BINARY_PATH} {full_bin_path} {test_name} --exact --no-capture --format=terse"
+                 init={INIT_BINARY_PATH} \
+                 -- {full_bin_path} {test_name} --exact --no-capture --format=terse"
             )),
             ..Default::default()
         },
