@@ -58,8 +58,6 @@ use crate::abort_on_drop::AbortOnDrop;
 use crate::error::VmError;
 use crate::hypervisor::{self, HypervisorVerdict};
 
-// ── Constants ────────────────────────────────────────────────────────
-
 /// Maximum number of poll iterations before giving up on a socket.
 const SOCKET_POLL_MAX_ATTEMPTS: u32 = 100;
 
@@ -74,8 +72,6 @@ const VSOCK_READER_CAPACITY: usize = 32_768;
 /// This is the child-side fd that cloud-hypervisor writes events to.
 /// It must match the `--event-monitor fd=N` argument.
 const EVENT_MONITOR_FD: RawFd = 3;
-
-// ── VM configuration constants ───────────────────────────────────────
 
 /// Total guest memory in bytes (512 MiB).
 const VM_MEMORY_BYTES: i64 = 512 * 1024 * 1024;
@@ -100,8 +96,6 @@ const FABRIC_QUEUE_SIZE: i32 = 8192;
 
 /// Virtio queue depth for the virtiofs filesystem device.
 const VIRTIOFS_QUEUE_SIZE: i32 = 1024;
-
-// ── Helper: socket polling ───────────────────────────────────────────
 
 /// Polls the filesystem until `path` exists, returning an error on timeout
 /// or I/O failure.
@@ -131,8 +125,6 @@ async fn wait_for_socket(path: impl AsRef<Path>) -> Result<(), VmError> {
     })
 }
 
-// ── Helper: process output collection ────────────────────────────────
-
 /// Collected stdout and stderr from a child process.
 ///
 /// This replaces the previous `(bool, String, String)` tuple return from
@@ -154,8 +146,6 @@ pub struct ProcessOutput {
 }
 
 impl ProcessOutput {
-    // ── Construction ─────────────────────────────────────────────────
-
     /// Waits for a child process to exit and collects its stdout/stderr as
     /// UTF-8 strings.
     ///
@@ -199,8 +189,6 @@ impl ProcessOutput {
         }
     }
 
-    // ── Formatting ───────────────────────────────────────────────────
-
     /// Formats the stdout and stderr sections with the given label prefix
     /// for inclusion in [`VmTestOutput`]'s `Display` output.
     fn fmt_sections(&self, f: &mut std::fmt::Formatter<'_>, label: &str) -> std::fmt::Result {
@@ -210,8 +198,6 @@ impl ProcessOutput {
         writeln!(f, "{}", self.stderr)
     }
 }
-
-// ── VM config factory ────────────────────────────────────────────────
 
 /// Parameters that vary per test invocation and feed into the VM
 /// configuration.
@@ -236,8 +222,6 @@ pub struct TestVmParams<'a> {
 }
 
 impl<'a> TestVmParams<'a> {
-    // ── Configuration building ───────────────────────────────────────
-
     /// Builds the kernel payload configuration, including the kernel
     /// command line that passes the test binary path and name to the init
     /// system.
@@ -412,8 +396,6 @@ impl<'a> TestVmParams<'a> {
     }
 }
 
-// ── VmTestOutput ─────────────────────────────────────────────────────
-
 /// Collected output from a test that ran inside a VM.
 ///
 /// This struct aggregates all observable output from the three-tier test
@@ -474,8 +456,6 @@ impl std::fmt::Display for VmTestOutput {
     }
 }
 
-// ── TestVm ───────────────────────────────────────────────────────────
-
 /// Owns all long-lived resources for a running test VM.
 ///
 /// The two-phase API ([`launch`](Self::launch) -> [`collect`](Self::collect))
@@ -518,8 +498,6 @@ pub struct TestVm {
 }
 
 impl TestVm {
-    // ── Process spawning ─────────────────────────────────────────────
-
     /// Binds a Unix listener for the given [`VsockChannel`], then spawns a
     /// task that accepts a single connection and reads it to EOF.
     ///
@@ -677,8 +655,6 @@ impl TestVm {
         })
     }
 
-    // ── Lifecycle ────────────────────────────────────────────────────
-
     /// Prepares the environment and boots the VM.
     ///
     /// This method orchestrates five focused phases, each delegated to an
@@ -700,20 +676,15 @@ impl TestVm {
     /// automatically aborted when their handles drop.  Child processes use
     /// `kill_on_drop(true)` for the same guarantee.
     pub async fn launch(params: &TestVmParams<'_>) -> Result<Self, VmError> {
-        // ── Phase 1: Launch virtiofsd ────────────────────────────────
         let virtiofsd = Self::launch_virtiofsd(VM_ROOT_SHARE_PATH).await?;
-
-        // ── Phase 2: Bind vsock listeners ────────────────────────────
         // All listeners must be bound *before* the VM boots so that the
         // guest-side vsock connections succeed immediately.
         let init_trace = Self::spawn_vsock_reader(&VsockChannel::INIT_TRACE)?;
         let test_stdout = Self::spawn_vsock_reader(&VsockChannel::TEST_STDOUT)?;
         let test_stderr = Self::spawn_vsock_reader(&VsockChannel::TEST_STDERR)?;
 
-        // ── Phase 3: Spawn cloud-hypervisor ──────────────────────────
         let (hypervisor, event_receiver) = Self::spawn_hypervisor().await?;
 
-        // ── Phase 4: Create and boot the VM ──────────────────────────
         let config = params.build_vm_config();
 
         let client = Arc::new(tokio::sync::Mutex::new(
@@ -740,7 +711,6 @@ impl TestVm {
                 reason: format!("{e:?}"),
             })?;
 
-        // ── Phase 5: Start kernel console reader ─────────────────────
         let kernel_log = Self::spawn_kernel_log_reader();
 
         Ok(Self {
@@ -784,7 +754,6 @@ impl TestVm {
         let test_stderr = test_stderr.into_inner();
         let kernel_log = kernel_log.into_inner();
 
-        // ── Collect vsock / task output ──────────────────────────────
         // The vsock readers complete when the guest-side streams close
         // (test process exits -> stdout/stderr close; n-it exits ->
         // init_trace closes).
@@ -803,7 +772,6 @@ impl TestVm {
             }
         };
 
-        // ── Shut down ────────────────────────────────────────────────
         // Best-effort shutdown BEFORE waiting for the hypervisor process
         // to exit.  In the normal path the VM has already powered off
         // (n-it calls reboot(RB_POWER_OFF) or aborts), so these calls
@@ -825,8 +793,6 @@ impl TestVm {
 
         let virtiofsd_output = ProcessOutput::from_child(virtiofsd, "virtiofsd").await;
 
-        // ── Assemble result ──────────────────────────────────────────
-        //
         // The Rust test harness (invoked with `--format=terse`) writes a
         // summary line to stdout:
         //
@@ -865,8 +831,6 @@ impl TestVm {
     }
 }
 
-// ── run_in_vm ────────────────────────────────────────────────────────
-
 /// Boots a cloud-hypervisor VM and runs the test function inside it.
 ///
 /// This is the **container-tier** entry point, called from the code generated
@@ -885,7 +849,6 @@ impl TestVm {
 /// Output collection is best-effort and never fails -- see
 /// [`TestVm::collect`].
 pub async fn run_in_vm<F: FnOnce()>(_: F) -> Result<VmTestOutput, VmError> {
-    // ── Resolve test identity ────────────────────────────────────────
     let identity = crate::test_identity::TestIdentity::resolve::<F>();
     let test_name = identity.test_name;
 
@@ -907,8 +870,6 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> Result<VmTestOutput, VmError> {
     Ok(vm.collect().await)
 }
 
-// ── Tests ────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,8 +883,6 @@ mod tests {
             test_name: "tests::my_test",
         }
     }
-
-    // ── Payload ──────────────────────────────────────────────────────
 
     #[test]
     fn payload_config_uses_kernel_image_path() {
@@ -995,8 +954,6 @@ mod tests {
         );
     }
 
-    // ── CPU ──────────────────────────────────────────────────────────
-
     #[test]
     fn cpu_config_has_six_vcpus() {
         let cpus = TestVmParams::build_cpu_config();
@@ -1024,8 +981,6 @@ mod tests {
         );
     }
 
-    // ── Memory ───────────────────────────────────────────────────────
-
     #[test]
     fn memory_config_has_expected_size() {
         let mem = TestVmParams::build_memory_config();
@@ -1045,8 +1000,6 @@ mod tests {
         assert_eq!(mem.mergeable, Some(true));
         assert_eq!(mem.thp, Some(true));
     }
-
-    // ── Network ──────────────────────────────────────────────────────
 
     #[test]
     fn network_config_has_three_interfaces() {
@@ -1110,8 +1063,6 @@ mod tests {
         assert_eq!(taps.len(), deduped.len(), "all tap names should be unique");
     }
 
-    // ── Filesystem ───────────────────────────────────────────────────
-
     #[test]
     fn fs_config_uses_virtiofs_root_tag_and_socket() {
         let fs = TestVmParams::build_fs_config();
@@ -1121,8 +1072,6 @@ mod tests {
         assert_eq!(entry.socket, VIRTIOFSD_SOCKET_PATH);
         assert_eq!(entry.queue_size, VIRTIOFS_QUEUE_SIZE);
     }
-
-    // ── Platform ─────────────────────────────────────────────────────
 
     #[test]
     fn platform_config_embeds_binary_and_test_name_in_oem_strings() {
@@ -1145,8 +1094,6 @@ mod tests {
         let platform = params.build_platform_config();
         assert_eq!(platform.num_pci_segments, Some(2));
     }
-
-    // ── Composed VmConfig ────────────────────────────────────────────
 
     #[test]
     fn vm_config_disables_virtio_console() {

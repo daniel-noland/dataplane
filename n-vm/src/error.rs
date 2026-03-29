@@ -21,8 +21,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-// ── VM tier errors ───────────────────────────────────────────────────
-
 /// Errors that can occur while launching or managing a cloud-hypervisor VM
 /// in the container tier.
 ///
@@ -134,8 +132,6 @@ pub enum VmError {
         reason: String,
     },
 }
-
-// ── Container tier errors ────────────────────────────────────────────
 
 /// Errors that can occur while launching or managing a Docker container
 /// in the host tier.

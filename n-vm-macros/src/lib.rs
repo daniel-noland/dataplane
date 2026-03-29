@@ -88,7 +88,7 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
 
     let func = parse_macro_input!(input as syn::ItemFn);
 
-    // ── Validate function signature ──────────────────────────────────
+    // Validate function signature
 
     if func.sig.asyncness.is_some() {
         return syn::Error::new_spanned(
@@ -120,7 +120,7 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
         .into();
     }
 
-    // ── Code generation ──────────────────────────────────────────────
+    // Code generation
 
     let block = &func.block;
     let vis = &func.vis;
@@ -128,30 +128,30 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
     let attrs = &func.attrs;
     let ident = &func.sig.ident;
 
-    // The three tiers are dispatched as a flat if / else-if / else chain.
+    // The three tiers are dispatched as a flat if chain.
     // Each tier is identified by an environment variable set by the
     // enclosing layer before re-executing the test binary.
     //
-    // Only Tier 3 (the VM guest) runs the original test body and must
+    // Only tier 3 (the VM guest) runs the original test body and must
     // therefore be generated inline.  Tiers 1 and 2 delegate to helper
     // functions in `n_vm::dispatch` so that all runtime policy lives in
     // normal, testable Rust code rather than in macro output.
     quote! {
         #(#attrs)*
         #vis #sig {
-            // ── Tier 3: VM guest ─────────────────────────────────────
+            // Tier 3: VM guest
             if ::n_vm::is_in_vm() {
                 { #block }
                 return;
             }
 
-            // ── Tier 2: Docker container -> VM ───────────────────────
+            // Tier 2: Docker container -> VM
             if ::n_vm::is_in_test_container() {
                 ::n_vm::run_container_tier(#ident);
                 return;
             }
 
-            // ── Tier 1: Host -> Docker container ─────────────────────
+            // Tier 1: Host -> Docker container
             ::n_vm::run_host_tier(#ident);
         }
     }

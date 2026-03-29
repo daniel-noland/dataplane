@@ -15,8 +15,6 @@ use n_vm_protocol::VsockChannel;
 use nix::errno::Errno;
 use nix::sys::signal::Signal;
 
-// ── Mount errors ─────────────────────────────────────────────────────
-
 /// An error that occurred while mounting an essential filesystem.
 #[derive(Debug, thiserror::Error)]
 pub enum MountError {
@@ -78,8 +76,6 @@ pub enum UnmountError {
     },
 }
 
-// ── Child / process lifecycle errors ─────────────────────────────────
-
 /// An error that occurred while spawning the main test process.
 #[derive(Debug, thiserror::Error)]
 pub enum SpawnError {
@@ -104,8 +100,6 @@ pub enum SpawnError {
     #[error("unable to determine PID of spawned test process")]
     NoPid,
 }
-
-// ── Process reaping / termination outcomes ───────────────────────────
 
 /// Outcome of reaping orphaned child processes via `waitpid`.
 ///

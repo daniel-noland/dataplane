@@ -72,7 +72,7 @@ pub struct SignalSpec {
 /// Append a [`SignalSpec`] entry below.  The [`SignalSet`] automatically
 /// picks it up; no other code changes are required.
 pub const SIGNAL_TABLE: &[SignalSpec] = &[
-    // ── Failure signals ──────────────────────────────────────────
+    // Failure signals
     SignalSpec {
         kind: SignalKind::terminate(),
         signal: Signal::SIGTERM,
@@ -103,7 +103,7 @@ pub const SIGNAL_TABLE: &[SignalSpec] = &[
         policy: SignalPolicy::Failure,
         label: "SIGQUIT",
     },
-    // ── Benign signals ───────────────────────────────────────────
+    // Benign signals
     SignalSpec {
         kind: SignalKind::hangup(),
         signal: Signal::SIGHUP,
@@ -210,8 +210,6 @@ impl SignalSet {
             .unwrap_or_else(|| fatal!("signal dispatch channel closed unexpectedly"))
     }
 }
-
-// ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

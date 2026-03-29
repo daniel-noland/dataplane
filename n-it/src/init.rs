@@ -52,19 +52,16 @@ impl InitSystem {
     pub async fn run() -> Infallible {
         info!("starting init system");
 
-        // ── Signal registration ──────────────────────────────────
         debug!("registering signal handlers");
         let mut signals = SignalSet::register(SIGNAL_TABLE);
         debug!("signal handlers registered");
 
-        // ── Filesystem setup ─────────────────────────────────────
         match tokio::task::spawn_blocking(|| mount::mount_essential_filesystems()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => fatal!("filesystem setup failed: {e}"),
             Err(e) => fatal!("mount filesystem task panicked: {e}"),
         }
 
-        // ── Spawn test process ───────────────────────────────────
         let mut test_child = match child::spawn_main_process().await {
             Ok(child) => child,
             Err(e) => fatal!("failed to start test process: {e}"),
@@ -80,7 +77,6 @@ impl InitSystem {
 
         let mut success = true;
 
-        // ── Event loop ───────────────────────────────────────────
         loop {
             tokio::select! {
                 result = test_child.wait() => {

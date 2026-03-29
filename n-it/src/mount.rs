@@ -212,8 +212,6 @@ fn unmount_one(mount_point: &'static Path) -> Result<(), UnmountError> {
     }
 }
 
-// ── Tests ────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;

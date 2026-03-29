@@ -22,8 +22,6 @@
 
 use n_vm_protocol::{ENV_IN_TEST_CONTAINER, ENV_IN_VM, ENV_MARKER_VALUE};
 
-// ── Environment checks ──────────────────────────────────────────────
-
 /// Returns `true` when running inside the VM guest (Tier 3).
 ///
 /// The init system (`n-it`) sets `IN_VM=YES` before spawning the test
@@ -43,8 +41,6 @@ pub fn is_in_vm() -> bool {
 pub fn is_in_test_container() -> bool {
     std::env::var(ENV_IN_TEST_CONTAINER).as_deref() == Ok(ENV_MARKER_VALUE)
 }
-
-// ── Tier 2: Container -> VM ─────────────────────────────────────────
 
 /// Initialises a tracing subscriber suitable for the container tier.
 ///
@@ -107,8 +103,6 @@ pub fn run_container_tier<F: FnOnce()>(test_fn: F) {
         assert!(output.success, "VM test failed (see output above)");
     });
 }
-
-// ── Tier 1: Host -> Container ───────────────────────────────────────
 
 /// Host-tier dispatch: launch a Docker container and re-run the test
 /// inside it.

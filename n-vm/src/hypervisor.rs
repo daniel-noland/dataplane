@@ -24,8 +24,6 @@ use tokio_stream::StreamExt;
 use tokio_util::bytes::{Buf, BytesMut};
 use tracing::warn;
 
-// ── Hypervisor event types ───────────────────────────────────────────
-
 /// The component that emitted a hypervisor event.
 #[derive(Debug, Copy, Clone, Deserialize)]
 pub enum Source {
@@ -102,8 +100,6 @@ where
     Ok(opt.unwrap_or_default())
 }
 
-// ── Hypervisor verdict ───────────────────────────────────────────────
-
 /// Verdict from the hypervisor event watcher indicating how the VM
 /// session ended.
 ///
@@ -127,8 +123,6 @@ impl HypervisorVerdict {
         matches!(self, Self::CleanShutdown)
     }
 }
-
-// ── Verdict computation ──────────────────────────────────────────────
 
 /// Computes the [`HypervisorVerdict`] from a collected event log and a
 /// flag indicating whether any stream-level deserialization errors occurred
@@ -169,8 +163,6 @@ pub fn compute_verdict(events: &[Event], had_stream_errors: bool) -> HypervisorV
     // Stream ended without a VMM Shutdown event.
     HypervisorVerdict::Failure
 }
-
-// ── Async JSON stream decoder ────────────────────────────────────────
 
 /// A [`tokio_util::codec::Decoder`] that incrementally deserializes
 /// concatenated JSON [`Event`] values from a byte stream.
@@ -230,8 +222,6 @@ impl tokio_util::codec::Decoder for AsyncJsonStreamDecoder {
         }
     }
 }
-
-// ── Hypervisor event watcher ─────────────────────────────────────────
 
 /// Duration to continue draining events after a guest panic is detected.
 ///
@@ -330,8 +320,6 @@ pub async fn watch(receiver: tokio::net::unix::pipe::Receiver) -> (Vec<Event>, H
     let verdict = compute_verdict(&hlog, had_stream_errors);
     (hlog, verdict)
 }
-
-// ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

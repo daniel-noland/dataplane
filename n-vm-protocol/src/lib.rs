@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-// ── Container image ──────────────────────────────────────────────────
+// == Container image ==
 
 /// Docker image used by the host tier to launch the test container.
 ///
@@ -28,7 +28,7 @@ pub const CONTAINER_IMAGE: &str = "ghcr.io/githedgehog/testn/n-vm:v0.0.9";
 /// Platform string passed to the Docker engine when creating the container.
 pub const CONTAINER_PLATFORM: &str = "linux/amd64";
 
-// ── Environment variables ────────────────────────────────────────────
+// == Environment variables ==
 
 /// Environment variable set by the init system (`n-it`) inside the VM guest.
 ///
@@ -46,8 +46,6 @@ pub const ENV_IN_TEST_CONTAINER: &str = "IN_TEST_CONTAINER";
 /// The value used to mark both [`ENV_IN_VM`] and [`ENV_IN_TEST_CONTAINER`]
 /// as active.
 pub const ENV_MARKER_VALUE: &str = "YES";
-
-// ── Vsock ────────────────────────────────────────────────────────────
 
 /// A vsock port number.
 ///
@@ -231,7 +229,7 @@ impl std::fmt::Display for VsockChannel {
 /// The vsock context identifier (CID) assigned to the VM guest.
 pub const VM_GUEST_CID: VsockCid = VsockCid::new(3);
 
-// ── Filesystem paths (inside the container / VM working directory) ───
+// == Filesystem paths (inside the container / VM working directory) ==
 
 /// Base directory for VM runtime artifacts (sockets, logs, etc.).
 ///
@@ -256,7 +254,7 @@ pub const VM_ROOT_SHARE_PATH: &str = "/vm.root";
 /// The virtiofs tag used to identify the root filesystem inside the guest.
 pub const VIRTIOFS_ROOT_TAG: &str = "root";
 
-// ── Binary paths (inside the container) ──────────────────────────────
+// == Binary paths (inside the container) ==
 
 /// Path to the Linux kernel image used to boot the VM.
 ///
