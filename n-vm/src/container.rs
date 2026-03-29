@@ -93,9 +93,15 @@ pub struct ContainerTestResult {
 /// ```
 struct ContainerParams {
     /// Full path to the test binary (e.g. `/path/to/deps/my_test-abc123`).
-    bin_path: String,
+    ///
+    /// Guaranteed to be valid UTF-8 by [`resolve`](Self::resolve), since
+    /// the Docker API requires string arguments.
+    bin_path: PathBuf,
     /// Canonicalized directory that contains the test binary.
-    bin_dir: String,
+    ///
+    /// Guaranteed to be valid UTF-8 by [`resolve`](Self::resolve), since
+    /// the Docker API requires string arguments.
+    bin_dir: PathBuf,
     /// Fully-qualified test name (e.g. `module::test_name`).
     test_name: String,
     /// Effective UID of the calling process.
@@ -142,23 +148,22 @@ impl ContainerParams {
         let bin_dir =
             std::fs::canonicalize(bin_parent).map_err(ContainerError::BinaryPathCanonicalize)?;
 
-        let bin_dir_str = bin_dir
-            .to_str()
-            .ok_or_else(|| ContainerError::NonUtf8Path {
-                path: bin_dir.clone(),
-            })?;
-
-        let bin_path_str = bin_path
-            .to_str()
-            .ok_or_else(|| ContainerError::NonUtf8Path {
-                path: bin_path.clone(),
-            })?;
+        // Validate that both paths are UTF-8, since the Docker API
+        // requires string arguments for mount sources, targets, and
+        // commands.  The paths are stored as PathBuf; boundary methods
+        // (bin_path_str, bin_dir_str) convert back to &str.
+        if bin_dir.to_str().is_none() {
+            return Err(ContainerError::NonUtf8Path { path: bin_dir });
+        }
+        if bin_path.to_str().is_none() {
+            return Err(ContainerError::NonUtf8Path { path: bin_path });
+        }
 
         let device_groups = Self::resolve_device_groups()?;
 
         Ok(Self {
-            bin_path: bin_path_str.to_owned(),
-            bin_dir: bin_dir_str.to_owned(),
+            bin_path,
+            bin_dir,
             test_name: test_name.to_owned(),
             uid: nix::unistd::getuid().as_raw(),
             gid: nix::unistd::getgid().as_raw(),
@@ -225,6 +230,32 @@ impl ContainerParams {
         Ok(groups)
     }
 
+    // ── Accessors ────────────────────────────────────────────────────
+
+    /// Returns the test binary path as a UTF-8 string slice.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic — [`resolve`](Self::resolve) validates UTF-8 before
+    /// construction.
+    fn bin_path_str(&self) -> &str {
+        self.bin_path
+            .to_str()
+            .expect("validated as UTF-8 in resolve()")
+    }
+
+    /// Returns the test binary directory as a UTF-8 string slice.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic — [`resolve`](Self::resolve) validates UTF-8 before
+    /// construction.
+    fn bin_dir_str(&self) -> &str {
+        self.bin_dir
+            .to_str()
+            .expect("validated as UTF-8 in resolve()")
+    }
+
     // ── Configuration building ───────────────────────────────────────
 
     /// Builds the [`ContainerCreateBody`] for this test invocation.
@@ -289,7 +320,7 @@ impl ContainerParams {
     /// that only the specified test runs inside the container.
     fn build_test_command(&self) -> Vec<String> {
         vec![
-            self.bin_path.clone(),
+            self.bin_path_str().to_owned(),
             self.test_name.clone(),
             "--exact".into(),
             "--no-capture".into(),
@@ -304,11 +335,12 @@ impl ContainerParams {
     /// - A mirror under [`VM_ROOT_SHARE_PATH`] for virtiofs exposure to
     ///   the VM.
     fn build_mounts(&self) -> Vec<bollard::models::Mount> {
+        let bin_dir = self.bin_dir_str();
         vec![
-            Self::read_only_bind_mount(&self.bin_dir, self.bin_dir.clone()),
+            Self::read_only_bind_mount(bin_dir, bin_dir.to_owned()),
             Self::read_only_bind_mount(
-                &self.bin_dir,
-                format!("{VM_ROOT_SHARE_PATH}/{bin_dir}", bin_dir = self.bin_dir),
+                bin_dir,
+                format!("{VM_ROOT_SHARE_PATH}/{bin_dir}"),
             ),
         ]
     }
