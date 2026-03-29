@@ -1,9 +1,26 @@
 //! Docker container management for the host tier of the `#[in_vm]` test
 //! infrastructure.
 //!
-//! This module launches a privileged Docker container with the devices and
+//! This module launches a Docker container with the devices and
 //! capabilities required to boot a cloud-hypervisor VM, then re-executes the
 //! test binary inside it.
+//!
+//! # Operating modes
+//!
+//! The module supports two container-image strategies:
+//!
+//! - **Legacy mode** (default): Uses a pre-built container image
+//!   ([`CONTAINER_IMAGE_DEFAULT`](n_vm_protocol::CONTAINER_IMAGE_DEFAULT))
+//!   that bundles the hypervisor, virtiofsd, init system, and kernel.
+//!
+//! - **Scratch mode**: When the environment variables
+//!   [`N_VM_TEST_ROOT`](n_vm_protocol::ENV_TEST_ROOT) and
+//!   [`N_VM_VM_ROOT`](n_vm_protocol::ENV_VM_ROOT) are set, the module
+//!   launches a minimal empty Docker image and volume-mounts the
+//!   nix-built `testroot` and `vmroot` directory trees into the
+//!   container.  The host's `/nix/store` is also mounted so that the
+//!   symlinks produced by nix's `symlinkJoin` resolve correctly.
+//!   See `development/ideam.md` for the full design rationale.
 //!
 //! The public entry point is [`run_test_in_vm`], which resolves the test
 //! identity and binary paths ([`ContainerParams::resolve`]), builds a
@@ -22,14 +39,21 @@ use bollard::secret::{
     RestartPolicyNameEnum,
 };
 use n_vm_protocol::{
-    CONTAINER_IMAGE, CONTAINER_PLATFORM, ENV_IN_TEST_CONTAINER, ENV_MARKER_VALUE,
-    VM_ROOT_SHARE_PATH, VM_RUN_DIR,
+    CONTAINER_PLATFORM, ENV_IN_TEST_CONTAINER, ENV_MARKER_VALUE, ScratchRoots,
+    VM_ROOT_SHARE_PATH, VM_RUN_DIR, container_image,
 };
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tracing::warn;
 
 use crate::error::ContainerError;
+
+/// Docker image tag used in scratch mode.
+///
+/// This is a locally-created empty image, not pulled from a registry.
+/// It is created on-demand by [`ensure_scratch_image`] if it does not
+/// already exist.
+const SCRATCH_IMAGE_TAG: &str = "dataplane-test-scratch:local";
 
 /// Linux capabilities required inside the test container.
 const REQUIRED_CAPS: [&str; 6] = [
@@ -98,6 +122,13 @@ struct ContainerParams {
     /// socket.  These are added via `--group-add` so the container process
     /// can access the devices without running as root.
     device_groups: Vec<nix::unistd::Gid>,
+    /// When set, the container runs in *scratch mode*: a minimal empty
+    /// Docker image is used and nix-built root directories are
+    /// volume-mounted into the container, with the host's `/nix/store`
+    /// bind-mounted for symlink resolution.
+    ///
+    /// See [`ScratchRoots`] and `development/ideam.md` for details.
+    scratch_roots: Option<ScratchRoots>,
 }
 
 impl ContainerParams {
@@ -145,6 +176,9 @@ impl ContainerParams {
 
         let device_groups = Self::resolve_device_groups()?;
 
+        let scratch_roots =
+            ScratchRoots::from_env().map_err(ContainerError::ScratchRootResolve)?;
+
         Ok(Self {
             bin_path,
             bin_dir,
@@ -152,6 +186,7 @@ impl ContainerParams {
             uid: nix::unistd::getuid(),
             gid: nix::unistd::getgid(),
             device_groups,
+            scratch_roots,
         })
     }
 
@@ -228,6 +263,21 @@ impl ContainerParams {
             .expect("validated as UTF-8 in resolve()")
     }
 
+    /// Returns the Docker image name to use for the test container.
+    ///
+    /// In scratch mode, returns [`SCRATCH_IMAGE_TAG`] (a locally-created
+    /// empty image).  Otherwise delegates to
+    /// [`container_image()`](n_vm_protocol::container_image) which
+    /// checks the [`N_VM_CONTAINER_IMAGE`](n_vm_protocol::ENV_CONTAINER_IMAGE)
+    /// environment variable with a fallback to the compiled-in default.
+    fn container_image(&self) -> String {
+        if self.scratch_roots.is_some() {
+            SCRATCH_IMAGE_TAG.to_owned()
+        } else {
+            container_image()
+        }
+    }
+
     /// Builds the [`ContainerCreateBody`] for this test invocation.
     ///
     /// This method composes the container configuration from focused
@@ -240,7 +290,7 @@ impl ContainerParams {
         ContainerCreateBody {
             entrypoint: None,
             cmd: Some(self.build_test_command()),
-            image: Some(CONTAINER_IMAGE.into()),
+            image: Some(self.container_image()),
             network_disabled: Some(true),
             env: Some(vec![
                 format!("{ENV_IN_TEST_CONTAINER}={ENV_MARKER_VALUE}"),
@@ -315,10 +365,89 @@ impl ContainerParams {
     ///   the VM.
     fn build_mounts(&self) -> Vec<bollard::models::Mount> {
         let bin_dir = self.bin_dir_str();
-        vec![
+        let mut mounts = vec![
             Self::read_only_bind_mount(bin_dir, bin_dir.to_owned()),
             Self::read_only_bind_mount(bin_dir, format!("{VM_ROOT_SHARE_PATH}/{bin_dir}")),
-        ]
+        ];
+
+        if let Some(roots) = &self.scratch_roots {
+            mounts.extend(Self::build_scratch_mounts(roots));
+        }
+
+        mounts
+    }
+
+    /// Builds the additional bind mounts required in scratch mode.
+    ///
+    /// Scratch mode volume-mounts three things into the container:
+    ///
+    /// 1. **`/nix/store`** (read-only) -- so that the symlinks inside the
+    ///    nix-built `testroot` and `vmroot` directories resolve to the
+    ///    actual binaries and their transitive library dependencies.
+    ///
+    /// 2. **`testroot` subdirectories** at their standard container paths
+    ///    (e.g. `testroot/bin` → `/bin`).  This provides the hypervisor
+    ///    binaries, virtiofsd, and (eventually) the kernel image at the
+    ///    paths expected by [`n_vm_protocol`] constants.
+    ///
+    /// 3. **`vmroot`** at [`VM_ROOT_SHARE_PATH`] -- the VM guest root
+    ///    filesystem shared via virtiofsd.  Contains the `n-it` init
+    ///    system binary, glibc/libgcc runtime libraries, and a
+    ///    `/nix → /nix` symlink that lets the VM guest resolve nix store
+    ///    rpaths through virtiofsd's `--no-sandbox` mode.
+    fn build_scratch_mounts(roots: &ScratchRoots) -> Vec<bollard::models::Mount> {
+        let test_root = roots
+            .test_root
+            .to_str()
+            .expect("test_root validated as canonicalized path");
+        let vm_root = roots
+            .vm_root
+            .to_str()
+            .expect("vm_root validated as canonicalized path");
+
+        let mut mounts = Vec::new();
+
+        // Host /nix/store → container /nix/store (read-only).
+        // This is the cornerstone of scratch mode: every nix-built binary
+        // and library is addressed via /nix/store paths, and the
+        // symlinkJoin trees in testroot/vmroot contain symlinks into it.
+        mounts.push(Self::read_only_bind_mount(
+            "/nix/store",
+            "/nix/store".to_owned(),
+        ));
+
+        // Mount each first-level subdirectory of testroot at the
+        // corresponding container path.  For a typical testroot built by
+        // symlinkJoin of cloud-hypervisor + virtiofsd + qemu, this maps
+        // testroot/bin → /bin, testroot/lib → /lib, etc.
+        if let Ok(entries) = std::fs::read_dir(&roots.test_root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                // Follow symlinks: symlinkJoin may create symlinks to
+                // directories rather than real directories.
+                if entry.path().is_dir() {
+                    mounts.push(Self::read_only_bind_mount(
+                        &format!("{test_root}/{name}"),
+                        format!("/{name}"),
+                    ));
+                }
+            }
+        }
+
+        // Mount vmroot at /vm.root.  virtiofsd will share this directory
+        // into the VM as the guest's root filesystem.  The test binary
+        // directory mounts (added by the caller) create nested mount
+        // points under /vm.root/{bin_dir} so the VM can find the test
+        // binary at its original full path.
+        mounts.push(Self::read_only_bind_mount(
+            vm_root,
+            VM_ROOT_SHARE_PATH.to_owned(),
+        ));
+
+        mounts
     }
 
     /// Builds the tmpfs mounts for the container.
@@ -358,6 +487,66 @@ impl ContainerParams {
             ..Default::default()
         }
     }
+}
+
+/// Ensures the scratch Docker image exists locally.
+///
+/// Docker's built-in `scratch` reference is only available in
+/// Dockerfiles, not for `docker create` / `docker run`.  This function
+/// checks whether [`SCRATCH_IMAGE_TAG`] exists and, if not, creates it
+/// by importing an empty tar archive via the `docker` CLI.
+///
+/// The resulting image is a truly empty filesystem layer -- all content
+/// comes from the volume mounts configured in
+/// [`build_scratch_mounts`](ContainerParams::build_scratch_mounts).
+///
+/// # Errors
+///
+/// Returns [`ContainerError::ScratchImageCreate`] if the image does not
+/// exist and cannot be created.
+async fn ensure_scratch_image(client: &bollard::Docker) -> Result<(), ContainerError> {
+    if client.inspect_image(SCRATCH_IMAGE_TAG).await.is_ok() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        image = SCRATCH_IMAGE_TAG,
+        "creating scratch Docker image for test infrastructure",
+    );
+
+    // A valid empty tar archive is two 512-byte end-of-archive records
+    // (1024 zero bytes total).  Importing this produces a Docker image
+    // with a single empty layer.
+    let mut child = tokio::process::Command::new("docker")
+        .args(["import", "-", SCRATCH_IMAGE_TAG])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            ContainerError::ScratchImageCreate(format!("failed to spawn `docker import`: {e}"))
+        })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(&[0u8; 1024]).await;
+        // Dropping stdin closes the pipe, signaling EOF to `docker import`.
+    }
+
+    let output = child.wait_with_output().await.map_err(|e| {
+        ContainerError::ScratchImageCreate(format!("failed to wait for `docker import`: {e}"))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ContainerError::ScratchImageCreate(format!(
+            "`docker import` exited with {}: {stderr}",
+            output.status,
+        )));
+    }
+
+    Ok(())
 }
 
 /// A dedicated thread that stands ready to perform emergency container
@@ -694,10 +883,17 @@ pub fn run_test_in_vm<F: FnOnce()>(_test_fn: F) -> Result<ContainerTestResult, C
 
     runtime.block_on(async {
         let params = ContainerParams::resolve::<F>()?;
-        let config = params.build_config();
 
         let client =
             bollard::Docker::connect_with_unix_defaults().map_err(ContainerError::DockerConnect)?;
+
+        // In scratch mode, ensure the empty Docker image exists before
+        // building the container config (which references the image).
+        if params.scratch_roots.is_some() {
+            ensure_scratch_image(&client).await?;
+        }
+
+        let config = params.build_config();
 
         // The guard is armed at creation -- if anything between here and
         // the explicit cleanup panics or returns early, the CleanupThread
@@ -744,13 +940,30 @@ mod tests {
                 nix::unistd::Gid::from_raw(36),
                 nix::unistd::Gid::from_raw(108),
             ],
+            scratch_roots: None,
         }
     }
 
     #[test]
-    fn config_uses_container_image() {
+    fn config_uses_default_container_image_in_legacy_mode() {
         let config = sample_params().build_config();
-        assert_eq!(config.image.as_deref(), Some(CONTAINER_IMAGE));
+        // In legacy mode (no scratch roots, no env override), the
+        // resolved image should match the compiled-in default.
+        assert_eq!(
+            config.image.as_deref(),
+            Some(n_vm_protocol::CONTAINER_IMAGE_DEFAULT),
+        );
+    }
+
+    #[test]
+    fn config_uses_scratch_image_in_scratch_mode() {
+        let mut params = sample_params();
+        params.scratch_roots = Some(ScratchRoots {
+            test_root: PathBuf::from("/nix/store/fake-test-root"),
+            vm_root: PathBuf::from("/nix/store/fake-vm-root"),
+        });
+        let config = params.build_config();
+        assert_eq!(config.image.as_deref(), Some(SCRATCH_IMAGE_TAG));
     }
 
     #[test]
@@ -897,6 +1110,77 @@ mod tests {
         let mirror = mirror.unwrap();
         assert_eq!(mirror.source.as_deref(), Some("/target/debug/deps"));
         assert_eq!(mirror.read_only, Some(true));
+    }
+
+    #[test]
+    fn scratch_mounts_include_nix_store() {
+        let roots = ScratchRoots {
+            test_root: PathBuf::from("/nix/store/fake-test-root"),
+            vm_root: PathBuf::from("/nix/store/fake-vm-root"),
+        };
+        let mounts = ContainerParams::build_scratch_mounts(&roots);
+        let nix_mount = mounts
+            .iter()
+            .find(|m| m.target.as_deref() == Some("/nix/store"));
+        assert!(
+            nix_mount.is_some(),
+            "scratch mounts should include /nix/store",
+        );
+        let nix_mount = nix_mount.unwrap();
+        assert_eq!(nix_mount.source.as_deref(), Some("/nix/store"));
+        assert_eq!(nix_mount.read_only, Some(true));
+    }
+
+    #[test]
+    fn scratch_mounts_include_vm_root() {
+        let roots = ScratchRoots {
+            test_root: PathBuf::from("/nix/store/fake-test-root"),
+            vm_root: PathBuf::from("/nix/store/fake-vm-root"),
+        };
+        let mounts = ContainerParams::build_scratch_mounts(&roots);
+        let vm_mount = mounts
+            .iter()
+            .find(|m| m.target.as_deref() == Some(VM_ROOT_SHARE_PATH));
+        assert!(
+            vm_mount.is_some(),
+            "scratch mounts should include {VM_ROOT_SHARE_PATH}",
+        );
+        let vm_mount = vm_mount.unwrap();
+        assert_eq!(
+            vm_mount.source.as_deref(),
+            Some("/nix/store/fake-vm-root"),
+        );
+        assert_eq!(vm_mount.read_only, Some(true));
+    }
+
+    #[test]
+    fn scratch_mounts_are_all_read_only_bind_mounts() {
+        let roots = ScratchRoots {
+            test_root: PathBuf::from("/nix/store/fake-test-root"),
+            vm_root: PathBuf::from("/nix/store/fake-vm-root"),
+        };
+        let mounts = ContainerParams::build_scratch_mounts(&roots);
+        // At minimum we expect /nix/store and /vm.root.
+        // testroot subdirectory mounts depend on what's on disk, so
+        // we can't assert an exact count, but we can verify invariants
+        // on whatever mounts are returned.
+        assert!(
+            mounts.len() >= 2,
+            "scratch mounts should have at least /nix/store and /vm.root, got {}",
+            mounts.len(),
+        );
+        for mount in &mounts {
+            assert_eq!(
+                mount.typ,
+                Some(bollard::secret::MountTypeEnum::BIND),
+                "all scratch mounts should be bind mounts",
+            );
+            assert_eq!(
+                mount.read_only,
+                Some(true),
+                "all scratch mounts should be read-only",
+            );
+        }
     }
 
     #[test]

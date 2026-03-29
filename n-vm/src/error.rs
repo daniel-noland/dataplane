@@ -217,4 +217,17 @@ pub enum ContainerError {
     /// Docker refused to remove the container.
     #[error("failed to remove container")]
     ContainerRemove(#[source] bollard::errors::Error),
+
+    /// A scratch-mode root directory environment variable is set but the
+    /// path it references cannot be resolved.
+    #[error("failed to resolve scratch root directory")]
+    ScratchRootResolve(#[source] n_vm_protocol::ScratchRootError),
+
+    /// The scratch Docker image could not be created locally.
+    ///
+    /// In scratch mode, a truly empty Docker image is created on-demand
+    /// by importing an empty tar archive.  This error indicates that
+    /// the import failed.
+    #[error("failed to create scratch Docker image: {0}")]
+    ScratchImageCreate(String),
 }
