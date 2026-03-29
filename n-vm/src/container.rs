@@ -241,6 +241,70 @@ fn resolve_test_params<F: FnOnce()>() -> Result<ContainerParams, ContainerError>
 /// mounts, environment) from the **where** (test binary path, test name)
 /// so that the orchestration code in [`run_test_in_vm`] stays focused on
 /// lifecycle management.
+/// Builds Docker device mappings from [`REQUIRED_DEVICES`].
+///
+/// Each device is mapped at the same path inside the container with full
+/// read/write/mknod permissions.
+fn build_device_mappings() -> Vec<DeviceMapping> {
+    REQUIRED_DEVICES
+        .iter()
+        .map(|&path| DeviceMapping {
+            path_on_host: Some(path.into()),
+            path_in_container: Some(path.into()),
+            cgroup_permissions: Some("rwm".into()),
+        })
+        .collect()
+}
+
+/// Builds the test binary command line for the container entrypoint.
+///
+/// The command re-invokes the test binary with `--exact` matching so that
+/// only the specified test runs inside the container.
+fn build_test_command(bin_path: &str, test_name: &str) -> Vec<String> {
+    vec![
+        bin_path.into(),
+        test_name.into(),
+        "--exact".into(),
+        "--no-capture".into(),
+        "--format=terse".into(),
+    ]
+}
+
+/// Builds the bind mounts for the test binary directory.
+///
+/// Two mounts are created:
+/// - The binary directory at its original path (so argv\[0\] resolves).
+/// - A mirror under [`VM_ROOT_SHARE_PATH`] for virtiofs exposure to the VM.
+fn build_container_mounts(bin_dir: &str) -> Vec<bollard::models::Mount> {
+    vec![
+        read_only_bind_mount(bin_dir, bin_dir.to_string()),
+        read_only_bind_mount(
+            bin_dir,
+            format!("{VM_ROOT_SHARE_PATH}/{bin_dir}"),
+        ),
+    ]
+}
+
+/// Builds the tmpfs mounts for the container.
+///
+/// A single tmpfs is mounted at [`VM_RUN_DIR`] for VM runtime artifacts
+/// (sockets, logs, etc.), owned by the specified UID/GID.
+fn build_container_tmpfs(uid: u32, gid: u32) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    map.insert(
+        VM_RUN_DIR.into(),
+        format!("nodev,noexec,nosuid,uid={uid},gid={gid}"),
+    );
+    map
+}
+
+/// Builds the [`ContainerCreateBody`] for a test run.
+///
+/// This function composes the container configuration from focused
+/// sub-builders ([`build_device_mappings`], [`build_test_command`],
+/// [`build_container_mounts`], [`build_container_tmpfs`]), keeping the
+/// orchestration code focused on the overall structure rather than the
+/// details of each component.
 fn build_container_config(params: &ContainerParams) -> ContainerCreateBody {
     let ContainerParams {
         bin_path,
@@ -251,50 +315,9 @@ fn build_container_config(params: &ContainerParams) -> ContainerCreateBody {
         device_groups,
     } = params;
 
-    let cap_add: Vec<String> = REQUIRED_CAPS.iter().map(|&c| c.into()).collect();
-    let devices: Vec<DeviceMapping> = REQUIRED_DEVICES
-        .iter()
-        .map(|&path| DeviceMapping {
-            path_on_host: Some(path.into()),
-            path_in_container: Some(path.into()),
-            cgroup_permissions: Some("rwm".into()),
-        })
-        .collect();
-
-    let cmd: Vec<String> = [bin_path.clone()]
-        .into_iter()
-        .chain([
-            test_name.clone(),
-            "--exact".into(),
-            "--no-capture".into(),
-            "--format=terse".into(),
-        ])
-        .collect();
-
-    let mounts = vec![
-        // Mount the test binary directory at the same path inside the
-        // container so that argv[0] resolves correctly.
-        read_only_bind_mount(bin_dir, bin_dir.clone()),
-        // Mirror the binary directory under VM_ROOT_SHARE_PATH so that
-        // virtiofsd can expose it to the VM guest via virtiofs.
-        read_only_bind_mount(
-            bin_dir,
-            format!("{VM_ROOT_SHARE_PATH}/{bin_dir}"),
-        ),
-    ];
-
-    let tmpfs = {
-        let mut map = std::collections::HashMap::new();
-        map.insert(
-            VM_RUN_DIR.into(),
-            format!("nodev,noexec,nosuid,uid={uid},gid={gid}"),
-        );
-        map
-    };
-
     ContainerCreateBody {
         entrypoint: None,
-        cmd: Some(cmd),
+        cmd: Some(build_test_command(bin_path, test_name)),
         image: Some(CONTAINER_IMAGE.into()),
         network_disabled: Some(true),
         env: Some(vec![
@@ -303,7 +326,7 @@ fn build_container_config(params: &ContainerParams) -> ContainerCreateBody {
         ]),
         user: Some(format!("{uid}:{gid}")),
         host_config: Some(HostConfig {
-            devices: Some(devices),
+            devices: Some(build_device_mappings()),
             group_add: Some(device_groups.clone()),
             init: Some(true),
             network_mode: Some("none".into()),
@@ -313,10 +336,10 @@ fn build_container_config(params: &ContainerParams) -> ContainerCreateBody {
             }),
             auto_remove: Some(false),
             readonly_rootfs: Some(true),
-            mounts: Some(mounts),
-            tmpfs: Some(tmpfs),
+            mounts: Some(build_container_mounts(bin_dir)),
+            tmpfs: Some(build_container_tmpfs(*uid, *gid)),
             privileged: Some(false),
-            cap_add: Some(cap_add),
+            cap_add: Some(REQUIRED_CAPS.iter().map(|&c| c.into()).collect()),
             cap_drop: Some(vec!["ALL".into()]),
             ..Default::default()
         }),
