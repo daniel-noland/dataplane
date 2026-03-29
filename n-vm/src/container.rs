@@ -4,6 +4,20 @@
 //! This module launches a privileged Docker container with the devices and
 //! capabilities required to boot a cloud-hypervisor VM, then re-executes the
 //! test binary inside it.
+//!
+//! The public entry point is [`run_test_in_vm`], which orchestrates five
+//! focused phases — each implemented as its own helper function so that the
+//! orchestrator requires only local reasoning about sequencing:
+//!
+//! 1. [`resolve_test_params`] — gather test identity, binary paths, device
+//!    groups, and process identity.
+//! 2. [`build_container_config`] — translate those parameters into a Docker
+//!    [`ContainerCreateBody`].
+//! 3. [`create_and_start_container`] — create and start the container.
+//! 4. [`stream_container_logs`] — forward container stdout/stderr to the
+//!    host.
+//! 5. [`collect_and_cleanup`] — inspect the exit status and remove the
+//!    container.
 
 use bollard::query_parameters::{
     CreateContainerOptions, InspectContainerOptions, RemoveContainerOptions, StartContainerOptions,
@@ -53,7 +67,35 @@ pub struct ContainerTestResult {
     pub exit_code: Option<i64>,
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────
+// ── ContainerParams ──────────────────────────────────────────────────
+
+/// Parameters that vary per test invocation and feed into the container
+/// configuration.
+///
+/// Everything else in the [`ContainerCreateBody`] is an infrastructure
+/// default derived from the module-level constants.
+///
+/// All string fields are owned so that parameter resolution
+/// ([`resolve_test_params`]) can be cleanly separated from config
+/// construction ([`build_container_config`]) without lifetime coupling.
+struct ContainerParams {
+    /// Full path to the test binary (e.g. `/path/to/deps/my_test-abc123`).
+    bin_path: String,
+    /// Canonicalized directory that contains the test binary.
+    bin_dir: String,
+    /// Fully-qualified test name (e.g. `module::test_name`).
+    test_name: String,
+    /// Effective UID of the calling process.
+    uid: u32,
+    /// Effective GID of the calling process.
+    gid: u32,
+    /// GIDs of the groups that own the required device nodes and the Docker
+    /// socket.  These are added via `--group-add` so the container process
+    /// can access the devices without running as root.
+    device_groups: Vec<String>,
+}
+
+// ── Helpers: mount construction ──────────────────────────────────────
 
 /// Creates a read-only private bind mount from `source` to `target`.
 ///
@@ -78,27 +120,113 @@ fn read_only_bind_mount(source: &str, target: String) -> bollard::models::Mount 
     }
 }
 
-/// Parameters that vary per test invocation and feed into the container
-/// configuration.
+// ── Helpers: parameter resolution ────────────────────────────────────
+
+/// Resolves the GIDs of the groups that own [`REQUIRED_DEVICES`] and the
+/// Docker socket.
 ///
-/// Everything else in the [`ContainerCreateBody`] is an infrastructure
-/// default derived from the module-level constants.
-struct ContainerParams<'a> {
-    /// Full path to the test binary (e.g. `/path/to/deps/my_test-abc123`).
-    bin_path: &'a str,
-    /// Canonicalized directory that contains the test binary.
-    bin_dir: &'a str,
-    /// Fully-qualified test name (e.g. `module::test_name`).
-    test_name: &'a str,
-    /// Effective UID of the calling process.
-    uid: u32,
-    /// Effective GID of the calling process.
-    gid: u32,
-    /// GIDs of the groups that own the required device nodes and the Docker
-    /// socket.  These are added via `--group-add` so the container process
-    /// can access the devices without running as root.
-    device_groups: Vec<String>,
+/// The container process runs as the current user.  To access the required
+/// device nodes without running as root, we add the owning groups via
+/// Docker's `--group-add`.
+///
+/// # Errors
+///
+/// Returns [`ContainerError::DeviceNotAccessible`] if any required device
+/// or the Docker socket cannot be `stat`'d.
+fn resolve_device_groups() -> Result<Vec<String>, ContainerError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let docker_host = std::env::var("DOCKER_HOST")
+        .unwrap_or("/var/run/docker.sock".into())
+        .trim_start_matches("unix://")
+        .to_string();
+
+    // Derive the list from REQUIRED_DEVICES (the same array used for
+    // --device mappings) plus the Docker socket.  This prevents drift
+    // between the two lists — previously /dev/net/tun was in
+    // REQUIRED_DEVICES but absent here.
+    let required_files: Vec<String> = REQUIRED_DEVICES
+        .iter()
+        .map(|&s| s.to_string())
+        .chain(std::iter::once(docker_host))
+        .collect();
+
+    let mut groups: Vec<String> = required_files
+        .iter()
+        .map(|path| {
+            std::fs::metadata(path)
+                .map(|m| m.gid().to_string())
+                .map_err(|source| ContainerError::DeviceNotAccessible {
+                    path: path.clone(),
+                    source,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    groups.sort_unstable();
+    groups.dedup();
+    Ok(groups)
 }
+
+/// Resolves all parameters needed to configure the test container.
+///
+/// This gathers:
+/// - The test name from the type parameter `F` via [`std::any::type_name`].
+/// - The test binary path and its parent directory from `/proc/self/exe`.
+/// - The effective UID and GID of the calling process.
+/// - The device group ownership via [`resolve_device_groups`].
+///
+/// # Errors
+///
+/// Returns a [`ContainerError`] if any filesystem lookup or validation
+/// step fails.
+fn resolve_test_params<F: FnOnce()>() -> Result<ContainerParams, ContainerError> {
+    // type_name for a function item type always contains "::" because it
+    // is fully qualified (e.g. "crate::module::function").  If this
+    // invariant is violated, the Rust compiler changed its type_name
+    // format in an incompatible way.
+    let type_name = std::any::type_name::<F>();
+    let (_, test_name) = type_name.split_once("::").unwrap_or_else(|| {
+        unreachable!("std::any::type_name::<F>() did not contain '::': {type_name:?}")
+    });
+
+    let bin_path = std::fs::read_link("/proc/self/exe")
+        .map_err(ContainerError::BinaryPathRead)?;
+
+    let bin_parent = bin_path
+        .parent()
+        .ok_or_else(|| ContainerError::NoParentDirectory {
+            path: bin_path.clone(),
+        })?;
+
+    let bin_dir = std::fs::canonicalize(bin_parent)
+        .map_err(ContainerError::BinaryPathCanonicalize)?;
+
+    let bin_dir_str = bin_dir
+        .to_str()
+        .ok_or_else(|| ContainerError::NonUtf8Path {
+            path: bin_dir.clone(),
+        })?;
+
+    let bin_path_str = bin_path
+        .to_str()
+        .ok_or_else(|| ContainerError::NonUtf8Path {
+            path: bin_path.clone(),
+        })?;
+
+    let device_groups = resolve_device_groups()?;
+
+    Ok(ContainerParams {
+        bin_path: bin_path_str.to_owned(),
+        bin_dir: bin_dir_str.to_owned(),
+        test_name: test_name.to_owned(),
+        uid: nix::unistd::getuid().as_raw(),
+        gid: nix::unistd::getgid().as_raw(),
+        device_groups,
+    })
+}
+
+// ── Helpers: container configuration ─────────────────────────────────
 
 /// Builds the [`ContainerCreateBody`] for a test run.
 ///
@@ -106,7 +234,7 @@ struct ContainerParams<'a> {
 /// mounts, environment) from the **where** (test binary path, test name)
 /// so that the orchestration code in [`run_test_in_vm`] stays focused on
 /// lifecycle management.
-fn build_container_config(params: &ContainerParams<'_>) -> ContainerCreateBody {
+fn build_container_config(params: &ContainerParams) -> ContainerCreateBody {
     let ContainerParams {
         bin_path,
         bin_dir,
@@ -126,10 +254,10 @@ fn build_container_config(params: &ContainerParams<'_>) -> ContainerCreateBody {
         })
         .collect();
 
-    let cmd: Vec<String> = [bin_path.to_string()]
+    let cmd: Vec<String> = [bin_path.clone()]
         .into_iter()
         .chain([
-            test_name.to_string(),
+            test_name.clone(),
             "--exact".into(),
             "--format=terse".into(),
         ])
@@ -138,7 +266,7 @@ fn build_container_config(params: &ContainerParams<'_>) -> ContainerCreateBody {
     let mounts = vec![
         // Mount the test binary directory at the same path inside the
         // container so that argv[0] resolves correctly.
-        read_only_bind_mount(bin_dir, bin_dir.to_string()),
+        read_only_bind_mount(bin_dir, bin_dir.clone()),
         // Mirror the binary directory under VM_ROOT_SHARE_PATH so that
         // virtiofsd can expose it to the VM guest via virtiofs.
         read_only_bind_mount(
@@ -188,6 +316,110 @@ fn build_container_config(params: &ContainerParams<'_>) -> ContainerCreateBody {
     }
 }
 
+// ── Helpers: container lifecycle ──────────────────────────────────────
+
+/// Creates and starts a Docker container from the given configuration.
+///
+/// Returns the container ID on success.
+///
+/// # Errors
+///
+/// Returns [`ContainerError::ContainerCreate`] or
+/// [`ContainerError::ContainerStart`] if the Docker daemon rejects the
+/// request.
+async fn create_and_start_container(
+    client: &bollard::Docker,
+    config: ContainerCreateBody,
+) -> Result<String, ContainerError> {
+    let container = client
+        .create_container(
+            Some(CreateContainerOptions {
+                name: None,
+                platform: CONTAINER_PLATFORM.into(),
+            }),
+            config,
+        )
+        .await
+        .map_err(ContainerError::ContainerCreate)?;
+
+    client
+        .start_container(&container.id, None::<StartContainerOptions>)
+        .await
+        .map_err(ContainerError::ContainerStart)?;
+
+    Ok(container.id)
+}
+
+/// Streams container stdout/stderr to the host's stdout/stderr until the
+/// container exits.
+///
+/// # Errors
+///
+/// Returns [`ContainerError::LogStream`] if the log stream encounters an
+/// error from the Docker daemon.
+async fn stream_container_logs(
+    client: &bollard::Docker,
+    container_id: &str,
+) -> Result<(), ContainerError> {
+    let mut logs = client.logs(
+        container_id,
+        Some(bollard::query_parameters::LogsOptions {
+            follow: true,
+            stdout: true,
+            stderr: true,
+            tail: "all".into(),
+            ..Default::default()
+        }),
+    );
+
+    while let Some(log) = logs.next().await {
+        match log {
+            Ok(msg) => match msg {
+                bollard::container::LogOutput::StdErr { message } => {
+                    eprint!("{}", String::from_utf8_lossy(&message));
+                }
+                bollard::container::LogOutput::StdOut { message }
+                | bollard::container::LogOutput::Console { message } => {
+                    print!("{}", String::from_utf8_lossy(&message));
+                }
+                bollard::container::LogOutput::StdIn { .. } => unreachable!(),
+            },
+            Err(e) => {
+                return Err(ContainerError::LogStream(e));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Inspects the container's exit status and removes it.
+///
+/// # Errors
+///
+/// Returns a [`ContainerError`] if the container cannot be inspected or
+/// removed, or if the inspection response is missing the container state.
+async fn collect_and_cleanup(
+    client: &bollard::Docker,
+    container_id: &str,
+) -> Result<ContainerTestResult, ContainerError> {
+    let state = client
+        .inspect_container(container_id, None::<InspectContainerOptions>)
+        .await
+        .map_err(ContainerError::ContainerInspect)?
+        .state
+        .ok_or(ContainerError::MissingState)?;
+
+    client
+        .remove_container(container_id, None::<RemoveContainerOptions>)
+        .await
+        .map_err(ContainerError::ContainerRemove)?;
+
+    Ok(ContainerTestResult {
+        exit_code: state.exit_code,
+    })
+}
+
 // ── run_test_in_vm ───────────────────────────────────────────────────
 
 /// Launches a Docker container and re-runs the current test binary inside it.
@@ -196,14 +428,15 @@ fn build_container_config(params: &ContainerParams<'_>) -> ContainerCreateBody {
 /// `#[in_vm]` when neither `IN_VM` nor `IN_TEST_CONTAINER` is set (i.e. a
 /// normal `cargo test` invocation).  It:
 ///
-/// 1. Connects to the local Docker daemon.
-/// 2. Creates a container from the `n-vm` test image with the required devices
-///    (`/dev/kvm`, `/dev/vhost-vsock`, `/dev/vhost-net`, `/dev/net/tun`) and
-///    Linux capabilities (`SYS_CHROOT`, `NET_ADMIN`, etc.).
-/// 3. Bind-mounts the test binary directory into the container.
-/// 4. Starts the container with `IN_TEST_CONTAINER=YES` and streams its
-///    stdout/stderr to the host's stdout/stderr.
-/// 5. Waits for the container to exit and returns a [`ContainerTestResult`].
+/// 1. Resolves the test identity, binary paths, and device group ownership
+///    via [`resolve_test_params`].
+/// 2. Builds the Docker container configuration via
+///    [`build_container_config`].
+/// 3. Creates and starts the container via [`create_and_start_container`].
+/// 4. Streams container stdout/stderr to the host via
+///    [`stream_container_logs`].
+/// 5. Collects the exit status and removes the container via
+///    [`collect_and_cleanup`].
 ///
 /// The type parameter `F` is used only to derive the test name via
 /// [`std::any::type_name`]; the function itself is never called in this tier.
@@ -222,141 +455,13 @@ pub fn run_test_in_vm<F: FnOnce()>(
         .expect("failed to build tokio runtime for test container");
 
     runtime.block_on(async {
-        // ── Resolve test identity and binary paths ───────────────────
-        // type_name for a function item type always contains "::" because
-        // it is fully qualified (e.g. "crate::module::function").  If this
-        // invariant is violated, the Rust compiler changed its type_name
-        // format in an incompatible way.
-        let type_name = std::any::type_name::<F>();
-        let (_, test_name) = type_name
-            .split_once("::")
-            .unwrap_or_else(|| unreachable!(
-                "std::any::type_name::<F>() did not contain '::': {type_name:?}"
-            ));
-        let bin_path = std::fs::read_link("/proc/self/exe")
-            .map_err(ContainerError::BinaryPathRead)?;
-        let bin_parent = bin_path
-            .parent()
-            .ok_or_else(|| ContainerError::NoParentDirectory {
-                path: bin_path.clone(),
-            })?;
-        let bin_dir = std::fs::canonicalize(bin_parent)
-            .map_err(ContainerError::BinaryPathCanonicalize)?;
-        let bin_dir_str = bin_dir
-            .to_str()
-            .ok_or_else(|| ContainerError::NonUtf8Path {
-                path: bin_dir.clone(),
-            })?;
-        let bin_path_str = bin_path
-            .to_str()
-            .ok_or_else(|| ContainerError::NonUtf8Path {
-                path: bin_path.clone(),
-            })?;
+        let params = resolve_test_params::<F>()?;
+        let config = build_container_config(&params);
 
-        // ── Resolve device group ownership ───────────────────────────
-        // The container process runs as the current user.  To access the
-        // required device nodes we add the owning groups via --group-add.
-        use std::os::unix::fs::MetadataExt;
-        let docker_host = std::env::var("DOCKER_HOST")
-            .unwrap_or("/var/run/docker.sock".into())
-            .trim_start_matches("unix://")
-            .to_string();
-        // Derive the group-ownership list from REQUIRED_DEVICES (the
-        // same array used for --device mappings) plus the Docker socket.
-        // This prevents drift between the two lists — previously
-        // /dev/net/tun was in REQUIRED_DEVICES but absent here.
-        let required_files: Vec<String> = REQUIRED_DEVICES
-            .iter()
-            .map(|&s| s.to_string())
-            .chain(std::iter::once(docker_host))
-            .collect();
-        let mut device_groups: Vec<String> = required_files
-            .iter()
-            .map(|path| {
-                std::fs::metadata(path)
-                    .map(|m| m.gid().to_string())
-                    .map_err(|source| ContainerError::DeviceNotAccessible {
-                        path: path.clone(),
-                        source,
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        device_groups.sort_unstable();
-        device_groups.dedup();
-
-        // ── Build container configuration ────────────────────────────
-        let uid = nix::unistd::getuid().as_raw();
-        let gid = nix::unistd::getgid().as_raw();
-        let config = build_container_config(&ContainerParams {
-            bin_path: bin_path_str,
-            bin_dir: bin_dir_str,
-            test_name,
-            uid,
-            gid,
-            device_groups,
-        });
-
-        // ── Create and start the container ───────────────────────────
         let client = bollard::Docker::connect_with_unix_defaults()
             .map_err(ContainerError::DockerConnect)?;
-        let container = client
-            .create_container(
-                Some(CreateContainerOptions {
-                    name: None,
-                    platform: CONTAINER_PLATFORM.into(),
-                }),
-                config,
-            )
-            .await
-            .map_err(ContainerError::ContainerCreate)?;
-        client
-            .start_container(&container.id, None::<StartContainerOptions>)
-            .await
-            .map_err(ContainerError::ContainerStart)?;
-
-        // ── Stream container logs to host stdout/stderr ──────────────
-        let mut logs = client.logs(
-            &container.id,
-            Some(bollard::query_parameters::LogsOptions {
-                follow: true,
-                stdout: true,
-                stderr: true,
-                tail: "all".into(),
-                ..Default::default()
-            }),
-        );
-        while let Some(log) = logs.next().await {
-            match log {
-                Ok(msg) => match msg {
-                    bollard::container::LogOutput::StdErr { message } => {
-                        eprint!("{}", String::from_utf8_lossy(&message));
-                    }
-                    bollard::container::LogOutput::StdOut { message }
-                    | bollard::container::LogOutput::Console { message } => {
-                        print!("{}", String::from_utf8_lossy(&message));
-                    }
-                    bollard::container::LogOutput::StdIn { .. } => unreachable!(),
-                },
-                Err(e) => {
-                    return Err(ContainerError::LogStream(e));
-                }
-            }
-        }
-
-        // ── Collect exit status and clean up ─────────────────────────
-        let state = client
-            .inspect_container(&container.id, None::<InspectContainerOptions>)
-            .await
-            .map_err(ContainerError::ContainerInspect)?
-            .state
-            .ok_or(ContainerError::MissingState)?;
-        client
-            .remove_container(&container.id, None::<RemoveContainerOptions>)
-            .await
-            .map_err(ContainerError::ContainerRemove)?;
-
-        Ok(ContainerTestResult {
-            exit_code: state.exit_code,
-        })
+        let container_id = create_and_start_container(&client, config).await?;
+        stream_container_logs(&client, &container_id).await?;
+        collect_and_cleanup(&client, &container_id).await
     })
 }
