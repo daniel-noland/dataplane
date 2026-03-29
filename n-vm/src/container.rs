@@ -248,12 +248,15 @@ pub fn run_test_in_vm<F: FnOnce()>(
             .unwrap_or("/var/run/docker.sock".into())
             .trim_start_matches("unix://")
             .to_string();
-        let required_files: [String; 4] = [
-            "/dev/kvm".into(),
-            "/dev/vhost-vsock".into(),
-            "/dev/vhost-net".into(),
-            docker_host,
-        ];
+        // Derive the group-ownership list from REQUIRED_DEVICES (the
+        // same array used for --device mappings) plus the Docker socket.
+        // This prevents drift between the two lists — previously
+        // /dev/net/tun was in REQUIRED_DEVICES but absent here.
+        let required_files: Vec<String> = REQUIRED_DEVICES
+            .iter()
+            .map(|&s| s.to_string())
+            .chain(std::iter::once(docker_host))
+            .collect();
         let mut device_groups: Vec<String> = required_files
             .iter()
             .map(|path| {
