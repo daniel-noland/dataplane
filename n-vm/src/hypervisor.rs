@@ -34,6 +34,14 @@ pub enum Source {
     /// A virtio device backend.
     #[serde(rename = "virtio-device")]
     VirtioDevice,
+    /// An unrecognised source emitted by a newer cloud-hypervisor version.
+    ///
+    /// Using `#[serde(other)]` ensures that new source strings do not cause
+    /// deserialization failures, which would otherwise downgrade the
+    /// [`HypervisorVerdict`] to [`Failure`](HypervisorVerdict::Failure) and
+    /// turn an otherwise passing test into a false negative.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The type of hypervisor lifecycle event.
@@ -60,6 +68,15 @@ pub enum EventType {
     /// The guest kernel panicked.
     #[serde(rename = "panic")]
     Panic,
+    /// An unrecognised event type emitted by a newer cloud-hypervisor
+    /// version.
+    ///
+    /// Using `#[serde(other)]` ensures that new event types do not cause
+    /// deserialization failures, which would otherwise downgrade the
+    /// [`HypervisorVerdict`] to [`Failure`](HypervisorVerdict::Failure) and
+    /// turn an otherwise passing test into a false negative.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A single event from the cloud-hypervisor event monitor.
