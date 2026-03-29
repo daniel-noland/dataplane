@@ -19,9 +19,9 @@
 //!    the same test binary inside it.
 //!
 //! 2. **Container** (`IN_TEST_CONTAINER=YES`) -- inside the Docker container.
-//!    Delegates to [`n_vm::dispatch::run_container_tier`] which boots a
-//!    cloud-hypervisor VM, shares the test binary into the guest via
-//!    virtiofs, and re-executes the test inside the VM.
+//!    Delegates to [`n_vm::dispatch::run_container_tier`] which boots a VM
+//!    using the selected hypervisor backend, shares the test binary into the
+//!    guest via virtiofs, and re-executes the test inside the VM.
 //!
 //! 3. **VM guest** (`IN_VM=YES`) -- inside the virtual machine, running under
 //!    the `n-it` init system.  The original test body executes directly.
@@ -32,6 +32,21 @@
 //! changes do not require proc-macro recompilation and the logic is
 //! testable and debuggable as normal Rust code.
 //!
+//! # Backend selection
+//!
+//! The macro accepts an optional argument to select the hypervisor backend
+//! used at the container tier:
+//!
+//! | Attribute | Backend |
+//! |-----------|---------|
+//! | `#[in_vm]` | [`CloudHypervisor`] (default) |
+//! | `#[in_vm(cloud_hypervisor)]` | [`CloudHypervisor`] (explicit) |
+//! | `#[in_vm(qemu)]` | [`Qemu`] |
+//!
+//! The backend identifier is case-sensitive and must match one of the
+//! supported values exactly.  Any other identifier produces a compile
+//! error listing the valid options.
+//!
 //! # Usage
 //!
 //! ```ignore
@@ -39,8 +54,22 @@
 //!
 //! #[test]
 //! #[in_vm]
-//! fn my_test() {
-//!     // This body runs inside an ephemeral VM.
+//! fn my_test_on_default_backend() {
+//!     // This body runs inside an ephemeral VM (cloud-hypervisor).
+//!     assert!(std::path::Path::new("/proc").exists());
+//! }
+//!
+//! #[test]
+//! #[in_vm(qemu)]
+//! fn my_test_on_qemu() {
+//!     // This body runs inside an ephemeral VM (QEMU).
+//!     assert!(std::path::Path::new("/proc").exists());
+//! }
+//!
+//! #[test]
+//! #[in_vm(cloud_hypervisor)]
+//! fn my_test_on_cloud_hypervisor() {
+//!     // Equivalent to bare `#[in_vm]`.
 //!     assert!(std::path::Path::new("/proc").exists());
 //! }
 //! ```
@@ -54,10 +83,52 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{ReturnType, parse_macro_input};
 
+/// Recognised backend identifiers and their corresponding type paths.
+///
+/// Each entry maps a user-facing identifier (the string written inside
+/// `#[in_vm(...)]`) to the fully-qualified type path emitted in the
+/// generated code.
+const KNOWN_BACKENDS: &[(&str, &str)] = &[
+    ("cloud_hypervisor", "::n_vm::CloudHypervisor"),
+    ("qemu", "::n_vm::Qemu"),
+];
+
+/// The type path used when no backend is specified (`#[in_vm]`).
+const DEFAULT_BACKEND_PATH: &str = "::n_vm::CloudHypervisor";
+
+/// Builds a human-readable list of valid backend identifiers for use in
+/// error messages.
+fn known_backend_list() -> String {
+    KNOWN_BACKENDS
+        .iter()
+        .map(|(name, _)| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolves a backend identifier to the corresponding type path.
+///
+/// Returns `None` if the identifier is not recognised.
+fn resolve_backend(ident: &str) -> Option<&'static str> {
+    KNOWN_BACKENDS
+        .iter()
+        .find(|(name, _)| *name == ident)
+        .map(|(_, path)| *path)
+}
+
 /// Attribute macro that rewrites a test function to run inside an ephemeral VM.
 ///
 /// See the [crate-level documentation](crate) for a full description of the
-/// three-tier dispatch mechanism and usage examples.
+/// three-tier dispatch mechanism, backend selection, and usage examples.
+///
+/// # Backend selection
+///
+/// An optional argument selects the hypervisor backend:
+///
+/// - `#[in_vm]` -- uses [`CloudHypervisor`](::n_vm::CloudHypervisor)
+///   (the default).
+/// - `#[in_vm(cloud_hypervisor)]` -- same as above, explicitly.
+/// - `#[in_vm(qemu)]` -- uses [`Qemu`](::n_vm::Qemu).
 ///
 /// # Compile-time validation
 ///
@@ -69,6 +140,11 @@ use syn::{ReturnType, parse_macro_input};
 /// - **Non-unit return type** -- the generated dispatch branches use bare
 ///   `return;` statements, so the function must return `()`.
 ///
+/// The macro also rejects:
+/// - **Multiple arguments** -- only a single backend identifier is accepted.
+/// - **Unrecognised identifiers** -- the backend name must be one of the
+///   supported values.
+///
 /// # Panics
 ///
 /// The generated code panics if:
@@ -77,18 +153,54 @@ use syn::{ReturnType, parse_macro_input};
 /// - The tokio runtime cannot be created.
 #[proc_macro_attribute]
 pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        return syn::Error::new(
-            proc_macro2::Span::call_site(),
-            "#[in_vm] does not accept any arguments",
-        )
-        .to_compile_error()
-        .into();
-    }
+    // ── Parse backend selection ──────────────────────────────────────
+
+    let backend_path: proc_macro2::TokenStream = if attr.is_empty() {
+        // No argument: use the default backend.
+        DEFAULT_BACKEND_PATH
+            .parse()
+            .expect("DEFAULT_BACKEND_PATH is a valid token stream")
+    } else {
+        // Parse the attribute contents as a single identifier.
+        let ident = match syn::parse::<syn::Ident>(attr) {
+            Ok(ident) => ident,
+            Err(_) => {
+                return syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "#[in_vm] expects a single backend identifier; \
+                         valid backends are: {}",
+                        known_backend_list(),
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+        };
+
+        let ident_str = ident.to_string();
+        match resolve_backend(&ident_str) {
+            Some(path) => path
+                .parse()
+                .expect("KNOWN_BACKENDS paths are valid token streams"),
+            None => {
+                return syn::Error::new_spanned(
+                    ident,
+                    format!(
+                        "unknown #[in_vm] backend `{ident_str}`; \
+                         valid backends are: {}",
+                        known_backend_list(),
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+    };
+
+    // ── Parse and validate the function ──────────────────────────────
 
     let func = parse_macro_input!(input as syn::ItemFn);
-
-    // Validate function signature
 
     if func.sig.asyncness.is_some() {
         return syn::Error::new_spanned(
@@ -120,7 +232,7 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
         .into();
     }
 
-    // Code generation
+    // ── Code generation ──────────────────────────────────────────────
 
     let block = &func.block;
     let vis = &func.vis;
@@ -147,7 +259,7 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
 
             // Tier 2: Docker container -> VM
             if ::n_vm::is_in_test_container() {
-                ::n_vm::run_container_tier::<::n_vm::CloudHypervisor, _>(#ident);
+                ::n_vm::run_container_tier::<#backend_path, _>(#ident);
                 return;
             }
 
