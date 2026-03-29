@@ -4,13 +4,24 @@
 //! nested test environment:
 //!
 //! 1. **Host** -- launches a Docker container via [`n-vm`](../n-vm).
-//! 2. **Container** -- launches a cloud-hypervisor VM via [`n-vm`](../n-vm).
+//! 2. **Container** -- launches a VM via a pluggable
+//!    [`HypervisorBackend`](../n_vm/backend/trait.HypervisorBackend.html)
+//!    (cloud-hypervisor, QEMU, etc.).
 //! 3. **VM guest** -- runs an init system ([`n-it`](../n-it)) that spawns the
 //!    test binary.
 //!
 //! All magic numbers, filesystem paths, and environment variable names that
 //! must agree across crate boundaries live here so that drift is caught at
 //! compile time rather than at runtime.
+//!
+//! # Backend-specific constants
+//!
+//! Most constants in this crate are shared across all hypervisor backends
+//! (filesystem layout, environment variables, vsock channels, etc.).
+//! A small number are specific to a single backend and are annotated as
+//! such in their documentation.  These exist here rather than in the
+//! backend module because they define paths baked into the container image,
+//! which is itself a cross-crate contract.
 
 use std::path::PathBuf;
 
@@ -18,8 +29,9 @@ use std::path::PathBuf;
 
 /// Docker image used by the host tier to launch the test container.
 ///
-/// This image contains cloud-hypervisor, virtiofsd, the `n-it` init system
-/// binary, and a minimal Linux kernel (`bzImage`).
+/// This image contains the hypervisor binaries (cloud-hypervisor, and
+/// eventually QEMU), virtiofsd, the `n-it` init system binary, and a
+/// minimal Linux kernel (`bzImage`).
 ///
 /// TODO: make this configurable (e.g. via environment variable or builder
 /// pattern) so that CI and local development can use different images.
@@ -242,7 +254,12 @@ pub const VIRTIOFSD_SOCKET_PATH: &str = "/vm/virtiofsd.sock";
 /// Path to the vhost-vsock Unix socket used by cloud-hypervisor.
 pub const VHOST_VSOCK_SOCKET_PATH: &str = "/vm/vhost.vsock";
 
-/// Path to the cloud-hypervisor API Unix socket.
+/// Path to the hypervisor control-plane Unix socket.
+///
+/// Cloud-hypervisor uses this path for its REST API socket
+/// (`--api-socket`); QEMU would use it for its QMP socket
+/// (`-chardev socket,path=...`).  Only one hypervisor runs per VM, so
+/// both backends can share the same path.
 pub const HYPERVISOR_API_SOCKET_PATH: &str = "/vm/hypervisor.sock";
 
 /// Path to the serial/kernel console Unix socket.
@@ -273,4 +290,9 @@ pub const INIT_BINARY_PATH: &str = "/bin/n-it";
 pub const VIRTIOFSD_BINARY_PATH: &str = "/bin/virtiofsd";
 
 /// Path to the cloud-hypervisor binary inside the container.
+///
+/// **Backend-specific**: used only by the
+/// [`CloudHypervisor`](../n_vm/cloud_hypervisor/struct.CloudHypervisor.html)
+/// backend.  Other backends define their own binary path constants (or
+/// will, once added).
 pub const CLOUD_HYPERVISOR_BINARY_PATH: &str = "/bin/cloud-hypervisor";
