@@ -384,7 +384,7 @@ impl<'a> TestVmParams<'a> {
         VmConfig {
             payload: self.build_payload_config(),
             vsock: Some(VsockConfig {
-                cid: VM_GUEST_CID as _,
+                cid: VM_GUEST_CID.as_raw() as _,
                 socket: VHOST_VSOCK_SOCKET_PATH.into(),
                 pci_segment: Some(0),
                 ..Default::default()

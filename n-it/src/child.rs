@@ -68,7 +68,7 @@ pub async fn spawn_main_process() -> Result<Child, SpawnError> {
     // Connect vsock streams for stdout and stderr.  The container tier
     // has already bound Unix listeners at the corresponding paths, so
     // these connections succeed immediately.
-    let stdout_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDOUT.port);
+    let stdout_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDOUT.port.as_raw());
     let stdout_stream = vsock::VsockStream::connect(&stdout_addr).map_err(|e| {
         SpawnError::VsockConnect {
             channel: "stdout",
@@ -76,7 +76,7 @@ pub async fn spawn_main_process() -> Result<Child, SpawnError> {
         }
     })?;
 
-    let stderr_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDERR.port);
+    let stderr_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDERR.port.as_raw());
     let stderr_stream = vsock::VsockStream::connect(&stderr_addr).map_err(|e| {
         SpawnError::VsockConnect {
             channel: "stderr",
