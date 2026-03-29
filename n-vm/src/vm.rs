@@ -107,168 +107,6 @@ async fn wait_for_socket(path: impl AsRef<Path>) -> Result<(), VmError> {
     })
 }
 
-// ── Helper: vsock reader ─────────────────────────────────────────────
-
-/// Binds a Unix listener for the given [`VsockChannel`], then spawns a
-/// task that accepts a single connection and reads it to EOF.
-///
-/// This pattern is shared by the init-system tracing channel, test stdout,
-/// and test stderr — all of which are vsock streams that the VM guest
-/// connects to via `vhost_vsock`.
-///
-/// The listener must be bound *before* the VM boots so that the guest-side
-/// `vsock::VsockStream::connect()` succeeds immediately.
-fn spawn_vsock_reader(channel: &VsockChannel) -> Result<AbortOnDrop<String>, VmError> {
-    let path = channel.listener_path();
-    let label = channel.label;
-    let listen = tokio::net::UnixListener::bind(&path).map_err(|source| VmError::VsockBind {
-        label,
-        path: path.clone(),
-        source,
-    })?;
-    Ok(AbortOnDrop::spawn(async move {
-        let mut buf = Vec::with_capacity(VSOCK_READER_CAPACITY);
-        let mut connection = match listen.accept().await {
-            Ok((stream, _)) => stream,
-            Err(e) => {
-                error!("failed to accept {label} vsock connection: {e}");
-                return format!(
-                    "!!!{} UNAVAILABLE: accept failed: {e}!!!",
-                    label.to_uppercase()
-                );
-            }
-        };
-        loop {
-            match connection.read_buf(&mut buf).await {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    error!("error reading {label} vsock stream: {e}");
-                    break;
-                }
-            }
-        }
-        String::from_utf8_lossy(&buf).into_owned()
-    }))
-}
-
-// ── Helper: virtiofsd ────────────────────────────────────────────────
-
-/// Spawns a virtiofsd process that shares `path` into the VM as a
-/// read-only virtiofs mount.
-async fn launch_virtiofsd(path: impl AsRef<str>) -> Result<tokio::process::Child, VmError> {
-    let uid = nix::unistd::getuid().as_raw();
-    let gid = nix::unistd::getgid().as_raw();
-    tokio::process::Command::new(VIRTIOFSD_BINARY_PATH)
-        .arg("--shared-dir")
-        .arg(path.as_ref())
-        .arg("--readonly")
-        .arg("--tag")
-        .arg(VIRTIOFS_ROOT_TAG)
-        .arg("--socket-path")
-        .arg(VIRTIOFSD_SOCKET_PATH)
-        .arg("--announce-submounts")
-        .arg("--sandbox=none")
-        .arg("--rlimit-nofile=0")
-        .arg(format!(
-            "--translate-uid=squash-host:0:{uid}:{MAX}",
-            MAX = u32::MAX
-        ))
-        .arg(format!(
-            "--translate-gid=squash-host:0:{gid}:{MAX}",
-            MAX = u32::MAX
-        ))
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(VmError::VirtiofsdSpawn)
-}
-
-// ── Helper: hypervisor process ───────────────────────────────────────
-
-/// Creates the event-monitor pipe, verifies `/dev/kvm`, spawns the
-/// cloud-hypervisor binary, and waits for the API socket to appear.
-///
-/// Returns the child process handle and the event-monitor pipe receiver
-/// (which is consumed by [`hypervisor::watch`]).
-async fn spawn_hypervisor() -> Result<(tokio::process::Child, tokio::net::unix::pipe::Receiver), VmError> {
-    let (event_sender, event_receiver) =
-        tokio::net::unix::pipe::pipe().map_err(VmError::EventPipe)?;
-    let event_sender = event_sender
-        .into_blocking_fd()
-        .map_err(VmError::EventSenderFd)?;
-
-    match tokio::fs::try_exists("/dev/kvm").await {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(VmError::KvmNotAccessible(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "/dev/kvm does not exist",
-            )));
-        }
-        Err(err) => {
-            return Err(VmError::KvmNotAccessible(err));
-        }
-    }
-
-    let hypervisor = tokio::process::Command::new(CLOUD_HYPERVISOR_BINARY_PATH)
-        .args([
-            "--api-socket",
-            format!("path={HYPERVISOR_API_SOCKET_PATH}").as_str(),
-            "--event-monitor",
-            format!("fd={EVENT_MONITOR_FD}").as_str(),
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
-        .kill_on_drop(true)
-        .fd_mappings(vec![FdMapping {
-            parent_fd: event_sender,
-            child_fd: EVENT_MONITOR_FD,
-        }])
-        .map_err(|e| VmError::FdMapping(format!("{e:?}")))?
-        .spawn()
-        .map_err(VmError::HypervisorSpawn)?;
-
-    // The first VMM event becoming readable indicates the hypervisor
-    // has started.  We then poll until the API socket appears on the
-    // filesystem.
-    event_receiver
-        .readable()
-        .await
-        .map_err(VmError::EventMonitorNotReadable)?;
-    wait_for_socket(HYPERVISOR_API_SOCKET_PATH).await?;
-
-    Ok((hypervisor, event_receiver))
-}
-
-// ── Helper: kernel console reader ────────────────────────────────────
-
-/// Spawns a background task that connects to the kernel serial console
-/// socket and reads it to EOF.
-///
-/// The console socket is created by cloud-hypervisor after the VM boots,
-/// so the task polls for its existence before attempting to connect.
-fn spawn_kernel_log_reader() -> AbortOnDrop<String> {
-    AbortOnDrop::spawn(async move {
-        if let Err(e) = wait_for_socket(KERNEL_CONSOLE_SOCKET_PATH).await {
-            return format!("!!!KERNEL LOG UNAVAILABLE: socket not ready: {e}!!!");
-        }
-        match tokio::net::UnixStream::connect(KERNEL_CONSOLE_SOCKET_PATH).await {
-            Ok(mut stream) => {
-                let mut log = String::with_capacity(16_384);
-                if let Err(e) = stream.read_to_string(&mut log).await {
-                    warn!("error reading kernel console: {e}");
-                }
-                log
-            }
-            Err(e) => format!("!!!KERNEL LOG UNAVAILABLE: connect failed: {e}!!!"),
-        }
-    })
-}
-
 // ── Helper: process output collection ────────────────────────────────
 
 /// Collected stdout and stderr from a child process.
@@ -292,6 +130,56 @@ pub struct ProcessOutput {
 }
 
 impl ProcessOutput {
+    // ── Construction ─────────────────────────────────────────────────
+
+    /// Waits for a child process to exit and collects its stdout/stderr as
+    /// UTF-8 strings.
+    ///
+    /// On I/O failure the process is treated as failed and the error is
+    /// placed in the stderr string so that it still appears in
+    /// [`VmTestOutput`]'s `Display` output.
+    async fn from_child(child: tokio::process::Child, label: &str) -> Self {
+        match child.wait_with_output().await {
+            Ok(output) => Self {
+                success: output.status.success(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            },
+            Err(err) => {
+                error!("failed to collect {label} output: {err}");
+                Self {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: format!("!!!OUTPUT UNAVAILABLE: {err}!!!"),
+                }
+            }
+        }
+    }
+
+    /// Awaits a [`JoinHandle<String>`], returning a fallback message on
+    /// panic or cancellation.
+    ///
+    /// This is an associated function rather than a constructor because it
+    /// returns a raw `String` (for use as a single output channel like
+    /// init-system tracing or kernel console output), not a full
+    /// [`ProcessOutput`].  It lives here because it is always used
+    /// alongside [`from_child`](Self::from_child) during the output
+    /// collection phase of [`TestVm::collect`].
+    async fn join_task_or_fallback(handle: JoinHandle<String>, label: &str) -> String {
+        match handle.await {
+            Ok(output) => output,
+            Err(err) => {
+                error!("failed to join {label} task: {err}");
+                format!(
+                    "!!!{} UNAVAILABLE: {err}!!!",
+                    label.to_uppercase()
+                )
+            }
+        }
+    }
+
+    // ── Formatting ───────────────────────────────────────────────────
+
     /// Formats the stdout and stderr sections with the given label prefix
     /// for inclusion in [`VmTestOutput`]'s `Display` output.
     fn fmt_sections(&self, f: &mut std::fmt::Formatter<'_>, label: &str) -> std::fmt::Result {
@@ -302,55 +190,21 @@ impl ProcessOutput {
     }
 }
 
-/// Waits for a child process to exit and collects its stdout/stderr as
-/// UTF-8 strings.
-///
-/// On I/O failure the process is treated as failed and the error is placed
-/// in the stderr string so that it still appears in [`VmTestOutput`]'s
-/// `Display` output.
-async fn collect_process_output(
-    child: tokio::process::Child,
-    label: &str,
-) -> ProcessOutput {
-    match child.wait_with_output().await {
-        Ok(output) => ProcessOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        },
-        Err(err) => {
-            error!("failed to collect {label} output: {err}");
-            ProcessOutput {
-                success: false,
-                stdout: String::new(),
-                stderr: format!("!!!OUTPUT UNAVAILABLE: {err}!!!"),
-            }
-        }
-    }
-}
-
-/// Awaits a [`JoinHandle<String>`], returning a fallback message on panic
-/// or cancellation.
-async fn join_or_fallback(handle: JoinHandle<String>, label: &str) -> String {
-    match handle.await {
-        Ok(output) => output,
-        Err(err) => {
-            error!("failed to join {label} task: {err}");
-            format!(
-                "!!!{} UNAVAILABLE: {err}!!!",
-                label.to_uppercase()
-            )
-        }
-    }
-}
-
 // ── VM config factory ────────────────────────────────────────────────
 
 /// Parameters that vary per test invocation and feed into the VM
 /// configuration.
 ///
 /// Everything else in the [`VmConfig`] is an infrastructure default
-/// that can eventually be overridden via a builder pattern.
+/// derived from the module-level constants.  Call
+/// [`build_vm_config`](Self::build_vm_config) to compose the full VM
+/// configuration from focused sub-builders.
+///
+/// # Usage
+///
+/// ```ignore
+/// let config = params.build_vm_config();
+/// ```
 pub struct TestVmParams<'a> {
     /// Full path to the test binary (e.g. `/path/to/deps/my_test-abc123`).
     pub full_bin_path: &'a str,
@@ -360,174 +214,180 @@ pub struct TestVmParams<'a> {
     pub test_name: &'a str,
 }
 
-/// Builds the kernel payload configuration, including the kernel command
-/// line that passes the test binary path and name to the init system.
-fn build_payload_config(params: &TestVmParams<'_>) -> PayloadConfig {
-    PayloadConfig {
-        firmware: None,
-        kernel: Some(KERNEL_IMAGE_PATH.into()),
-        cmdline: Some(format!(
-            "iommu=on \
-             intel_iommu=on \
-             amd_iommu=on \
-             vfio.enable_unsafe_noiommu_mode=1 \
-             earlyprintk=ttyS0 \
-             console=ttyS0 \
-             ro \
-             rootfstype=virtiofs \
-             root=root \
-             default_hugepagesz=2M \
-             hugepagesz=2M \
-             hugepages=16 \
-             init={INIT_BINARY_PATH} \
-             -- {full_bin_path} {test_name} --exact --no-capture --format=terse",
-            full_bin_path = params.full_bin_path,
-            test_name = params.test_name,
-        )),
-        ..Default::default()
+impl<'a> TestVmParams<'a> {
+    // ── Configuration building ───────────────────────────────────────
+
+    /// Builds the kernel payload configuration, including the kernel
+    /// command line that passes the test binary path and name to the init
+    /// system.
+    fn build_payload_config(&self) -> PayloadConfig {
+        PayloadConfig {
+            firmware: None,
+            kernel: Some(KERNEL_IMAGE_PATH.into()),
+            cmdline: Some(format!(
+                "iommu=on \
+                 intel_iommu=on \
+                 amd_iommu=on \
+                 vfio.enable_unsafe_noiommu_mode=1 \
+                 earlyprintk=ttyS0 \
+                 console=ttyS0 \
+                 ro \
+                 rootfstype=virtiofs \
+                 root=root \
+                 default_hugepagesz=2M \
+                 hugepagesz=2M \
+                 hugepages=16 \
+                 init={INIT_BINARY_PATH} \
+                 -- {full_bin_path} {test_name} --exact --no-capture --format=terse",
+                full_bin_path = self.full_bin_path,
+                test_name = self.test_name,
+            )),
+            ..Default::default()
+        }
     }
-}
 
-/// Builds the CPU topology: 6 vCPUs arranged as 3 dies × 1 core × 2 threads.
-fn build_cpu_config() -> CpusConfig {
-    CpusConfig {
-        boot_vcpus: 6,
-        max_vcpus: 6,
-        topology: Some(CpuTopology {
-            threads_per_core: Some(2),
-            cores_per_die: Some(1),
-            dies_per_package: Some(3),
-            packages: Some(1),
-        }),
-        ..Default::default()
+    /// Builds the CPU topology: 6 vCPUs arranged as 3 dies × 1 core × 2
+    /// threads.
+    fn build_cpu_config() -> CpusConfig {
+        CpusConfig {
+            boot_vcpus: 6,
+            max_vcpus: 6,
+            topology: Some(CpuTopology {
+                threads_per_core: Some(2),
+                cores_per_die: Some(1),
+                dies_per_package: Some(3),
+                packages: Some(1),
+            }),
+            ..Default::default()
+        }
     }
-}
 
-/// Builds the memory configuration: 512 MiB with 2 MiB hugepages.
-fn build_memory_config() -> MemoryConfig {
-    MemoryConfig {
-        size: 512 * 1024 * 1024, // 512 MiB
-        mergeable: Some(true),
-        shared: Some(true),
-        hugepages: Some(true),
-        hugepage_size: Some(2 * 1024 * 1024), // 2 MiB
-        thp: Some(true),
-        ..Default::default()
+    /// Builds the memory configuration: 512 MiB with 2 MiB hugepages.
+    fn build_memory_config() -> MemoryConfig {
+        MemoryConfig {
+            size: 512 * 1024 * 1024, // 512 MiB
+            mergeable: Some(true),
+            shared: Some(true),
+            hugepages: Some(true),
+            hugepage_size: Some(2 * 1024 * 1024), // 2 MiB
+            thp: Some(true),
+            ..Default::default()
+        }
     }
-}
 
-/// Builds the network interface configurations.
-///
-/// Returns three interfaces:
-/// - **mgmt** — management network on PCI segment 0 (1500 MTU).
-/// - **fabric1** / **fabric2** — fabric-facing interfaces on PCI segment 1
-///   (9500 MTU jumbo frames).
-fn build_network_configs() -> Vec<NetConfig> {
-    vec![
-        NetConfig {
-            tap: Some("mgmt".into()),
-            ip: Some("fe80::ffff:1".into()),
-            mask: Some("ffff:ffff:ffff:ffff::".into()),
-            mac: Some("02:DE:AD:BE:EF:01".into()),
-            mtu: Some(1500),
-            id: Some("mgmt".into()),
-            pci_segment: Some(0),
-            queue_size: Some(512),
-            ..Default::default()
-        },
-        NetConfig {
-            tap: Some("fabric1".into()),
-            ip: Some("fe80::1".into()),
-            mask: Some("ffff:ffff:ffff:ffff::".into()),
-            mac: Some("02:CA:FE:BA:BE:01".into()),
-            mtu: Some(9500),
-            id: Some("fabric1".into()),
-            pci_segment: Some(1),
-            queue_size: Some(8192),
-            ..Default::default()
-        },
-        NetConfig {
-            tap: Some("fabric2".into()),
-            ip: Some("fe80::2".into()),
-            mask: Some("ffff:ffff:ffff:ffff::".into()),
-            mac: Some("02:CA:FE:BA:BE:02".into()),
-            mtu: Some(9500),
-            id: Some("fabric2".into()),
-            pci_segment: Some(1),
-            queue_size: Some(8192),
-            ..Default::default()
-        },
-    ]
-}
-
-/// Builds the virtiofs filesystem configuration for sharing the container
-/// filesystem into the VM.
-fn build_fs_config() -> Vec<FsConfig> {
-    vec![FsConfig {
-        tag: VIRTIOFS_ROOT_TAG.into(),
-        socket: VIRTIOFSD_SOCKET_PATH.into(),
-        num_queues: 1,
-        queue_size: 1024,
-        id: Some(VIRTIOFS_ROOT_TAG.into()),
-        ..Default::default()
-    }]
-}
-
-/// Builds the platform metadata configuration, embedding the test binary
-/// name and test name in OEM strings for identification.
-fn build_platform_config(params: &TestVmParams<'_>) -> PlatformConfig {
-    PlatformConfig {
-        serial_number: Some("dataplane-test".into()),
-        uuid: Some("dff9c8dd-492d-4148-a007-7931f94db852".into()), // arbitrary uuid4
-        oem_strings: Some(vec![
-            format!("exe={}", params.bin_name),
-            format!("test={}", params.test_name),
-        ]),
-        num_pci_segments: Some(2),
-        ..Default::default()
+    /// Builds the network interface configurations.
+    ///
+    /// Returns three interfaces:
+    /// - **mgmt** — management network on PCI segment 0 (1500 MTU).
+    /// - **fabric1** / **fabric2** — fabric-facing interfaces on PCI
+    ///   segment 1 (9500 MTU jumbo frames).
+    fn build_network_configs() -> Vec<NetConfig> {
+        vec![
+            NetConfig {
+                tap: Some("mgmt".into()),
+                ip: Some("fe80::ffff:1".into()),
+                mask: Some("ffff:ffff:ffff:ffff::".into()),
+                mac: Some("02:DE:AD:BE:EF:01".into()),
+                mtu: Some(1500),
+                id: Some("mgmt".into()),
+                pci_segment: Some(0),
+                queue_size: Some(512),
+                ..Default::default()
+            },
+            NetConfig {
+                tap: Some("fabric1".into()),
+                ip: Some("fe80::1".into()),
+                mask: Some("ffff:ffff:ffff:ffff::".into()),
+                mac: Some("02:CA:FE:BA:BE:01".into()),
+                mtu: Some(9500),
+                id: Some("fabric1".into()),
+                pci_segment: Some(1),
+                queue_size: Some(8192),
+                ..Default::default()
+            },
+            NetConfig {
+                tap: Some("fabric2".into()),
+                ip: Some("fe80::2".into()),
+                mask: Some("ffff:ffff:ffff:ffff::".into()),
+                mac: Some("02:CA:FE:BA:BE:02".into()),
+                mtu: Some(9500),
+                id: Some("fabric2".into()),
+                pci_segment: Some(1),
+                queue_size: Some(8192),
+                ..Default::default()
+            },
+        ]
     }
-}
 
-/// Builds the cloud-hypervisor [`VmConfig`] for a test run.
-///
-/// This function composes the VM configuration from focused sub-builders,
-/// each responsible for a single aspect of the configuration (payload, CPU,
-/// memory, network, filesystem, platform).  The sub-builders can be tested
-/// and evolved independently.
-///
-/// The virtio-console is disabled (`Mode::Off`) because test stdout/stderr
-/// are forwarded via dedicated [`VsockChannel`]s instead.
-fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
-    VmConfig {
-        payload: build_payload_config(params),
-        vsock: Some(VsockConfig {
-            cid: VM_GUEST_CID as _,
-            socket: VHOST_VSOCK_SOCKET_PATH.into(),
-            pci_segment: Some(0),
+    /// Builds the virtiofs filesystem configuration for sharing the
+    /// container filesystem into the VM.
+    fn build_fs_config() -> Vec<FsConfig> {
+        vec![FsConfig {
+            tag: VIRTIOFS_ROOT_TAG.into(),
+            socket: VIRTIOFSD_SOCKET_PATH.into(),
+            num_queues: 1,
+            queue_size: 1024,
+            id: Some(VIRTIOFS_ROOT_TAG.into()),
             ..Default::default()
-        }),
-        cpus: Some(build_cpu_config()),
-        memory: Some(build_memory_config()),
-        net: Some(build_network_configs()),
-        fs: Some(build_fs_config()),
-        // The virtio-console is disabled: test stdout/stderr travel over
-        // dedicated VsockChannels (TEST_STDOUT / TEST_STDERR).
-        console: Some(ConsoleConfig::new(Mode::Off)),
-        serial: Some(ConsoleConfig {
-            mode: Mode::Socket,
-            socket: Some(KERNEL_CONSOLE_SOCKET_PATH.into()),
+        }]
+    }
+
+    /// Builds the platform metadata configuration, embedding the test
+    /// binary name and test name in OEM strings for identification.
+    fn build_platform_config(&self) -> PlatformConfig {
+        PlatformConfig {
+            serial_number: Some("dataplane-test".into()),
+            uuid: Some("dff9c8dd-492d-4148-a007-7931f94db852".into()), // arbitrary uuid4
+            oem_strings: Some(vec![
+                format!("exe={}", self.bin_name),
+                format!("test={}", self.test_name),
+            ]),
+            num_pci_segments: Some(2),
             ..Default::default()
-        }),
-        iommu: Some(false),
-        watchdog: Some(true),
-        platform: Some(build_platform_config(params)),
-        pvpanic: Some(true),
-        landlock_enable: Some(true),
-        landlock_rules: Some(vec![LandlockConfig {
-            path: VM_RUN_DIR.into(),
-            access: "rw".into(),
-        }]),
-        ..Default::default()
+        }
+    }
+
+    /// Builds the cloud-hypervisor [`VmConfig`] for a test run.
+    ///
+    /// This method composes the VM configuration from focused sub-builders,
+    /// each responsible for a single aspect of the configuration (payload,
+    /// CPU, memory, network, filesystem, platform).  The sub-builders can
+    /// be tested and evolved independently.
+    ///
+    /// The virtio-console is disabled (`Mode::Off`) because test
+    /// stdout/stderr are forwarded via dedicated [`VsockChannel`]s instead.
+    fn build_vm_config(&self) -> VmConfig {
+        VmConfig {
+            payload: self.build_payload_config(),
+            vsock: Some(VsockConfig {
+                cid: VM_GUEST_CID as _,
+                socket: VHOST_VSOCK_SOCKET_PATH.into(),
+                pci_segment: Some(0),
+                ..Default::default()
+            }),
+            cpus: Some(Self::build_cpu_config()),
+            memory: Some(Self::build_memory_config()),
+            net: Some(Self::build_network_configs()),
+            fs: Some(Self::build_fs_config()),
+            // The virtio-console is disabled: test stdout/stderr travel
+            // over dedicated VsockChannels (TEST_STDOUT / TEST_STDERR).
+            console: Some(ConsoleConfig::new(Mode::Off)),
+            serial: Some(ConsoleConfig {
+                mode: Mode::Socket,
+                socket: Some(KERNEL_CONSOLE_SOCKET_PATH.into()),
+                ..Default::default()
+            }),
+            iommu: Some(false),
+            watchdog: Some(true),
+            platform: Some(self.build_platform_config()),
+            pvpanic: Some(true),
+            landlock_enable: Some(true),
+            landlock_rules: Some(vec![LandlockConfig {
+                path: VM_RUN_DIR.into(),
+                access: "rw".into(),
+            }]),
+            ..Default::default()
+        }
     }
 }
 
@@ -637,17 +497,184 @@ pub struct TestVm {
 }
 
 impl TestVm {
+    // ── Process spawning ─────────────────────────────────────────────
+
+    /// Binds a Unix listener for the given [`VsockChannel`], then spawns a
+    /// task that accepts a single connection and reads it to EOF.
+    ///
+    /// This pattern is shared by the init-system tracing channel, test
+    /// stdout, and test stderr — all of which are vsock streams that the
+    /// VM guest connects to via `vhost_vsock`.
+    ///
+    /// The listener must be bound *before* the VM boots so that the
+    /// guest-side `vsock::VsockStream::connect()` succeeds immediately.
+    fn spawn_vsock_reader(channel: &VsockChannel) -> Result<AbortOnDrop<String>, VmError> {
+        let path = channel.listener_path();
+        let label = channel.label;
+        let listen =
+            tokio::net::UnixListener::bind(&path).map_err(|source| VmError::VsockBind {
+                label,
+                path: path.clone(),
+                source,
+            })?;
+        Ok(AbortOnDrop::spawn(async move {
+            let mut buf = Vec::with_capacity(VSOCK_READER_CAPACITY);
+            let mut connection = match listen.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    error!("failed to accept {label} vsock connection: {e}");
+                    return format!(
+                        "!!!{} UNAVAILABLE: accept failed: {e}!!!",
+                        label.to_uppercase()
+                    );
+                }
+            };
+            loop {
+                match connection.read_buf(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("error reading {label} vsock stream: {e}");
+                        break;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }))
+    }
+
+    /// Spawns a virtiofsd process that shares `path` into the VM as a
+    /// read-only virtiofs mount.
+    async fn launch_virtiofsd(
+        path: impl AsRef<str>,
+    ) -> Result<tokio::process::Child, VmError> {
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        tokio::process::Command::new(VIRTIOFSD_BINARY_PATH)
+            .arg("--shared-dir")
+            .arg(path.as_ref())
+            .arg("--readonly")
+            .arg("--tag")
+            .arg(VIRTIOFS_ROOT_TAG)
+            .arg("--socket-path")
+            .arg(VIRTIOFSD_SOCKET_PATH)
+            .arg("--announce-submounts")
+            .arg("--sandbox=none")
+            .arg("--rlimit-nofile=0")
+            .arg(format!(
+                "--translate-uid=squash-host:0:{uid}:{MAX}",
+                MAX = u32::MAX
+            ))
+            .arg(format!(
+                "--translate-gid=squash-host:0:{gid}:{MAX}",
+                MAX = u32::MAX
+            ))
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(VmError::VirtiofsdSpawn)
+    }
+
+    /// Creates the event-monitor pipe, verifies `/dev/kvm`, spawns the
+    /// cloud-hypervisor binary, and waits for the API socket to appear.
+    ///
+    /// Returns the child process handle and the event-monitor pipe
+    /// receiver (which is consumed by [`hypervisor::watch`]).
+    async fn spawn_hypervisor()
+    -> Result<(tokio::process::Child, tokio::net::unix::pipe::Receiver), VmError> {
+        let (event_sender, event_receiver) =
+            tokio::net::unix::pipe::pipe().map_err(VmError::EventPipe)?;
+        let event_sender = event_sender
+            .into_blocking_fd()
+            .map_err(VmError::EventSenderFd)?;
+
+        match tokio::fs::try_exists("/dev/kvm").await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(VmError::KvmNotAccessible(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "/dev/kvm does not exist",
+                )));
+            }
+            Err(err) => {
+                return Err(VmError::KvmNotAccessible(err));
+            }
+        }
+
+        let hypervisor = tokio::process::Command::new(CLOUD_HYPERVISOR_BINARY_PATH)
+            .args([
+                "--api-socket",
+                format!("path={HYPERVISOR_API_SOCKET_PATH}").as_str(),
+                "--event-monitor",
+                format!("fd={EVENT_MONITOR_FD}").as_str(),
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .fd_mappings(vec![FdMapping {
+                parent_fd: event_sender,
+                child_fd: EVENT_MONITOR_FD,
+            }])
+            .map_err(|e| VmError::FdMapping(format!("{e:?}")))?
+            .spawn()
+            .map_err(VmError::HypervisorSpawn)?;
+
+        // The first VMM event becoming readable indicates the hypervisor
+        // has started.  We then poll until the API socket appears on the
+        // filesystem.
+        event_receiver
+            .readable()
+            .await
+            .map_err(VmError::EventMonitorNotReadable)?;
+        wait_for_socket(HYPERVISOR_API_SOCKET_PATH).await?;
+
+        Ok((hypervisor, event_receiver))
+    }
+
+    /// Spawns a background task that connects to the kernel serial console
+    /// socket and reads it to EOF.
+    ///
+    /// The console socket is created by cloud-hypervisor after the VM
+    /// boots, so the task polls for its existence before attempting to
+    /// connect.
+    fn spawn_kernel_log_reader() -> AbortOnDrop<String> {
+        AbortOnDrop::spawn(async move {
+            if let Err(e) = wait_for_socket(KERNEL_CONSOLE_SOCKET_PATH).await {
+                return format!("!!!KERNEL LOG UNAVAILABLE: socket not ready: {e}!!!");
+            }
+            match tokio::net::UnixStream::connect(KERNEL_CONSOLE_SOCKET_PATH).await {
+                Ok(mut stream) => {
+                    let mut log = String::with_capacity(16_384);
+                    if let Err(e) = stream.read_to_string(&mut log).await {
+                        warn!("error reading kernel console: {e}");
+                    }
+                    log
+                }
+                Err(e) => format!("!!!KERNEL LOG UNAVAILABLE: connect failed: {e}!!!"),
+            }
+        })
+    }
+
+    // ── Lifecycle ────────────────────────────────────────────────────
+
     /// Prepares the environment and boots the VM.
     ///
-    /// This method orchestrates five focused phases, each delegated to a
-    /// helper function:
+    /// This method orchestrates five focused phases, each delegated to an
+    /// associated function on this type:
     ///
-    /// 1. [`launch_virtiofsd`] — share the container filesystem into the VM.
-    /// 2. [`spawn_vsock_reader`] — bind vsock listeners for all channels.
-    /// 3. [`spawn_hypervisor`] — create the event pipe, verify `/dev/kvm`,
-    ///    spawn cloud-hypervisor, and wait for the API socket.
+    /// 1. [`launch_virtiofsd`](Self::launch_virtiofsd) — share the
+    ///    container filesystem into the VM.
+    /// 2. [`spawn_vsock_reader`](Self::spawn_vsock_reader) — bind vsock
+    ///    listeners for all channels.
+    /// 3. [`spawn_hypervisor`](Self::spawn_hypervisor) — create the event
+    ///    pipe, verify `/dev/kvm`, spawn cloud-hypervisor, and wait for the
+    ///    API socket.
     /// 4. Create and boot the VM via the hypervisor REST API.
-    /// 5. [`spawn_kernel_log_reader`] — start collecting kernel console output.
+    /// 5. [`spawn_kernel_log_reader`](Self::spawn_kernel_log_reader) —
+    ///    start collecting kernel console output.
     ///
     /// All background tasks are wrapped in [`AbortOnDrop`], so if any phase
     /// fails (or the method panics), previously spawned tasks are
@@ -655,20 +682,20 @@ impl TestVm {
     /// `kill_on_drop(true)` for the same guarantee.
     pub async fn launch(params: &TestVmParams<'_>) -> Result<Self, VmError> {
         // ── Phase 1: Launch virtiofsd ────────────────────────────────
-        let virtiofsd = launch_virtiofsd(VM_ROOT_SHARE_PATH).await?;
+        let virtiofsd = Self::launch_virtiofsd(VM_ROOT_SHARE_PATH).await?;
 
         // ── Phase 2: Bind vsock listeners ────────────────────────────
         // All listeners must be bound *before* the VM boots so that the
         // guest-side vsock connections succeed immediately.
-        let init_trace = spawn_vsock_reader(&VsockChannel::INIT_TRACE)?;
-        let test_stdout = spawn_vsock_reader(&VsockChannel::TEST_STDOUT)?;
-        let test_stderr = spawn_vsock_reader(&VsockChannel::TEST_STDERR)?;
+        let init_trace = Self::spawn_vsock_reader(&VsockChannel::INIT_TRACE)?;
+        let test_stdout = Self::spawn_vsock_reader(&VsockChannel::TEST_STDOUT)?;
+        let test_stderr = Self::spawn_vsock_reader(&VsockChannel::TEST_STDERR)?;
 
         // ── Phase 3: Spawn cloud-hypervisor ──────────────────────────
-        let (hypervisor, event_receiver) = spawn_hypervisor().await?;
+        let (hypervisor, event_receiver) = Self::spawn_hypervisor().await?;
 
         // ── Phase 4: Create and boot the VM ──────────────────────────
-        let config = build_vm_config(params);
+        let config = params.build_vm_config();
 
         let client = Arc::new(tokio::sync::Mutex::new(
             cloud_hypervisor_client::socket_based_api_client(HYPERVISOR_API_SOCKET_PATH),
@@ -695,7 +722,7 @@ impl TestVm {
             })?;
 
         // ── Phase 5: Start kernel console reader ─────────────────────
-        let kernel_log = spawn_kernel_log_reader();
+        let kernel_log = Self::spawn_kernel_log_reader();
 
         Ok(Self {
             hypervisor,
@@ -742,9 +769,9 @@ impl TestVm {
         // The vsock readers complete when the guest-side streams close
         // (test process exits → stdout/stderr close; n-it exits →
         // init_trace closes).
-        let init_trace = join_or_fallback(init_trace, "init system trace").await;
-        let test_stdout = join_or_fallback(test_stdout, "test stdout").await;
-        let test_stderr = join_or_fallback(test_stderr, "test stderr").await;
+        let init_trace = ProcessOutput::join_task_or_fallback(init_trace, "init system trace").await;
+        let test_stdout = ProcessOutput::join_task_or_fallback(test_stdout, "test stdout").await;
+        let test_stderr = ProcessOutput::join_task_or_fallback(test_stderr, "test stderr").await;
 
         // The event watcher completes when the hypervisor emits a
         // terminal event (Shutdown / Panic) or the pipe closes.
@@ -771,12 +798,12 @@ impl TestVm {
             debug!("vmm shutdown: {err}");
         }
 
-        let hypervisor_output = collect_process_output(hypervisor, "cloud-hypervisor").await;
+        let hypervisor_output = ProcessOutput::from_child(hypervisor, "cloud-hypervisor").await;
 
         // The kernel serial socket closes when the hypervisor exits.
-        let kernel_log = join_or_fallback(kernel_log, "kernel log").await;
+        let kernel_log = ProcessOutput::join_task_or_fallback(kernel_log, "kernel log").await;
 
-        let virtiofsd_output = collect_process_output(virtiofsd, "virtiofsd").await;
+        let virtiofsd_output = ProcessOutput::from_child(virtiofsd, "virtiofsd").await;
 
         // ── Assemble result ──────────────────────────────────────────
         //
