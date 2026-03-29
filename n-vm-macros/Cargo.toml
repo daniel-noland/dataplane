@@ -11,6 +11,6 @@ proc-macro = true
 [dependencies]
 
 # external
-proc-macro2 = { workspace = true, default-features = false, features = [] }
-quote = { workspace = true, default-features = false, features = [] }
-syn = { workspace = true, default-features = false, features = ["full"] }
+proc-macro2 = { workspace = true, default-features = true }
+quote = { workspace = true, default-features = true }
+syn = { workspace = true, default-features = true, features = ["full"] }
