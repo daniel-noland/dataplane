@@ -23,7 +23,9 @@
 /// ```ignore
 /// fn my_test_fn() {}
 ///
-/// let id = TestIdentity::resolve::<fn()>();
+/// fn resolve_for<F>(_: F) -> TestIdentity { TestIdentity::resolve::<F>() }
+///
+/// let id = resolve_for(my_test_fn);
 /// // id.full_type_name == "my_crate::my_test_fn" (or similar)
 /// // id.test_name      == "my_test_fn"
 /// ```
@@ -83,9 +85,18 @@ mod tests {
 
     fn dummy_test_function() {}
 
+    /// Helper that infers the concrete function item type from a value,
+    /// mirroring how the `#[in_vm]` macro passes the function identifier.
+    fn resolve_for<F>(_: F) -> TestIdentity {
+        TestIdentity::resolve::<F>()
+    }
+
     #[test]
     fn resolve_produces_expected_test_name() {
-        let id = TestIdentity::resolve::<fn()>();
+        // Use a concrete function item type (not `fn()` which is just
+        // the function pointer type whose type_name is `"fn()"` and
+        // contains no `::`).
+        let id = resolve_for(dummy_test_function);
         // We can't assert the exact value of type_name (it's compiler-dependent),
         // but we can verify the structural invariants.
         assert!(
@@ -107,12 +118,8 @@ mod tests {
         );
     }
 
-    /// Helper that infers the concrete function item type from a value,
-    /// mirroring how the `#[in_vm]` macro passes the function identifier.
-    fn resolve_for<F>(_: F) -> TestIdentity {
-        TestIdentity::resolve::<F>()
-    }
-
+    /// Separate test for the concrete function item path to verify the
+    /// test_name suffix matches the original function name.
     #[test]
     fn resolve_with_concrete_function_item() {
         // When F is a concrete function item type (not `fn()`), type_name
