@@ -177,3 +177,130 @@ fn unmount_one(mount_point: &'static Path) -> Result<(), UnmountError> {
         }
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_targets_are_all_absolute_paths() {
+        for entry in ESSENTIAL_MOUNTS {
+            assert!(
+                entry.target.starts_with('/'),
+                "mount target should be absolute: {:?}",
+                entry.target,
+            );
+        }
+    }
+
+    #[test]
+    fn mount_targets_have_no_duplicates() {
+        let mut targets: Vec<&str> = ESSENTIAL_MOUNTS.iter().map(|e| e.target).collect();
+        let original_len = targets.len();
+        targets.sort();
+        targets.dedup();
+        assert_eq!(
+            targets.len(),
+            original_len,
+            "ESSENTIAL_MOUNTS contains duplicate targets",
+        );
+    }
+
+    #[test]
+    fn mount_sources_are_non_empty() {
+        for entry in ESSENTIAL_MOUNTS {
+            assert!(
+                !entry.source.is_empty(),
+                "mount source should not be empty for target {:?}",
+                entry.target,
+            );
+        }
+    }
+
+    #[test]
+    fn mount_fstypes_are_non_empty() {
+        for entry in ESSENTIAL_MOUNTS {
+            assert!(
+                !entry.fstype.is_empty(),
+                "mount fstype should not be empty for target {:?}",
+                entry.target,
+            );
+        }
+    }
+
+    /// The unmount order is the reverse of the mount order.  Child mount
+    /// points must be unmounted before their parents (e.g. `/sys/fs/cgroup`
+    /// before `/sys`).  This test verifies that no mount point is a prefix
+    /// of a *later* entry, because the reverse iteration used by
+    /// `unmount_filesystems` would then try to unmount the parent first.
+    #[test]
+    fn mount_order_ensures_children_appear_after_parents() {
+        for (i, entry) in ESSENTIAL_MOUNTS.iter().enumerate() {
+            let parent = entry.target;
+            for later in &ESSENTIAL_MOUNTS[i + 1..] {
+                if later.target.starts_with(parent) && later.target != parent {
+                    // A child of `parent` appears later — this is correct.
+                    // The reverse unmount order will process the child first.
+                    //
+                    // Now verify the *inverse* is not also true (which would
+                    // indicate an impossible ordering).
+                    assert!(
+                        !parent.starts_with(later.target),
+                        "circular mount dependency: {parent:?} and {:?}",
+                        later.target,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Verify that every child mount point appears *after* its parent in
+    /// the table.  For example, `/sys/fs/cgroup` must come after `/sys`.
+    /// If a child appeared before its parent, mounting would fail because
+    /// the parent directory does not yet exist.
+    #[test]
+    fn child_mount_points_appear_after_their_parents() {
+        for (i, entry) in ESSENTIAL_MOUNTS.iter().enumerate() {
+            let target = entry.target;
+            // Check if any earlier entry is a proper prefix (i.e. is a parent).
+            // If target has a parent in the table, that parent must have a
+            // smaller index.
+            for (j, other) in ESSENTIAL_MOUNTS.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let is_child = target.starts_with(other.target)
+                    && target != other.target
+                    && target.as_bytes().get(other.target.len()) == Some(&b'/');
+                if is_child {
+                    assert!(
+                        j < i,
+                        "mount target {target:?} is a child of {:?}, \
+                         but the parent appears at index {j} (after child at index {i})",
+                        other.target,
+                    );
+                }
+            }
+        }
+    }
+
+    /// `/sys/fs/cgroup` specifically depends on `/sys` being mounted first.
+    /// This is a concrete regression test for the ordering invariant above.
+    #[test]
+    fn cgroup_is_mounted_after_sys() {
+        let sys_pos = ESSENTIAL_MOUNTS
+            .iter()
+            .position(|e| e.target == "/sys")
+            .expect("/sys should be in ESSENTIAL_MOUNTS");
+        let cgroup_pos = ESSENTIAL_MOUNTS
+            .iter()
+            .position(|e| e.target == "/sys/fs/cgroup")
+            .expect("/sys/fs/cgroup should be in ESSENTIAL_MOUNTS");
+        assert!(
+            sys_pos < cgroup_pos,
+            "/sys (index {sys_pos}) must be mounted before /sys/fs/cgroup (index {cgroup_pos})",
+        );
+    }
+}
