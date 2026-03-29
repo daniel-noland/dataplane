@@ -12,6 +12,8 @@
 //! must agree across crate boundaries live here so that drift is caught at
 //! compile time rather than at runtime.
 
+use std::path::PathBuf;
+
 // ── Container image ──────────────────────────────────────────────────
 
 /// Docker image used by the host tier to launch the test container.
@@ -124,8 +126,8 @@ impl VsockChannel {
     /// cloud-hypervisor creates a `<vhost_socket>_<port>` file for each
     /// vsock port that a guest connects to.  The host-side listener must
     /// bind to this path *before* the VM boots.
-    pub fn listener_path(&self) -> String {
-        format!("{VHOST_VSOCK_SOCKET_PATH}_{}", self.port)
+    pub fn listener_path(&self) -> PathBuf {
+        PathBuf::from(format!("{VHOST_VSOCK_SOCKET_PATH}_{}", self.port))
     }
 }
 

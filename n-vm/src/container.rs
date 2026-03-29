@@ -19,6 +19,8 @@
 //! 5. [`collect_and_cleanup`] — inspect the exit status and remove the
 //!    container.
 
+use std::path::PathBuf;
+
 use bollard::query_parameters::{
     CreateContainerOptions, InspectContainerOptions, RemoveContainerOptions,
     RemoveContainerOptionsBuilder, StartContainerOptions,
@@ -212,7 +214,7 @@ impl ContainerParams {
                 std::fs::metadata(path)
                     .map(|m| m.gid().to_string())
                     .map_err(|source| ContainerError::DeviceNotAccessible {
-                        path: path.clone(),
+                        path: PathBuf::from(path),
                         source,
                     })
             })

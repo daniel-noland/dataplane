@@ -31,7 +31,7 @@
 //! The convenience function [`run_in_vm`] wraps both phases for the
 //! `#[in_vm]` macro.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,18 +92,15 @@ async fn wait_for_socket(path: impl AsRef<Path>) -> Result<(), VmError> {
             }
             Err(err) => {
                 return Err(VmError::SocketPoll {
-                    path: path.display().to_string(),
+                    path: path.to_path_buf(),
                     source: err,
                 });
             }
         }
     }
     Err(VmError::SocketTimeout {
-        path: path.display().to_string(),
-        timeout_ms: SOCKET_POLL_INTERVAL
-            .saturating_mul(SOCKET_POLL_MAX_ATTEMPTS)
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64,
+        path: path.to_path_buf(),
+        timeout: SOCKET_POLL_INTERVAL.saturating_mul(SOCKET_POLL_MAX_ATTEMPTS),
     })
 }
 
@@ -875,7 +872,7 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> Result<VmTestOutput, VmError> {
     let (_, bin_name) = full_bin_path
         .rsplit_once("/")
         .ok_or_else(|| VmError::InvalidBinaryPath {
-            path: full_bin_path.clone(),
+            path: PathBuf::from(&full_bin_path),
         })?;
 
     let params = TestVmParams {
