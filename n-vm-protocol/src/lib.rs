@@ -24,7 +24,7 @@
 pub const CONTAINER_IMAGE: &str = "ghcr.io/githedgehog/testn/n-vm:v0.0.9";
 
 /// Platform string passed to the Docker engine when creating the container.
-pub const CONTAINER_PLATFORM: &str = "x86-64";
+pub const CONTAINER_PLATFORM: &str = "linux/amd64";
 
 // ── Environment variables ────────────────────────────────────────────
 
