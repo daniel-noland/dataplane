@@ -7,6 +7,8 @@
 //! `/dev` is intentionally absent because `CONFIG_DEVTMPFS_MOUNT` is
 //! enabled in the kernel configuration, so it is auto-mounted.
 
+use std::path::Path;
+
 use nix::errno::Errno;
 use nix::mount::{MntFlags, MsFlags, mount};
 use nix::unistd::sync;
@@ -22,6 +24,10 @@ struct MountEntry {
     /// Filesystem source (e.g. `"proc"`, `"tmpfs"`).
     source: &'static str,
     /// Mount point path.
+    ///
+    /// Stored as `&str` rather than `&Path` because `Path::new()` is not
+    /// yet const-stable.  Converted to `&'static Path` at the call
+    /// boundary (see [`secure_mount`] and [`unmount_filesystems`]).
     target: &'static str,
     /// Filesystem type.
     fstype: &'static str,
@@ -70,7 +76,8 @@ pub fn mount_essential_filesystems() -> Result<(), MountError> {
 /// Performs a single mount with security flags.
 fn secure_mount(entry: &MountEntry) -> Result<(), MountError> {
     let MountEntry { source, target, fstype, data } = entry;
-    debug!("mounting {target}");
+    let target_path: &'static Path = Path::new(*target);
+    debug!("mounting {}", target_path.display());
     mount(
         Some(*source),
         *target,
@@ -79,10 +86,10 @@ fn secure_mount(entry: &MountEntry) -> Result<(), MountError> {
         *data,
     )
     .map_err(|e| match e {
-        Errno::UnknownErrno => MountError::Unknown { target },
-        Errno::EPERM => MountError::PermissionDenied { target },
+        Errno::UnknownErrno => MountError::Unknown { target: target_path },
+        Errno::EPERM => MountError::PermissionDenied { target: target_path },
         other => MountError::Failed {
-            target,
+            target: target_path,
             source: other,
         },
     })
@@ -105,7 +112,7 @@ pub fn unmount_filesystems() -> Result<(), UnmountError> {
     debug!("umounting filesystems");
     // Unmount in reverse order of mounting, derived from the same
     // table used by mount_essential_filesystems().
-    for mount_point in ESSENTIAL_MOUNTS.iter().rev().map(|e| e.target) {
+    for mount_point in ESSENTIAL_MOUNTS.iter().rev().map(|e| Path::new(e.target)) {
         unmount_one(mount_point)?;
     }
     debug!("filesystem umounting completed");
@@ -125,8 +132,8 @@ pub fn unmount_filesystems() -> Result<(), UnmountError> {
 /// tokio runtime is configured with `max_blocking_threads(1)`, this
 /// thread is dedicated to shutdown work where async cooperation is not
 /// needed.
-fn unmount_one(mount_point: &'static str) -> Result<(), UnmountError> {
-    debug!("umounting {mount_point}");
+fn unmount_one(mount_point: &'static Path) -> Result<(), UnmountError> {
+    debug!("umounting {}", mount_point.display());
     sync();
     let mut attempts: u32 = 0;
     loop {
@@ -135,7 +142,7 @@ fn unmount_one(mount_point: &'static str) -> Result<(), UnmountError> {
             MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW,
         ) {
             Ok(()) => {
-                debug!("successfully unmounted {mount_point}");
+                debug!("successfully unmounted {}", mount_point.display());
                 sync();
                 return Ok(());
             }
@@ -149,7 +156,8 @@ fn unmount_one(mount_point: &'static str) -> Result<(), UnmountError> {
                 }
                 if attempts.is_multiple_of(100) {
                     warn!(
-                        "{mount_point} still busy after {attempts} retries"
+                        "{} still busy after {attempts} retries",
+                        mount_point.display(),
                     );
                 }
                 sync();
