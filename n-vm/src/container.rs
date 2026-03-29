@@ -9,10 +9,10 @@
 //! focused phases — each implemented as its own helper function so that the
 //! orchestrator requires only local reasoning about sequencing:
 //!
-//! 1. [`ContainerParams::resolve`] — gather test identity, binary paths,
-//!    device groups, and process identity.
-//! 2. [`ContainerParams::build_config`] — translate those parameters into a
-//!    Docker [`ContainerCreateBody`].
+//! 1. [`resolve_test_params`] — gather test identity, binary paths, device
+//!    groups, and process identity.
+//! 2. [`build_container_config`] — translate those parameters into a Docker
+//!    [`ContainerCreateBody`].
 //! 3. [`create_and_start_container`] — create and start the container.
 //! 4. [`stream_container_logs`] — forward container stdout/stderr to the
 //!    host.
@@ -20,7 +20,8 @@
 //!    container.
 
 use bollard::query_parameters::{
-    CreateContainerOptions, InspectContainerOptions, RemoveContainerOptions, StartContainerOptions,
+    CreateContainerOptions, InspectContainerOptions, RemoveContainerOptions,
+    RemoveContainerOptionsBuilder, StartContainerOptions,
 };
 use bollard::secret::{
     ContainerCreateBody, DeviceMapping, HostConfig, MountBindOptions, RestartPolicy,
@@ -30,6 +31,7 @@ use n_vm_protocol::{
     CONTAINER_IMAGE, CONTAINER_PLATFORM, ENV_IN_TEST_CONTAINER, ENV_MARKER_VALUE,
     VM_ROOT_SHARE_PATH, VM_RUN_DIR,
 };
+use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tracing::warn;
 
@@ -311,8 +313,8 @@ impl ContainerParams {
 
     /// Builds the tmpfs mounts for the container.
     ///
-    /// A single tmpfs is mounted at [`VM_RUN_DIR`] for VM runtime artifacts
-    /// (sockets, logs, etc.), owned by the specified UID/GID.
+    /// A single tmpfs is mounted at [`VM_RUN_DIR`] for VM runtime
+    /// artifacts (sockets, logs, etc.), owned by the process UID/GID.
     fn build_tmpfs(&self) -> std::collections::HashMap<String, String> {
         let mut map = std::collections::HashMap::new();
         map.insert(
@@ -350,164 +352,301 @@ impl ContainerParams {
     }
 }
 
-// ── Helpers: container lifecycle ──────────────────────────────────────
+// ── CleanupThread ────────────────────────────────────────────────────
 
-/// Creates and starts a Docker container from the given configuration.
+/// A dedicated thread that stands ready to perform emergency container
+/// cleanup when the [`ContainerGuard`] is dropped without explicit cleanup.
 ///
-/// Returns the container ID on success.
+/// The thread blocks on a [`oneshot::Receiver`].  There are two outcomes:
 ///
-/// # Errors
+/// - **Normal path**: The sender is dropped without sending (via
+///   [`defuse`](Self::defuse)).  The receiver returns `Err`, the thread
+///   exits immediately, and no cleanup is performed.
+/// - **Emergency path**: The [`ContainerGuard::drop`] impl sends the
+///   container ID through the channel.  The thread receives it, builds a
+///   minimal tokio runtime, and force-removes the container via the Docker
+///   API.
 ///
-/// Returns [`ContainerError::ContainerCreate`] or
-/// [`ContainerError::ContainerStart`] if the Docker daemon rejects the
-/// request.
-async fn create_and_start_container(
-    client: &bollard::Docker,
-    config: ContainerCreateBody,
-) -> Result<String, ContainerError> {
-    let container = client
-        .create_container(
-            Some(CreateContainerOptions {
-                name: None,
-                platform: CONTAINER_PLATFORM.into(),
-            }),
-            config,
-        )
-        .await
-        .map_err(ContainerError::ContainerCreate)?;
-
-    client
-        .start_container(&container.id, None::<StartContainerOptions>)
-        .await
-        .map_err(ContainerError::ContainerStart)?;
-
-    Ok(container.id)
+/// # Why `std::thread` instead of `tokio::task`?
+///
+/// [`run_test_in_vm`] uses a single-threaded tokio runtime.  During panic
+/// unwinding, the runtime may be shutting down, so a `tokio::task::spawn`
+/// from [`Drop`] is unreliable.  A dedicated OS thread with its own
+/// runtime is fully decoupled from the caller's async context.
+struct CleanupThread {
+    /// Send the container ID to request emergency cleanup.
+    /// Drop without sending to signal "all clear."
+    tx: Option<oneshot::Sender<String>>,
+    /// Handle to the cleanup thread.  Joined on defuse; detached on
+    /// emergency trigger (so that [`Drop`] does not block).
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Streams container stdout/stderr to the host's stdout/stderr until the
-/// container exits.
-///
-/// # Errors
-///
-/// Returns [`ContainerError::LogStream`] if the log stream encounters an
-/// error from the Docker daemon.
-async fn stream_container_logs(
-    client: &bollard::Docker,
-    container_id: &str,
-) -> Result<(), ContainerError> {
-    let mut logs = client.logs(
-        container_id,
-        Some(bollard::query_parameters::LogsOptions {
-            follow: true,
-            stdout: true,
-            stderr: true,
-            tail: "all".into(),
-            ..Default::default()
-        }),
-    );
+impl CleanupThread {
+    /// Spawns the cleanup thread with its own clone of the Docker client.
+    ///
+    /// The thread blocks immediately on the [`oneshot::Receiver`] and does
+    /// no work until either [`trigger`](Self::trigger) or
+    /// [`defuse`](Self::defuse) is called (or the sender is dropped).
+    fn spawn(client: bollard::Docker) -> Self {
+        let (tx, rx) = oneshot::channel::<String>();
 
-    while let Some(log) = logs.next().await {
-        match log {
-            Ok(msg) => match msg {
-                bollard::container::LogOutput::StdErr { message } => {
-                    eprint!("{}", String::from_utf8_lossy(&message));
-                }
-                bollard::container::LogOutput::StdOut { message }
-                | bollard::container::LogOutput::Console { message } => {
-                    print!("{}", String::from_utf8_lossy(&message));
-                }
-                bollard::container::LogOutput::StdIn { .. } => {
-                    warn!("unexpected StdIn log entry from Docker");
-                }
-            },
-            Err(e) => {
-                return Err(ContainerError::LogStream(e));
-            }
+        let thread = std::thread::Builder::new()
+            .name("container-cleanup".into())
+            .spawn(move || {
+                // Block until we know whether cleanup is needed.
+                let container_id = match rx.blocking_recv() {
+                    Ok(id) => id,
+                    // Sender dropped without sending → explicit cleanup
+                    // already happened, nothing to do.
+                    Err(_) => return,
+                };
+
+                tracing::warn!(
+                    %container_id,
+                    "performing emergency container cleanup",
+                );
+
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!(
+                            %container_id,
+                            error = %e,
+                            "failed to build emergency cleanup runtime; \
+                             manual removal needed (e.g. `docker rm -f {container_id}`)",
+                        );
+                        return;
+                    }
+                };
+
+                rt.block_on(async {
+                    let opts = RemoveContainerOptionsBuilder::default()
+                        .force(true)
+                        .build();
+                    match client.remove_container(&container_id, Some(opts)).await {
+                        Ok(()) => tracing::warn!(
+                            %container_id,
+                            "emergency container cleanup succeeded",
+                        ),
+                        Err(e) => tracing::error!(
+                            %container_id,
+                            error = %e,
+                            "emergency container cleanup failed; \
+                             manual removal may be needed \
+                             (e.g. `docker rm -f {container_id}`)",
+                        ),
+                    }
+                });
+            })
+            .expect("failed to spawn container cleanup thread");
+
+        Self {
+            tx: Some(tx),
+            thread: Some(thread),
         }
     }
 
-    Ok(())
-}
+    /// Signal that explicit cleanup was performed; the thread will exit
+    /// without doing anything.
+    ///
+    /// Drops the sender (so the receiver sees `RecvError`) and joins the
+    /// thread, which should return almost immediately.
+    fn defuse(&mut self) {
+        // Drop the sender without sending — the receiver unblocks with
+        // Err(RecvError) and the thread exits.
+        self.tx.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 
-/// Inspects the container's exit status and removes it.
-///
-/// # Errors
-///
-/// Returns a [`ContainerError`] if the container cannot be inspected or
-/// removed, or if the inspection response is missing the container state.
-async fn collect_and_cleanup(
-    client: &bollard::Docker,
-    container_id: &str,
-) -> Result<ContainerTestResult, ContainerError> {
-    let state = client
-        .inspect_container(container_id, None::<InspectContainerOptions>)
-        .await
-        .map_err(ContainerError::ContainerInspect)?
-        .state
-        .ok_or(ContainerError::MissingState)?;
-
-    client
-        .remove_container(container_id, None::<RemoveContainerOptions>)
-        .await
-        .map_err(ContainerError::ContainerRemove)?;
-
-    Ok(ContainerTestResult {
-        exit_code: state.exit_code,
-    })
+    /// Send the container ID to trigger emergency cleanup.
+    ///
+    /// The thread is *detached* (not joined) so that [`Drop`] does not
+    /// block waiting for the Docker API call.  The cleanup proceeds in the
+    /// background.
+    fn trigger(&mut self, container_id: String) {
+        if let Some(tx) = self.tx.take() {
+            // The only way send() fails is if the receiver was already
+            // dropped (thread exited), in which case there is nothing to
+            // do.
+            let _ = tx.send(container_id);
+        }
+        // Detach the thread — don't block Drop on the Docker API call.
+        self.thread.take();
+    }
 }
 
 // ── ContainerGuard ───────────────────────────────────────────────────
 
-/// RAII guard that ensures a Docker container is cleaned up.
+/// RAII guard that owns a running Docker container and provides lifecycle
+/// methods.
 ///
-/// The guard holds a reference to the Docker client and the container ID.
 /// The expected usage is:
 ///
-/// 1. Create the guard immediately after the container is started.
-/// 2. Perform operations against the running container (e.g. log streaming).
-/// 3. Call [`into_result`](Self::into_result) to inspect the exit status
-///    and remove the container, defusing the guard.
+/// 1. [`create_and_start`](Self::create_and_start) — create the container
+///    and return an armed guard.
+/// 2. [`stream_logs`](Self::stream_logs) — forward container
+///    stdout/stderr to the host.
+/// 3. [`into_result`](Self::into_result) — inspect the exit status,
+///    remove the container, and defuse the guard.
 ///
 /// If the guard is dropped *without* calling `into_result` (e.g. due to a
 /// panic or an early return inserted by a future refactor), the [`Drop`]
-/// impl logs the container ID so the leak is visible in test output.
+/// impl sends the container ID to a [`CleanupThread`] which force-removes
+/// the container via the Docker API.
 ///
-/// # Why not async Drop?
+/// # Async cleanup via sync Drop
 ///
-/// Rust does not support async `Drop`.  The guard cannot perform async
-/// container removal in its destructor.  The `Drop` impl instead emits a
-/// prominent `tracing::error` with the container ID so that the operator
-/// can clean up manually (e.g. `docker rm -f <id>`).
+/// Rust does not support async `Drop`.  This guard bridges the gap by
+/// using a [`tokio::sync::oneshot`] channel whose
+/// [`Sender::send`](oneshot::Sender::send) is synchronous (not async),
+/// making it safe to call from [`Drop`].  A dedicated [`std::thread`]
+/// receives the message and performs the async Docker API call in its own
+/// minimal tokio runtime — fully decoupled from whatever runtime (if any)
+/// the caller is using.
 struct ContainerGuard<'a> {
     client: &'a bollard::Docker,
     container_id: String,
+    /// Background thread that will force-remove the container if we send
+    /// it the container ID.  Defused on the normal path.
+    cleanup: CleanupThread,
     /// Set to `true` once explicit cleanup has been performed via
     /// [`into_result`](Self::into_result).
     defused: bool,
 }
 
 impl<'a> ContainerGuard<'a> {
-    /// Creates a new guard for a running container.
-    fn new(client: &'a bollard::Docker, container_id: String) -> Self {
-        Self {
+    // ── Construction ─────────────────────────────────────────────────
+
+    /// Creates a Docker container from the given configuration, starts it,
+    /// and returns an armed guard.
+    ///
+    /// This combines container creation, starting, and guard construction
+    /// into a single step so that the container is _never_ running without
+    /// a guard to clean it up.
+    ///
+    /// A [`CleanupThread`] is spawned that will stand by to force-remove
+    /// the container if this guard is dropped without calling
+    /// [`into_result`](Self::into_result).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::ContainerCreate`] or
+    /// [`ContainerError::ContainerStart`] if the Docker daemon rejects the
+    /// request.
+    async fn create_and_start(
+        client: &'a bollard::Docker,
+        config: ContainerCreateBody,
+    ) -> Result<ContainerGuard<'a>, ContainerError> {
+        let container = client
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: None,
+                    platform: CONTAINER_PLATFORM.into(),
+                }),
+                config,
+            )
+            .await
+            .map_err(ContainerError::ContainerCreate)?;
+
+        client
+            .start_container(&container.id, None::<StartContainerOptions>)
+            .await
+            .map_err(ContainerError::ContainerStart)?;
+
+        let cleanup = CleanupThread::spawn(client.clone());
+        Ok(Self {
             client,
-            container_id,
+            container_id: container.id,
+            cleanup,
             defused: false,
-        }
+        })
     }
 
-    /// Returns a reference to the container ID.
-    fn id(&self) -> &str {
-        &self.container_id
+    // ── Lifecycle ────────────────────────────────────────────────────
+
+    /// Streams container stdout/stderr to the host's stdout/stderr until
+    /// the container exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::LogStream`] if the log stream encounters
+    /// an error from the Docker daemon.
+    async fn stream_logs(&self) -> Result<(), ContainerError> {
+        let mut logs = self.client.logs(
+            &self.container_id,
+            Some(bollard::query_parameters::LogsOptions {
+                follow: true,
+                stdout: true,
+                stderr: true,
+                tail: "all".into(),
+                ..Default::default()
+            }),
+        );
+
+        while let Some(log) = logs.next().await {
+            match log {
+                Ok(msg) => match msg {
+                    bollard::container::LogOutput::StdErr { message } => {
+                        eprint!("{}", String::from_utf8_lossy(&message));
+                    }
+                    bollard::container::LogOutput::StdOut { message }
+                    | bollard::container::LogOutput::Console { message } => {
+                        print!("{}", String::from_utf8_lossy(&message));
+                    }
+                    bollard::container::LogOutput::StdIn { .. } => {
+                        warn!("unexpected StdIn log entry from Docker");
+                    }
+                },
+                Err(e) => {
+                    return Err(ContainerError::LogStream(e));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Performs the explicit inspect + remove lifecycle.
     ///
-    /// This marks the guard as defused so that the [`Drop`] impl is a
-    /// no-op.  Returns the container's exit status on success.
+    /// This defuses the [`CleanupThread`] (so its background thread exits
+    /// without doing anything) and marks the guard so that its [`Drop`]
+    /// impl is a no-op.  Returns the container's exit status on success.
     async fn into_result(mut self) -> Result<ContainerTestResult, ContainerError> {
         self.defused = true;
-        collect_and_cleanup(self.client, &self.container_id).await
+        self.cleanup.defuse();
+        self.collect_and_cleanup().await
+    }
+
+    /// Inspects the container's exit status and removes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ContainerError`] if the container cannot be inspected
+    /// or removed, or if the inspection response is missing the container
+    /// state.
+    async fn collect_and_cleanup(&self) -> Result<ContainerTestResult, ContainerError> {
+        let state = self
+            .client
+            .inspect_container(&self.container_id, None::<InspectContainerOptions>)
+            .await
+            .map_err(ContainerError::ContainerInspect)?
+            .state
+            .ok_or(ContainerError::MissingState)?;
+
+        self.client
+            .remove_container(&self.container_id, None::<RemoveContainerOptions>)
+            .await
+            .map_err(ContainerError::ContainerRemove)?;
+
+        Ok(ContainerTestResult {
+            exit_code: state.exit_code,
+        })
     }
 }
 
@@ -517,10 +656,9 @@ impl Drop for ContainerGuard<'_> {
             tracing::error!(
                 container_id = %self.container_id,
                 "ContainerGuard dropped without explicit cleanup; \
-                 the container was NOT removed and may need manual cleanup \
-                 (e.g. `docker rm -f {}`)",
-                self.container_id,
+                 dispatching emergency container removal",
             );
+            self.cleanup.trigger(self.container_id.clone());
         }
     }
 }
@@ -537,11 +675,12 @@ impl Drop for ContainerGuard<'_> {
 ///    via [`ContainerParams::resolve`].
 /// 2. Builds the Docker container configuration via
 ///    [`ContainerParams::build_config`].
-/// 3. Creates and starts the container via [`create_and_start_container`].
+/// 3. Creates and starts the container via
+///    [`ContainerGuard::create_and_start`].
 /// 4. Streams container stdout/stderr to the host via
-///    [`stream_container_logs`].
+///    [`ContainerGuard::stream_logs`].
 /// 5. Collects the exit status and removes the container via
-///    [`collect_and_cleanup`].
+///    [`ContainerGuard::into_result`].
 ///
 /// The type parameter `F` is used only to derive the test name via
 /// [`std::any::type_name`]; the function itself is never called in this tier.
@@ -565,14 +704,13 @@ pub fn run_test_in_vm<F: FnOnce()>(
 
         let client = bollard::Docker::connect_with_unix_defaults()
             .map_err(ContainerError::DockerConnect)?;
-        let container_id = create_and_start_container(&client, config).await?;
 
-        // Wrap the container in a guard so that if anything between here
-        // and the explicit cleanup panics or returns early, the container
-        // leak is at least logged (see ContainerGuard::drop).
-        let guard = ContainerGuard::new(&client, container_id);
+        // The guard is armed at creation — if anything between here and
+        // the explicit cleanup panics or returns early, the CleanupThread
+        // will force-remove the container.
+        let guard = ContainerGuard::create_and_start(&client, config).await?;
 
-        let log_result = stream_container_logs(&client, guard.id()).await;
+        let log_result = guard.stream_logs().await;
 
         // Explicit cleanup — inspects the exit status and removes the
         // container.  This defuses the guard so its Drop is a no-op.
