@@ -259,6 +259,7 @@ fn build_container_config(params: &ContainerParams) -> ContainerCreateBody {
         .chain([
             test_name.clone(),
             "--exact".into(),
+            "--no-capture".into(),
             "--format=terse".into(),
         ])
         .collect();
