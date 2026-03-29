@@ -4,6 +4,9 @@
 //! [cloud-hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor)
 //! via its `--event-monitor` file descriptor, along with an async codec for
 //! reading those events incrementally from a pipe.
+//!
+//! The [`watch`] function consumes the event stream and returns a
+//! [`HypervisorVerdict`] indicating whether the VM shut down cleanly.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -12,7 +15,7 @@ use serde::Deserialize;
 use serde_json::StreamDeserializer;
 use tokio_stream::StreamExt;
 use tokio_util::bytes::{Buf, BytesMut};
-use tracing::error;
+use tracing::warn;
 
 // ── Hypervisor event types ───────────────────────────────────────────
 
@@ -76,6 +79,7 @@ pub struct Event {
     pub properties: BTreeMap<String, String>,
 }
 
+/// Deserializes `null` JSON values as `T::default()` instead of failing.
 fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     T: Default + Deserialize<'de>,
@@ -83,6 +87,32 @@ where
 {
     let opt = Option::deserialize(deserializer)?;
     Ok(opt.unwrap_or_default())
+}
+
+// ── Hypervisor verdict ───────────────────────────────────────────────
+
+/// Verdict from the hypervisor event watcher indicating how the VM
+/// session ended.
+///
+/// This replaces a bare `bool` return, making call sites self-documenting
+/// and preventing accidental inversion of the success/failure logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HypervisorVerdict {
+    /// The VMM emitted a clean `Shutdown` event with no preceding guest
+    /// panic or event-stream errors.
+    CleanShutdown,
+    /// The VM session ended abnormally — a guest panic was detected, the
+    /// event stream contained deserialization errors, or the stream ended
+    /// without a clean shutdown event.
+    Failure,
+}
+
+impl HypervisorVerdict {
+    /// Returns `true` if the VM shut down cleanly.
+    #[must_use]
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::CleanShutdown)
+    }
 }
 
 // ── Async JSON stream decoder ────────────────────────────────────────
@@ -100,6 +130,7 @@ where
 pub struct AsyncJsonStreamDecoder;
 
 impl AsyncJsonStreamDecoder {
+    /// Creates a new decoder instance.
     pub fn new() -> Self {
         Self
     }
@@ -151,18 +182,23 @@ impl tokio_util::codec::Decoder for AsyncJsonStreamDecoder {
 
 // ── Hypervisor event watcher ─────────────────────────────────────────
 
-/// Consumes the hypervisor event stream and returns the collected events along
-/// with a success verdict.
+/// Consumes the hypervisor event stream and returns the collected events
+/// along with a [`HypervisorVerdict`].
 ///
-/// Returns `(events, true)` on a clean VMM shutdown, or `(events, false)` if a
-/// guest panic is detected or the stream ends unexpectedly.
-pub async fn watch(receiver: tokio::net::unix::pipe::Receiver) -> (Vec<Event>, bool) {
+/// Returns [`HypervisorVerdict::CleanShutdown`] if the VMM emits a clean
+/// `Shutdown` event with no preceding errors, or
+/// [`HypervisorVerdict::Failure`] if a guest panic is detected, the event
+/// stream contains deserialization errors, or the stream ends without a
+/// clean shutdown.
+pub async fn watch(
+    receiver: tokio::net::unix::pipe::Receiver,
+) -> (Vec<Event>, HypervisorVerdict) {
     let decoder = AsyncJsonStreamDecoder::new();
 
     let mut reader = tokio_util::codec::FramedRead::new(receiver, decoder);
     let mut hlog = Vec::with_capacity(32);
 
-    let mut success = true;
+    let mut clean = true;
 
     loop {
         let event = reader.next().await;
@@ -171,22 +207,30 @@ pub async fn watch(receiver: tokio::net::unix::pipe::Receiver) -> (Vec<Event>, b
                 hlog.push(value.clone());
                 match (value.source, value.event) {
                     (Source::Vmm, EventType::Shutdown) => {
-                        return (hlog, success);
+                        let verdict = if clean {
+                            HypervisorVerdict::CleanShutdown
+                        } else {
+                            HypervisorVerdict::Failure
+                        };
+                        return (hlog, verdict);
                     }
                     (Source::Guest, EventType::Panic) => {
-                        success = false;
                         break;
                     }
                     _ => {}
                 };
             }
             Some(Err(e)) => {
-                error!("{e:#?}");
+                // Deserialization errors may hide critical events (e.g.
+                // a guest panic encoded in a malformed JSON object), so
+                // they downgrade the verdict to Failure.
+                warn!("hypervisor event deserialization error (marking as failure): {e:#?}");
+                clean = false;
             }
             None => {
                 break;
             }
         }
     }
-    (hlog, success)
+    (hlog, HypervisorVerdict::Failure)
 }

@@ -1,3 +1,6 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(missing_docs)]
+
 //! Runtime support for the `#[in_vm]` test macro.
 //!
 //! This crate implements the two outer tiers of the nested test environment:

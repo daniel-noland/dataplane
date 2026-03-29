@@ -45,7 +45,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
 use crate::error::VmError;
-use crate::hypervisor;
+use crate::hypervisor::{self, HypervisorVerdict};
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -460,7 +460,7 @@ pub struct TestVm {
     /// generated client takes `&self`).
     client: Arc<tokio::sync::Mutex<dyn DefaultApi>>,
     /// Background task watching hypervisor lifecycle events.
-    event_watcher: JoinHandle<(Vec<hypervisor::Event>, bool)>,
+    event_watcher: JoinHandle<(Vec<hypervisor::Event>, HypervisorVerdict)>,
     /// Background task collecting init system tracing output via vsock.
     init_trace: JoinHandle<String>,
     /// Background task collecting test process stdout via vsock.
@@ -621,7 +621,7 @@ impl TestVm {
             Ok(result) => result,
             Err(err) => {
                 error!("hypervisor event watcher task failed: {err}");
-                (Vec::new(), false)
+                (Vec::new(), HypervisorVerdict::Failure)
             }
         };
 
@@ -645,7 +645,7 @@ impl TestVm {
 
         // ── Assemble result ──────────────────────────────────────────
         VmTestOutput {
-            success: virtiofsd_exit_ok && hypervisor_verdict && hypervisor_exit_ok,
+            success: virtiofsd_exit_ok && hypervisor_verdict.is_success() && hypervisor_exit_ok,
             stdout: test_stdout,
             stderr: test_stderr,
             console: kernel_log,
