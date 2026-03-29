@@ -19,6 +19,9 @@
 //! 6. **Clean shutdown** — unmount filesystems, sync, and power off the VM
 //!    (or abort on failure so the hypervisor detects a guest panic).
 
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(missing_docs)]
+
 use std::convert::Infallible;
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -74,8 +77,8 @@ fn main() -> Infallible {
             .with_file(true)
             .init();
 
-        let _init_span = tracing::span!(tracing::Level::INFO, "init");
-        let _guard = _init_span.enter();
+        let init_span = tracing::span!(tracing::Level::INFO, "init");
+        let _guard = init_span.enter();
         const INIT_PID: u32 = 1;
         if process::id() != INIT_PID {
             fatal!("this program must be run as PID {INIT_PID} (init process)");
