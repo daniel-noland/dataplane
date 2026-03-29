@@ -14,17 +14,23 @@
 //! variables (defined in `n_vm_protocol` and re-exported from `n_vm`):
 //!
 //! 1. **Host** (no env vars set) — the default when `cargo test` is invoked.
-//!    Launches a Docker container via [`n_vm::run_test_in_vm`] with the
-//!    required devices (`/dev/kvm`, `/dev/vhost-vsock`, etc.) and
-//!    capabilities, then re-executes the same test binary inside it.
+//!    Delegates to [`n_vm::dispatch::run_host_tier`] which launches a Docker
+//!    container with the required devices and capabilities, then re-executes
+//!    the same test binary inside it.
 //!
 //! 2. **Container** (`IN_TEST_CONTAINER=YES`) — inside the Docker container.
-//!    Boots a cloud-hypervisor VM via [`n_vm::run_in_vm`], sharing the test
-//!    binary into the guest via virtiofs, then re-executes the test inside
-//!    the VM.
+//!    Delegates to [`n_vm::dispatch::run_container_tier`] which boots a
+//!    cloud-hypervisor VM, shares the test binary into the guest via
+//!    virtiofs, and re-executes the test inside the VM.
 //!
 //! 3. **VM guest** (`IN_VM=YES`) — inside the virtual machine, running under
 //!    the `n-it` init system.  The original test body executes directly.
+//!
+//! All runtime policy (tokio runtime construction, tracing configuration,
+//! error formatting, exit-code interpretation) lives in the
+//! [`n_vm::dispatch`] module rather than in `quote!` output, so that
+//! changes do not require proc-macro recompilation and the logic is
+//! testable and debuggable as normal Rust code.
 //!
 //! # Usage
 //!
@@ -125,76 +131,28 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
     // The three tiers are dispatched as a flat if / else-if / else chain.
     // Each tier is identified by an environment variable set by the
     // enclosing layer before re-executing the test binary.
+    //
+    // Only Tier 3 (the VM guest) runs the original test body and must
+    // therefore be generated inline.  Tiers 1 and 2 delegate to helper
+    // functions in `n_vm::dispatch` so that all runtime policy lives in
+    // normal, testable Rust code rather than in macro output.
     quote! {
         #(#attrs)*
         #vis #sig {
             // ── Tier 3: VM guest ─────────────────────────────────────
-            // The init system (`n-it`) sets IN_VM=YES before spawning
-            // the test binary.  Execute the original test body directly.
-            if ::std::env::var(::n_vm::ENV_IN_VM).as_deref()
-                == ::core::result::Result::Ok(::n_vm::ENV_MARKER_VALUE)
-            {
+            if ::n_vm::is_in_vm() {
                 { #block }
                 return;
             }
 
-            // ── Tier 2: Docker container ─────────────────────────────
-            // `run_test_in_vm` sets IN_TEST_CONTAINER=YES before
-            // starting the container.  Boot a cloud-hypervisor VM and
-            // re-execute the test inside it.
-            if ::std::env::var(::n_vm::ENV_IN_TEST_CONTAINER).as_deref()
-                == ::core::result::Result::Ok(::n_vm::ENV_MARKER_VALUE)
-            {
-                let runtime = ::tokio::runtime::Builder::new_current_thread()
-                    .enable_io()
-                    .enable_time()
-                    .build()
-                    .expect("failed to build tokio runtime for #[in_vm] container tier");
-                let _guard = runtime.enter();
-                runtime.block_on(async {
-                    // Use try_init() to avoid panicking if a subscriber is already set
-                    // (e.g. when multiple #[in_vm] tests run in the same binary).
-                    let _ = ::tracing_subscriber::fmt()
-                        .with_max_level(::tracing::Level::INFO)
-                        .with_thread_names(true)
-                        .without_time()
-                        .with_test_writer()
-                        .with_line_number(true)
-                        .with_target(true)
-                        .with_file(true)
-                        .try_init();
-                    let init_span =
-                        ::tracing::span!(::tracing::Level::INFO, "hypervisor");
-                    let _guard = init_span.enter();
-                    let output = ::n_vm::run_in_vm(#ident).await
-                        .unwrap_or_else(|err| {
-                            ::std::panic!("VM infrastructure error: {err:#?}")
-                        });
-                    ::std::eprintln!("{output}");
-                    assert!(output.success, "VM test failed (see output above)");
-                });
+            // ── Tier 2: Docker container → VM ────────────────────────
+            if ::n_vm::is_in_test_container() {
+                ::n_vm::run_container_tier(#ident);
                 return;
             }
 
-            // ── Tier 1: Host (cargo test) ────────────────────────────
-            // No environment marker is set — we are running directly on
-            // the developer's machine.  Launch a Docker container that
-            // will enter tier 2.
-            ::std::eprintln!("•─────⋅☾☾☾☾BEGIN NESTED TEST ENVIRONMENT☽☽☽☽⋅─────•");
-            let container_state = ::n_vm::run_test_in_vm(#ident)
-                .unwrap_or_else(|err| {
-                    ::std::panic!("test container infrastructure error: {err:#?}")
-                });
-            ::std::eprintln!("•─────⋅☾☾☾☾ END NESTED TEST ENVIRONMENT ☽☽☽☽⋅─────•");
-            match container_state.exit_code {
-                ::core::option::Option::Some(0) => {}
-                ::core::option::Option::Some(code) => {
-                    ::std::panic!("test container exited with code {code}");
-                }
-                ::core::option::Option::None => {
-                    ::std::panic!("test container did not return an exit code");
-                }
-            }
+            // ── Tier 1: Host → Docker container ──────────────────────
+            ::n_vm::run_host_tier(#ident);
         }
     }
     .into()

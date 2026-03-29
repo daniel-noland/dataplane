@@ -27,6 +27,7 @@
 //! without requiring downstream crates to add `n-vm-protocol` as a direct
 //! dependency.
 
+pub mod dispatch;
 pub mod error;
 pub mod hypervisor;
 
@@ -34,6 +35,7 @@ mod container;
 mod vm;
 
 pub use container::{ContainerTestResult, run_test_in_vm};
+pub use dispatch::{is_in_test_container, is_in_vm, run_container_tier, run_host_tier};
 pub use error::{ContainerError, VmError};
 pub use n_vm_macros::in_vm;
 pub use n_vm_protocol::{
