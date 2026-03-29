@@ -82,6 +82,29 @@ pub const VM_ROOT_SHARE_PATH: &str = "/vm.root";
 /// The virtiofs tag used to identify the root filesystem inside the guest.
 pub const VIRTIOFS_ROOT_TAG: &str = "root";
 
+// ── Binary paths (inside the container) ──────────────────────────────
+
+/// Path to the Linux kernel image used to boot the VM.
+///
+/// This is a minimal `bzImage` bundled in the test container image.
+pub const KERNEL_IMAGE_PATH: &str = "/bzImage";
+
+/// Path to the `n-it` init system binary inside the container.
+///
+/// This binary is passed as the `init=` kernel command-line argument so
+/// that it runs as PID 1 inside the VM guest.
+pub const INIT_BINARY_PATH: &str = "/bin/n-it";
+
+/// Path to the virtiofsd binary inside the container.
+///
+/// virtiofsd shares the container's filesystem into the VM via virtiofs.
+pub const VIRTIOFSD_BINARY_PATH: &str = "/bin/virtiofsd";
+
+/// Path to the cloud-hypervisor binary inside the container.
+pub const CLOUD_HYPERVISOR_BINARY_PATH: &str = "/bin/cloud-hypervisor";
+
+// ── Derived paths ────────────────────────────────────────────────────
+
 /// Returns the vhost-vsock listener socket path that includes the vsock port.
 ///
 /// cloud-hypervisor creates a `<socket>_<port>` file for each vsock port that

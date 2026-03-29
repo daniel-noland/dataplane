@@ -17,9 +17,10 @@ use cloud_hypervisor_client::models::{
 };
 use command_fds::{CommandFdExt, FdMapping};
 use n_vm_protocol::{
-    HYPERVISOR_API_SOCKET_PATH, KERNEL_CONSOLE_SOCKET_PATH, VHOST_VSOCK_SOCKET_PATH,
-    VIRTIOFSD_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VM_GUEST_CID, VM_ROOT_SHARE_PATH, VM_RUN_DIR,
-    vhost_vsock_listener_path,
+    CLOUD_HYPERVISOR_BINARY_PATH, HYPERVISOR_API_SOCKET_PATH, INIT_BINARY_PATH,
+    KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH, VHOST_VSOCK_SOCKET_PATH,
+    VIRTIOFSD_BINARY_PATH, VIRTIOFSD_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VM_GUEST_CID,
+    VM_ROOT_SHARE_PATH, VM_RUN_DIR, vhost_vsock_listener_path,
 };
 use tokio::io::AsyncReadExt;
 use tracing::{debug, error};
@@ -70,7 +71,7 @@ async fn wait_for_socket(path: impl AsRef<Path>) {
 async fn launch_virtiofsd(path: impl AsRef<str>) -> tokio::process::Child {
     let uid = nix::unistd::getuid().as_raw();
     let gid = nix::unistd::getgid().as_raw();
-    tokio::process::Command::new("/bin/virtiofsd")
+    tokio::process::Command::new(VIRTIOFSD_BINARY_PATH)
         .arg("--shared-dir")
         .arg(path.as_ref())
         .arg("--readonly")
@@ -123,7 +124,7 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
     VmConfig {
         payload: PayloadConfig {
             firmware: None,
-            kernel: Some("/bzImage".into()),
+            kernel: Some(KERNEL_IMAGE_PATH.into()),
             cmdline: Some(format!(
                 "iommu=on \
                  intel_iommu=on \
@@ -137,7 +138,7 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
                  default_hugepagesz=2M \
                  hugepagesz=2M \
                  hugepages=16 \
-                 init=/bin/n-it {full_bin_path} {test_name} --exact --no-capture --format=terse"
+                 init={INIT_BINARY_PATH} {full_bin_path} {test_name} --exact --no-capture --format=terse"
             )),
             ..Default::default()
         },
@@ -369,7 +370,7 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> VmTestOutput {
         .expect("/dev/kvm does not exist or is not accessible");
 
     const EVENT_MONITOR_FD: i32 = 3;
-    let process = tokio::process::Command::new("/bin/cloud-hypervisor")
+    let process = tokio::process::Command::new(CLOUD_HYPERVISOR_BINARY_PATH)
         .args([
             "--api-socket",
             format!("path={HYPERVISOR_API_SOCKET_PATH}").as_str(),
