@@ -167,7 +167,10 @@ pub fn in_vm(_attr: TokenStream, input: TokenStream) -> TokenStream {
             // the developer's machine.  Launch a Docker container that
             // will enter tier 2.
             ::std::eprintln!("•─────⋅☾☾☾☾BEGIN NESTED TEST ENVIRONMENT☽☽☽☽⋅─────•");
-            let container_state = ::n_vm::run_test_in_vm(#ident);
+            let container_state = ::n_vm::run_test_in_vm(#ident)
+                .unwrap_or_else(|err| {
+                    ::std::panic!("test container infrastructure error: {err:#?}")
+                });
             ::std::eprintln!("•─────⋅☾☾☾☾ END NESTED TEST ENVIRONMENT ☽☽☽☽⋅─────•");
             match container_state.exit_code {
                 ::core::option::Option::Some(0) => {}

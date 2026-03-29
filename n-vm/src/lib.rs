@@ -13,8 +13,8 @@
 //!
 //! # Error handling
 //!
-//! The container-tier entry point [`run_in_vm`] returns [`Result`] with a
-//! dedicated error type ([`VmError`]) so that callers can distinguish
+//! Both entry points return [`Result`] with dedicated error types
+//! ([`VmError`] and [`ContainerError`]) so that callers can distinguish
 //! infrastructure failures from test failures.
 //!
 //! # Protocol constants
@@ -31,7 +31,7 @@ mod container;
 mod vm;
 
 pub use container::{ContainerTestResult, run_test_in_vm};
-pub use error::VmError;
+pub use error::{ContainerError, VmError};
 pub use n_vm_macros::in_vm;
 pub use n_vm_protocol::{
     CLOUD_HYPERVISOR_BINARY_PATH, CONTAINER_IMAGE, CONTAINER_PLATFORM, ENV_IN_TEST_CONTAINER,
