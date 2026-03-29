@@ -97,9 +97,30 @@ impl std::fmt::Display for VsockPort {
 pub struct VsockCid(u64);
 
 impl VsockCid {
+    /// The hypervisor's CID (`VMADDR_CID_HYPERVISOR`).
+    pub const HYPERVISOR: Self = Self(0);
+
+    /// Loopback CID (`VMADDR_CID_LOCAL`), analogous to `127.0.0.1`.
+    pub const LOCAL: Self = Self(1);
+
+    /// The host CID (`VMADDR_CID_HOST`).
+    pub const HOST: Self = Self(2);
+
     /// Creates a new [`VsockCid`] from a raw CID value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cid` is 0 (`VMADDR_CID_HYPERVISOR`), 1
+    /// (`VMADDR_CID_LOCAL`), or 2 (`VMADDR_CID_HOST`).  These CIDs have
+    /// fixed kernel-level semantics and must not be used as arbitrary guest
+    /// identifiers — use the named constants [`Self::HYPERVISOR`],
+    /// [`Self::LOCAL`], or [`Self::HOST`] instead.
     #[must_use]
     pub const fn new(cid: u64) -> Self {
+        assert!(
+            cid >= 3,
+            "CIDs 0 (hypervisor), 1 (local), and 2 (host) are reserved; use the named constants instead"
+        );
         Self(cid)
     }
 
