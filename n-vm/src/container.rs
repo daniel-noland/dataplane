@@ -105,9 +105,9 @@ struct ContainerParams {
     /// Fully-qualified test name (e.g. `module::test_name`).
     test_name: String,
     /// Effective UID of the calling process.
-    uid: u32,
+    uid: nix::unistd::Uid,
     /// Effective GID of the calling process.
-    gid: u32,
+    gid: nix::unistd::Gid,
     /// GIDs of the groups that own the required device nodes and the Docker
     /// socket.  These are added via `--group-add` so the container process
     /// can access the devices without running as root.
@@ -165,8 +165,8 @@ impl ContainerParams {
             bin_path,
             bin_dir,
             test_name: test_name.to_owned(),
-            uid: nix::unistd::getuid().as_raw(),
-            gid: nix::unistd::getgid().as_raw(),
+            uid: nix::unistd::getuid(),
+            gid: nix::unistd::getgid(),
             device_groups,
         })
     }
@@ -276,7 +276,7 @@ impl ContainerParams {
                 format!("{ENV_IN_TEST_CONTAINER}={ENV_MARKER_VALUE}"),
                 "RUST_BACKTRACE=1".into(),
             ]),
-            user: Some(format!("{uid}:{gid}", uid = self.uid, gid = self.gid)),
+            user: Some(format!("{uid}:{gid}", uid = self.uid.as_raw(), gid = self.gid.as_raw())),
             host_config: Some(HostConfig {
                 devices: Some(Self::build_device_mappings()),
                 group_add: Some(self.device_groups.clone()),
@@ -355,8 +355,8 @@ impl ContainerParams {
             VM_RUN_DIR.into(),
             format!(
                 "nodev,noexec,nosuid,uid={uid},gid={gid}",
-                uid = self.uid,
-                gid = self.gid,
+                uid = self.uid.as_raw(),
+                gid = self.gid.as_raw(),
             ),
         );
         map

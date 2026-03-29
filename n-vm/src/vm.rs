@@ -31,6 +31,7 @@
 //! The convenience function [`run_in_vm`] wraps both phases for the
 //! `#[in_vm]` macro.
 
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -72,7 +73,7 @@ const VSOCK_READER_CAPACITY: usize = 32_768;
 ///
 /// This is the child-side fd that cloud-hypervisor writes events to.
 /// It must match the `--event-monitor fd=N` argument.
-const EVENT_MONITOR_FD: i32 = 3;
+const EVENT_MONITOR_FD: RawFd = 3;
 
 // ── Helper: socket polling ───────────────────────────────────────────
 
