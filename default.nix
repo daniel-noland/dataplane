@@ -144,6 +144,29 @@ let
       yq
     ]);
   };
+  # Container-tier tools for the scratch-container test infrastructure.
+  #
+  # This derivation provides the binaries needed inside the Docker
+  # container that launches the test VM: the hypervisor(s), virtiofsd,
+  # and (eventually) a kernel image.
+  #
+  # When used with a scratch container, subdirectories of this derivation
+  # (e.g. bin/, lib/) are volume-mounted at their standard container
+  # paths.  The container also mounts /nix/store from the host so that
+  # the symlinks created by symlinkJoin resolve to the actual binaries
+  # and their transitive library dependencies.
+  #
+  # See development/ideam.md for the design rationale.
+  testroot = pkgs.symlinkJoin {
+    name = "dataplane-test-root";
+    paths = with pkgs.pkgsBuildHost; [
+      cloud-hypervisor
+      virtiofsd
+      qemu_kvm
+      # TODO: add kernel image (vmlinuz / bzImage) once migrated from
+      # the external repository.
+    ];
+  };
   devenv = pkgs.mkShell {
     name = "dataplane-dev-shell";
     packages = [ devroot ];
@@ -373,6 +396,52 @@ let
       inherit pname;
     }
   ) package-list;
+
+  # VM guest root filesystem for the scratch-container test infrastructure.
+  #
+  # This derivation is shared into the VM via virtiofsd and becomes the
+  # guest's root filesystem (mounted as virtiofs with tag "root").
+  #
+  # It contains:
+  # - The n-it init system binary (runs as PID 1 in the VM).
+  # - glibc and libgcc shared libraries (so dynamically linked test
+  #   binaries can run inside the VM).
+  # - A /nix -> /nix absolute symlink that allows the VM to resolve
+  #   nix store rpath entries through virtiofsd (in --no-sandbox mode).
+  #
+  # The test binary directory is bind-mounted separately by container.rs
+  # into /vm.root/{bin_dir}, so it appears at /{bin_dir} in the VM.
+  #
+  # See development/ideam.md for the design rationale.
+  vmroot = pkgs.runCommand "dataplane-vm-root" { } ''
+    mkdir -p $out/bin $out/lib
+
+    # n-it init system binary.
+    # The cargo package is "dataplane-n-it" but the VM expects the
+    # binary at /bin/n-it (see INIT_BINARY_PATH in n-vm-protocol).
+    ln -s ${workspace."n-it"}/bin/dataplane-n-it $out/bin/n-it
+
+    # glibc runtime libraries -- needed by dynamically linked test
+    # binaries running inside the VM.
+    for f in ${pkgs.pkgsHostHost.libc.out}/lib/*.so*; do
+      [ -e "$f" ] || continue
+      ln -s "$f" "$out/lib/$(basename "$f")"
+    done
+
+    # libgcc runtime libraries (libgcc_s.so, etc.)
+    for f in ${pkgs.pkgsHostHost.glibc.libgcc}/lib/*.so*; do
+      [ -e "$f" ] || continue
+      ln -s "$f" "$out/lib/$(basename "$f")"
+    done
+
+    # Critical: absolute symlink so the VM guest can resolve nix store
+    # paths through virtiofsd's --no-sandbox mode.  Nix-built test
+    # binaries have rpaths like /nix/store/{hash}-glibc-X.Y/lib; this
+    # symlink makes those paths reachable from inside the VM because
+    # virtiofsd (without sandboxing) follows symlinks in the container's
+    # mount namespace, which includes the host's /nix/store.
+    ln -s /nix $out/nix
+  '';
 
   test-builder =
     {
@@ -808,7 +877,9 @@ in
     pkgs
     sources
     sysroot
+    testroot
     tests
+    vmroot
     workspace
     ;
   profile = profile';

@@ -131,11 +131,11 @@ test package="tests.all" *args: (build (if package == "tests.all" { "tests.all" 
 docs package="" *args: (build (if package == "" { "docs.all" } else { "docs.pkg." + package }) args)
     {{ _just_debuggable_ }}
 
-# Create devroot and sysroot symlinks for local development
+# Create devroot, sysroot, testroot, and vmroot symlinks for local development
 [script]
 setup-roots *args:
     {{ _just_debuggable_ }}
-    for root in devroot sysroot; do
+    for root in devroot sysroot testroot vmroot; do
       nix build -f default.nix "${root}" \
         --argstr profile '{{ profile }}' \
         --argstr sanitize '{{ sanitize }}' \
