@@ -232,7 +232,33 @@ pub async fn watch(
                         return (hlog, verdict);
                     }
                     (Source::Guest, EventType::Panic) => {
-                        break;
+                        // Don't break immediately — drain remaining events
+                        // for a short period so that subsequent lifecycle
+                        // events (e.g. VMM Shutdown, Deleted) are captured
+                        // for diagnostics.
+                        let drain_deadline = tokio::time::sleep(Duration::from_millis(500));
+                        tokio::pin!(drain_deadline);
+                        loop {
+                            tokio::select! {
+                                event = reader.next() => {
+                                    match event {
+                                        Some(Ok(value)) => {
+                                            hlog.push(value);
+                                        }
+                                        Some(Err(e)) => {
+                                            warn!(
+                                                "hypervisor event error during post-panic drain: {e:#?}"
+                                            );
+                                        }
+                                        None => break,
+                                    }
+                                }
+                                () = &mut drain_deadline => {
+                                    break;
+                                }
+                            }
+                        }
+                        return (hlog, HypervisorVerdict::Failure);
                     }
                     _ => {}
                 };
