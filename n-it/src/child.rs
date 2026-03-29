@@ -71,7 +71,7 @@ pub async fn spawn_main_process() -> Result<Child, SpawnError> {
     let stdout_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDOUT.port.as_raw());
     let stdout_stream = vsock::VsockStream::connect(&stdout_addr).map_err(|e| {
         SpawnError::VsockConnect {
-            channel: "stdout",
+            channel: VsockChannel::TEST_STDOUT,
             source: e,
         }
     })?;
@@ -79,7 +79,7 @@ pub async fn spawn_main_process() -> Result<Child, SpawnError> {
     let stderr_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDERR.port.as_raw());
     let stderr_stream = vsock::VsockStream::connect(&stderr_addr).map_err(|e| {
         SpawnError::VsockConnect {
-            channel: "stderr",
+            channel: VsockChannel::TEST_STDERR,
             source: e,
         }
     })?;
