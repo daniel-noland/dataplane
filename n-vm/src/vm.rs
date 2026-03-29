@@ -782,17 +782,9 @@ impl TestVm {
 /// [`TestVm::collect`].
 pub async fn run_in_vm<F: FnOnce()>(_: F) -> Result<VmTestOutput, VmError> {
     // ── Resolve test identity ────────────────────────────────────────
-    //
-    // `type_name::<F>()` returns the fully-qualified path of the function
-    // item type, e.g. `"my_crate::tests::my_test"`.  When `F` is a
-    // reference to a function item (which can happen depending on how the
-    // macro captures the function), the output is prefixed with `"&"`, so
-    // we strip that.
-    //
-    // NOTE: `type_name` is explicitly documented as not stable across
-    // compiler versions, but the `crate::path` format has been consistent
-    // in practice and is the same mechanism the proc macro relies on.
-    let type_name = std::any::type_name::<F>().trim_start_matches("&");
+    let identity = crate::test_identity::TestIdentity::resolve::<F>();
+    let test_name = identity.test_name;
+
     let full_bin_path = std::env::args()
         .next()
         .ok_or(VmError::MissingArgv)?;
@@ -801,15 +793,6 @@ pub async fn run_in_vm<F: FnOnce()>(_: F) -> Result<VmTestOutput, VmError> {
         .ok_or_else(|| VmError::InvalidBinaryPath {
             path: full_bin_path.clone(),
         })?;
-    // type_name for a function item type always contains "::" because it
-    // is fully qualified (e.g. "crate::module::function").  If this
-    // invariant is violated, the Rust compiler changed its type_name
-    // format in an incompatible way.
-    let (_, test_name) = type_name
-        .split_once("::")
-        .unwrap_or_else(|| unreachable!(
-            "std::any::type_name::<F>() did not contain '::': {type_name:?}"
-        ));
 
     let params = TestVmParams {
         full_bin_path: &full_bin_path,
