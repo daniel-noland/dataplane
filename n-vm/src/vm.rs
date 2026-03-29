@@ -91,6 +91,29 @@ pub(crate) async fn wait_for_socket(path: impl AsRef<Path>) -> Result<(), VmErro
     })
 }
 
+/// Verifies that `/dev/kvm` is accessible inside the container.
+///
+/// Both cloud-hypervisor and QEMU require KVM for hardware-accelerated
+/// virtualisation.  This pre-flight check runs before the hypervisor
+/// process is spawned so that a missing or inaccessible `/dev/kvm`
+/// produces a clear, early error rather than a cryptic child-process
+/// failure.
+///
+/// # Errors
+///
+/// Returns [`VmError::KvmNotAccessible`] if `/dev/kvm` does not exist or
+/// cannot be stat'd.
+pub(crate) async fn check_kvm_accessible() -> Result<(), VmError> {
+    match tokio::fs::try_exists("/dev/kvm").await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(VmError::KvmNotAccessible(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "/dev/kvm does not exist",
+        ))),
+        Err(err) => Err(VmError::KvmNotAccessible(err)),
+    }
+}
+
 // ── ProcessOutput ────────────────────────────────────────────────────
 
 /// Collected stdout and stderr from a child process.

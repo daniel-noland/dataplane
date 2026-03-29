@@ -47,7 +47,7 @@ use tracing::debug;
 use crate::abort_on_drop::AbortOnDrop;
 use crate::backend::{HypervisorBackend, LaunchedHypervisor};
 use crate::error::VmError;
-use crate::vm::{TestVmParams, wait_for_socket};
+use crate::vm::{TestVmParams, check_kvm_accessible, wait_for_socket};
 
 use self::error::CloudHypervisorError;
 
@@ -211,18 +211,7 @@ async fn spawn_hypervisor_process()
         .into_blocking_fd()
         .map_err(CloudHypervisorError::EventSenderFd)?;
 
-    match tokio::fs::try_exists("/dev/kvm").await {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(VmError::KvmNotAccessible(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "/dev/kvm does not exist",
-            )));
-        }
-        Err(err) => {
-            return Err(VmError::KvmNotAccessible(err));
-        }
-    }
+    check_kvm_accessible().await?;
 
     let hypervisor = tokio::process::Command::new(CLOUD_HYPERVISOR_BINARY_PATH)
         .args([
