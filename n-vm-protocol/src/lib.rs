@@ -54,6 +54,23 @@ pub const ENV_MARKER_VALUE: &str = "YES";
 /// on this port) and `n-vm::run_in_vm` (which listens for the connection).
 pub const INIT_SYSTEM_VSOCK_PORT: u32 = 123_456;
 
+/// The vsock port used by the init system to forward the test process's
+/// **stdout** back to the container tier.
+///
+/// The init system connects a [`vsock::VsockStream`] on this port and passes
+/// the resulting fd as the child process's stdout.  The container tier binds
+/// a Unix listener at [`test_stdout_vsock_listener_path()`] *before* booting
+/// the VM so that the connection succeeds immediately.
+pub const TEST_STDOUT_VSOCK_PORT: u32 = 123_457;
+
+/// The vsock port used by the init system to forward the test process's
+/// **stderr** back to the container tier.
+///
+/// See [`TEST_STDOUT_VSOCK_PORT`] for the general mechanism — this port
+/// carries stderr instead of stdout, giving the host proper separation of
+/// the two streams (unlike the old `hvc0` approach which merged them).
+pub const TEST_STDERR_VSOCK_PORT: u32 = 123_458;
+
 /// The vsock context identifier (CID) assigned to the VM guest.
 pub const VM_GUEST_CID: u64 = 3;
 
@@ -112,4 +129,20 @@ pub const CLOUD_HYPERVISOR_BINARY_PATH: &str = "/bin/cloud-hypervisor";
 /// *before* the VM boots.
 pub fn vhost_vsock_listener_path() -> String {
     format!("{VHOST_VSOCK_SOCKET_PATH}_{INIT_SYSTEM_VSOCK_PORT}")
+}
+
+/// Returns the Unix socket path the container tier must bind for the test
+/// process's **stdout** vsock stream.
+///
+/// See [`vhost_vsock_listener_path()`] for the naming convention.
+pub fn test_stdout_vsock_listener_path() -> String {
+    format!("{VHOST_VSOCK_SOCKET_PATH}_{TEST_STDOUT_VSOCK_PORT}")
+}
+
+/// Returns the Unix socket path the container tier must bind for the test
+/// process's **stderr** vsock stream.
+///
+/// See [`vhost_vsock_listener_path()`] for the naming convention.
+pub fn test_stderr_vsock_listener_path() -> String {
+    format!("{VHOST_VSOCK_SOCKET_PATH}_{TEST_STDERR_VSOCK_PORT}")
 }

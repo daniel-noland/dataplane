@@ -1,14 +1,16 @@
 use std::convert::Infallible;
+use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::process::Stdio;
 
-use n_vm_protocol::{ENV_IN_VM, ENV_MARKER_VALUE};
+use n_vm_protocol::{ENV_IN_VM, ENV_MARKER_VALUE, TEST_STDERR_VSOCK_PORT, TEST_STDOUT_VSOCK_PORT};
+use tokio_vsock::VMADDR_CID_HOST;
 use nix::errno::Errno;
 use nix::mount::{MntFlags, MsFlags, mount};
 use nix::sys::reboot::{RebootMode, reboot};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, sync};
-use tokio::io::AsyncWriteExt;
+
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{Duration, sleep};
@@ -93,10 +95,13 @@ impl InitSystem {
     /// Reads the binary path and test name from the kernel command line
     /// arguments (passed via `init=`), sets `IN_VM=YES` so the `#[in_vm]`
     /// macro executes the test body directly, and redirects stdout/stderr to
-    /// the hypervisor console (`/dev/hvc0`).
+    /// dedicated vsock streams ([`TEST_STDOUT_VSOCK_PORT`] and
+    /// [`TEST_STDERR_VSOCK_PORT`]).
     ///
-    /// Returns the console file handle (for flushing) and the child process.
-    pub async fn spawn_main_process() -> (tokio::fs::File, Child) {
+    /// The container tier must have already bound Unix listeners at the
+    /// corresponding vsock listener paths before the VM booted, so these
+    /// connections succeed immediately.
+    pub async fn spawn_main_process() -> Child {
         debug!("spawning main process");
 
         let mut args = std::env::args();
@@ -104,32 +109,31 @@ impl InitSystem {
             fatal!("no main process specified to init process");
         }
 
-        let mut console = tokio::fs::OpenOptions::new()
-            .read(false)
-            .append(true)
-            .create_new(false)
-            .open("/dev/hvc0")
-            .await
-            .unwrap_or_else(|e| fatal!("failed to open hypervisor console /dev/hvc0: {e}"));
-        console.set_max_buf_size(8_192);
-
         args.next().expect("argv[0] missing"); // skip self
 
-        // TODO: convert from using hvc0 to using a vsock
-        let stderr_console = console
-            .try_clone()
-            .await
-            .unwrap_or_else(|e| fatal!("failed to clone console for stderr: {e}"));
-        let stdout_console = console
-            .try_clone()
-            .await
-            .unwrap_or_else(|e| fatal!("failed to clone console for stdout: {e}"));
+        // Connect vsock streams for stdout and stderr.  The container tier
+        // has already bound Unix listeners at the corresponding paths, so
+        // these connections succeed immediately.
+        let stdout_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, TEST_STDOUT_VSOCK_PORT);
+        let stdout_stream = vsock::VsockStream::connect(&stdout_addr)
+            .unwrap_or_else(|e| fatal!("failed to connect stdout vsock: {e}"));
+
+        let stderr_addr = vsock::VsockAddr::new(VMADDR_CID_HOST, TEST_STDERR_VSOCK_PORT);
+        let stderr_stream = vsock::VsockStream::connect(&stderr_addr)
+            .unwrap_or_else(|e| fatal!("failed to connect stderr vsock: {e}"));
+
+        // SAFETY: `VsockStream::into_raw_fd()` returns a valid, owned file
+        // descriptor.  `Stdio::from_raw_fd()` takes ownership of it.  The
+        // fd is not used after this point.
+        let stdout_stdio = unsafe { Stdio::from_raw_fd(stdout_stream.into_raw_fd()) };
+        let stderr_stdio = unsafe { Stdio::from_raw_fd(stderr_stream.into_raw_fd()) };
+
         let child = Command::new(args.next().expect("argv[1] missing: no test binary specified"))
             .args(args)
             .kill_on_drop(true)
             .stdin(Stdio::inherit())
-            .stderr(stderr_console.into_std().await)
-            .stdout(stdout_console.into_std().await)
+            .stdout(stdout_stdio)
+            .stderr(stderr_stdio)
             .env(ENV_IN_VM, ENV_MARKER_VALUE)
             .env("PATH", "/bin")
             .env("LD_LIBRARY_PATH", "/lib")
@@ -142,7 +146,7 @@ impl InitSystem {
         } else {
             fatal!("unable to determine main PID");
         }
-        (console, child)
+        child
     }
 
     /// Reaps all orphaned child processes via non-blocking `waitpid`.
@@ -408,7 +412,7 @@ impl InitSystem {
         }
 
         // Spawn the main process
-        let (mut console, mut child) = InitSystem::spawn_main_process().await;
+        let mut child = InitSystem::spawn_main_process().await;
 
         let pid = match child.id() {
             Some(id) => Pid::from_raw(id as i32),
@@ -436,13 +440,6 @@ impl InitSystem {
                             error!("main process error: {e}");
                             success = false;
                         }
-                    }
-                    match console.flush().await {
-                        Ok(_) => {},
-                        Err(e) => {
-                            error!("failed to flush console: {e}");
-                            success = false;
-                        },
                     }
                     break;
                 }
