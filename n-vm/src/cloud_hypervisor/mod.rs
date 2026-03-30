@@ -35,14 +35,14 @@ use std::sync::Arc;
 use cloud_hypervisor_client::apis::DefaultApi;
 use cloud_hypervisor_client::models::console_config::Mode;
 use cloud_hypervisor_client::models::{
-    ConsoleConfig, CpuTopology, CpusConfig, FsConfig, LandlockConfig, MemoryConfig, NetConfig,
-    PayloadConfig, PlatformConfig, VmConfig, VsockConfig,
+    ConsoleConfig, CpuTopology, CpusConfig, FsConfig, MemoryConfig, NetConfig, PayloadConfig,
+    PlatformConfig, VmConfig, VsockConfig,
 };
 use command_fds::{CommandFdExt, FdMapping};
 use n_vm_protocol::{
     CLOUD_HYPERVISOR_BINARY_PATH, HYPERVISOR_API_SOCKET_PATH, INIT_BINARY_PATH,
     KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH, VHOST_VSOCK_SOCKET_PATH, VIRTIOFS_ROOT_TAG,
-    VIRTIOFSD_SOCKET_PATH, VM_GUEST_CID, VM_RUN_DIR, VsockChannel,
+    VIRTIOFSD_SOCKET_PATH, VsockChannel,
 };
 use tokio::io::AsyncReadExt;
 use tracing::{debug, error};
@@ -50,7 +50,7 @@ use tracing::{debug, error};
 use crate::abort_on_drop::AbortOnDrop;
 use crate::backend::{HypervisorBackend, LaunchedHypervisor};
 use crate::error::VmError;
-use crate::vm::{TestVmParams, check_kvm_accessible, wait_for_socket};
+use crate::vm::{TestVmParams, check_hugepages_accessible, check_kvm_accessible, wait_for_socket};
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -60,14 +60,20 @@ use crate::vm::{TestVmParams, check_kvm_accessible, wait_for_socket};
 /// It must match the `--event-monitor fd=N` argument.
 const EVENT_MONITOR_FD: RawFd = 3;
 
-/// Total guest memory in bytes (512 MiB).
-const VM_MEMORY_BYTES: i64 = 512 * 1024 * 1024;
+/// Total guest memory in bytes (1 GiB).
+///
+/// Must be a multiple of the host hugepage size.  The development
+/// machines use 1 GiB hugepages, so the minimum (and default) is 1 GiB.
+const VM_MEMORY_BYTES: i64 = 1024 * 1024 * 1024;
 
-/// Hugepage size in bytes (2 MiB).
-const VM_HUGEPAGE_BYTES: i64 = 2 * 1024 * 1024;
+/// Hugepage size in bytes (1 GiB).
+///
+/// Must match the `pagesize=` of the hugetlbfs mount at `/dev/hugepages`
+/// on the host.
+const VM_HUGEPAGE_BYTES: i64 = 1024 * 1024 * 1024;
 
-/// Number of 2 MiB hugepages to reserve on the kernel command line.
-const VM_HUGEPAGE_COUNT: u32 = 16;
+/// Number of 1 GiB hugepages to reserve on the guest kernel command line.
+const VM_HUGEPAGE_COUNT: u32 = 1;
 
 /// MTU for the management network interface (standard Ethernet).
 const MGMT_MTU: i32 = 1500;
@@ -248,6 +254,7 @@ async fn spawn_hypervisor_process()
         .map_err(CloudHypervisorError::EventSenderFd)?;
 
     check_kvm_accessible().await?;
+    check_hugepages_accessible().await?;
 
     let hypervisor = tokio::process::Command::new(CLOUD_HYPERVISOR_BINARY_PATH)
         .args([
@@ -295,7 +302,7 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
     VmConfig {
         payload: build_payload_config(params),
         vsock: Some(VsockConfig {
-            cid: VM_GUEST_CID.as_raw() as _,
+            cid: params.vsock.cid.as_raw() as _,
             socket: VHOST_VSOCK_SOCKET_PATH.into(),
             pci_segment: Some(0),
             ..Default::default()
@@ -316,11 +323,11 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
         watchdog: Some(true),
         platform: Some(build_platform_config(params)),
         pvpanic: Some(true),
-        landlock_enable: Some(true),
-        landlock_rules: Some(vec![LandlockConfig {
-            path: VM_RUN_DIR.into(),
-            access: "rw".into(),
-        }]),
+        // Landlock is disabled: the Docker container already provides
+        // filesystem isolation, and Landlock's allow-list (which only
+        // covers VM_RUN_DIR) would block access to /dev/net/tun and
+        // other device nodes that cloud-hypervisor needs.
+        landlock_enable: Some(false),
         ..Default::default()
     }
 }
@@ -328,6 +335,7 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
 /// Builds the kernel payload configuration, including the kernel command
 /// line that passes the test binary path and name to the init system.
 fn build_payload_config(params: &TestVmParams<'_>) -> PayloadConfig {
+    let vsock_cmdline = params.vsock.kernel_cmdline_fragment();
     PayloadConfig {
         firmware: None,
         kernel: Some(KERNEL_IMAGE_PATH.into()),
@@ -341,12 +349,13 @@ fn build_payload_config(params: &TestVmParams<'_>) -> PayloadConfig {
              ro \
              rootfstype=virtiofs \
              root=root \
-             default_hugepagesz=2M \
-             hugepagesz=2M \
+             default_hugepagesz=1G \
+             hugepagesz=1G \
              hugepages={VM_HUGEPAGE_COUNT} \
+             {vsock_cmdline} \
              init={INIT_BINARY_PATH} \
-             -- {full_bin_path} {test_name} --exact --no-capture --format=terse",
-            full_bin_path = params.full_bin_path.display(),
+             -- {vm_bin_path} {test_name} --exact --no-capture --format=terse",
+            vm_bin_path = params.vm_bin_path,
             test_name = params.test_name,
         )),
         ..Default::default()
@@ -499,9 +508,11 @@ mod tests {
     fn sample_params() -> TestVmParams<'static> {
         TestVmParams {
             full_bin_path: Path::new("/target/debug/deps/my_test-abc123"),
+            vm_bin_path: format!("/{}/my_test-abc123", n_vm_protocol::VM_TEST_BIN_DIR),
             bin_name: "my_test-abc123",
             test_name: "tests::my_test",
             iommu: false,
+            vsock: n_vm_protocol::VsockAllocation::with_defaults(),
         }
     }
 
@@ -519,9 +530,10 @@ mod tests {
         let params = sample_params();
         let payload = build_payload_config(&params);
         let cmdline = payload.cmdline.as_deref().expect("cmdline should be set");
+        let expected = format!("/{}/my_test-abc123", n_vm_protocol::VM_TEST_BIN_DIR);
         assert!(
-            cmdline.contains("/target/debug/deps/my_test-abc123"),
-            "cmdline should contain the full binary path: {cmdline}",
+            cmdline.contains(&expected),
+            "cmdline should contain the VM-side binary path ({expected}): {cmdline}",
         );
     }
 
@@ -557,7 +569,7 @@ mod tests {
             "cmdline should configure hugepage count: {cmdline}",
         );
         assert!(
-            cmdline.contains("hugepagesz=2M"),
+            cmdline.contains("hugepagesz=1G"),
             "cmdline should configure hugepage size: {cmdline}",
         );
     }
@@ -574,6 +586,18 @@ mod tests {
         assert!(
             cmdline.contains("--no-capture"),
             "cmdline should pass --no-capture to the test harness: {cmdline}",
+        );
+    }
+
+    #[test]
+    fn payload_config_embeds_vsock_port_parameters() {
+        let params = sample_params();
+        let payload = build_payload_config(&params);
+        let cmdline = payload.cmdline.as_deref().expect("cmdline should be set");
+        let fragment = params.vsock.kernel_cmdline_fragment();
+        assert!(
+            cmdline.contains(&fragment),
+            "cmdline should contain vsock port parameters ({fragment}): {cmdline}",
         );
     }
 
@@ -752,7 +776,7 @@ mod tests {
         let params = sample_params();
         let config = build_vm_config(&params);
         let vsock = config.vsock.expect("vsock should be set");
-        assert_eq!(vsock.cid, VM_GUEST_CID.as_raw() as i64);
+        assert_eq!(vsock.cid, params.vsock.cid.as_raw() as i64);
         assert_eq!(vsock.socket, VHOST_VSOCK_SOCKET_PATH);
     }
 
@@ -863,14 +887,13 @@ mod tests {
     }
 
     #[test]
-    fn vm_config_enables_landlock_with_vm_run_dir() {
+    fn vm_config_disables_landlock() {
         let params = sample_params();
         let config = build_vm_config(&params);
-        assert_eq!(config.landlock_enable, Some(true));
-        let rules = config.landlock_rules.expect("landlock_rules should be set");
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].path, VM_RUN_DIR);
-        assert_eq!(rules[0].access, "rw");
+        // Landlock is disabled because the Docker container already
+        // provides filesystem isolation, and the allow-list would block
+        // access to /dev/net/tun and other device nodes.
+        assert_eq!(config.landlock_enable, Some(false));
     }
 
     // ── Event log display ────────────────────────────────────────────
