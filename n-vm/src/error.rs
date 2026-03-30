@@ -93,6 +93,24 @@ pub enum VmError {
     #[error("/dev/kvm is not accessible")]
     KvmNotAccessible(#[source] std::io::Error),
 
+    /// `/dev/hugepages` is missing or inaccessible inside the container.
+    ///
+    /// Both cloud-hypervisor and QEMU require hugepage-backed memory for
+    /// the VM guest (cloud-hypervisor via `MemoryConfig.hugepages`, QEMU
+    /// via `-object memory-backend-file,mem-path=/dev/hugepages`).
+    ///
+    /// In scratch-mode containers, `/dev/hugepages` must be available as
+    /// a hugetlbfs mount.  Privileged containers normally inherit this
+    /// from the host, but if the host kernel does not have hugetlbfs
+    /// mounted at `/dev/hugepages` or the mount is not propagated into
+    /// the container, QEMU/cloud-hypervisor will crash immediately with
+    /// an opaque error.
+    ///
+    /// This pre-flight check runs alongside [`KvmNotAccessible`] to
+    /// surface the problem early with a clear message.
+    #[error("/dev/hugepages is not accessible (hugetlbfs not mounted?)")]
+    HugepagesNotAccessible(#[source] std::io::Error),
+
     /// The hypervisor binary could not be spawned.
     ///
     /// This is the `Command::spawn()` call for whatever hypervisor binary

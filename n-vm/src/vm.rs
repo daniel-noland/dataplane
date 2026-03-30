@@ -39,12 +39,14 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use n_vm_protocol::{
-    KERNEL_CONSOLE_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VIRTIOFSD_BINARY_PATH, VIRTIOFSD_SOCKET_PATH,
-    VM_ROOT_SHARE_PATH, VsockChannel,
+    INIT_BINARY_PATH, KERNEL_CONSOLE_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VIRTIOFSD_BINARY_PATH,
+    VIRTIOFSD_SOCKET_PATH, VM_ROOT_SHARE_PATH, VsockAllocation, VsockChannel, VsockCid,
+    VsockPort,
 };
+use rand::RngExt;
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::abort_on_drop::AbortOnDrop;
 use crate::backend::{HypervisorBackend, HypervisorVerdict};
@@ -57,6 +59,17 @@ const SOCKET_POLL_MAX_ATTEMPTS: u32 = 100;
 
 /// Interval between socket existence checks.
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Maximum time a VM test is allowed to run before forced shutdown.
+///
+/// If the guest-side streams (vsock readers for test stdout/stderr and
+/// init trace) do not close within this duration after the VM is
+/// launched, [`TestVm::collect`] forcefully shuts down the hypervisor
+/// and collects whatever output is available.  This prevents a hung
+/// guest from blocking the test runner indefinitely while still
+/// capturing the kernel console log, hypervisor output, and any partial
+/// test output for diagnostics.
+const VM_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ── Utilities ────────────────────────────────────────────────────────
 
@@ -108,6 +121,384 @@ pub(crate) async fn check_kvm_accessible() -> Result<(), VmError> {
             "/dev/kvm does not exist",
         ))),
         Err(err) => Err(VmError::KvmNotAccessible(err)),
+    }
+}
+
+/// Verifies that `/dev/hugepages` is accessible inside the container.
+///
+/// Both cloud-hypervisor and QEMU require hugepage-backed memory for the
+/// VM guest.  QEMU uses `-object memory-backend-file,mem-path=/dev/hugepages`
+/// and cloud-hypervisor uses `MemoryConfig { hugepages: true, .. }`.
+///
+/// In scratch-mode containers `/dev/hugepages` must be present as a
+/// hugetlbfs mount.  Privileged Docker containers normally inherit it
+/// from the host, but if the host does not have hugetlbfs mounted there
+/// (or the mount is not propagated), the hypervisor will crash
+/// immediately after creating its control socket — producing a cryptic
+/// "Connection reset by peer" (QEMU/QMP) or silent timeout
+/// (cloud-hypervisor) rather than a clear error.
+///
+/// This pre-flight check runs before the hypervisor process is spawned
+/// so that the missing mount produces a clear, actionable message.
+///
+/// # Errors
+///
+/// Returns [`VmError::HugepagesNotAccessible`] if `/dev/hugepages` does
+/// not exist or cannot be stat'd.
+pub(crate) async fn check_hugepages_accessible() -> Result<(), VmError> {
+    match tokio::fs::try_exists("/dev/hugepages").await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(VmError::HugepagesNotAccessible(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "/dev/hugepages does not exist; ensure hugetlbfs is mounted on the host \
+             and propagated into the container",
+        ))),
+        Err(err) => Err(VmError::HugepagesNotAccessible(err)),
+    }
+}
+
+/// Pre-flight diagnostics for the virtiofsd root share.
+///
+/// Logs detailed information about the vmroot filesystem state to help
+/// diagnose guest init failures — especially `ENOEXEC` (error -8) which
+/// indicates the kernel found the init binary but could not execute it.
+///
+/// Checks performed:
+///
+/// 1. The vmroot share directory ([`VM_ROOT_SHARE_PATH`]) exists.
+/// 2. The `/nix/store` bind mount inside the vmroot is populated (not
+///    the empty directory from the nix derivation).
+/// 3. The init binary ([`INIT_BINARY_PATH`]) file metadata: size,
+///    permissions, file type (regular vs symlink), and whether it is
+///    executable.
+/// 4. Full ELF header dump: magic, class (32/64), encoding (LE/BE),
+///    `e_type` (EXEC/DYN/…), `e_machine`, `e_phnum`, and a hex dump
+///    of the first 64 bytes so the developer can compare against
+///    `readelf -h` on the host.
+/// 5. Essential guest directories (`/dev`, `/proc`, `/sys`, `/tmp`,
+///    `/run`) exist so the kernel can mount devtmpfs, procfs, etc.
+///
+/// This function never fails — it logs warnings and errors so the
+/// developer can see what went wrong even when the VM subsequently
+/// kernel-panics with an otherwise cryptic error code.
+pub(crate) async fn diagnose_vmroot_share() {
+    let root = VM_ROOT_SHARE_PATH;
+
+    // ── 0. process identity ──────────────────────────────────────────
+    //
+    // virtiofsd inherits this UID/GID and opens files on the guest's
+    // behalf using these credentials.  If the container user cannot
+    // read files in the vmroot, virtiofsd will serve empty/error
+    // responses and the kernel will see ENOEXEC.
+    let uid = nix::unistd::getuid();
+    let gid = nix::unistd::getgid();
+    let euid = nix::unistd::geteuid();
+    let egid = nix::unistd::getegid();
+    info!(
+        "vmroot diagnostics: process uid={uid} gid={gid} \
+         euid={euid} egid={egid}"
+    );
+
+    // ── 1. vmroot share directory ────────────────────────────────────
+    match tokio::fs::try_exists(root).await {
+        Ok(true) => info!("vmroot share: {root} exists"),
+        other => {
+            error!("vmroot share: {root} not accessible: {other:?}");
+            return;
+        }
+    }
+
+    // ── 2. /nix/store bind mount ─────────────────────────────────────
+    let nix_store = format!("{root}/nix/store");
+    match tokio::fs::read_dir(&nix_store).await {
+        Ok(mut entries) => {
+            let has_entries = entries.next_entry().await.ok().flatten().is_some();
+            if has_entries {
+                info!("vmroot nix store: {nix_store} is populated (bind mount OK)");
+            } else {
+                error!(
+                    "vmroot nix store: {nix_store} is EMPTY — the /nix/store \
+                     bind mount into the vmroot share is not working.  \
+                     Symlinks to /nix/store/* will not resolve in the VM guest, \
+                     causing ENOEXEC (error -8) on the init binary."
+                );
+            }
+        }
+        Err(e) => error!("vmroot nix store: cannot read {nix_store}: {e}"),
+    }
+
+    // ── 3. init binary file metadata ─────────────────────────────────
+    let init_path = format!("{root}{INIT_BINARY_PATH}");
+
+    // Check symlink status first (lstat — does not follow symlinks).
+    match tokio::fs::symlink_metadata(&init_path).await {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                match tokio::fs::read_link(&init_path).await {
+                    Ok(target) => warn!(
+                        "vmroot init binary: {init_path} is a SYMLINK -> {target:?}. \
+                         The guest kernel resolves symlinks via FUSE READLINK; \
+                         if the target is an absolute /nix/store path it must \
+                         be reachable through the virtiofs submount."
+                    ),
+                    Err(e) => warn!(
+                        "vmroot init binary: {init_path} is a symlink but \
+                         readlink failed: {e}"
+                    ),
+                }
+            } else if ft.is_file() {
+                info!("vmroot init binary: {init_path} is a regular file (not a symlink)");
+            } else {
+                error!(
+                    "vmroot init binary: {init_path} is neither a regular file \
+                     nor a symlink (file_type: {ft:?})"
+                );
+            }
+        }
+        Err(e) => {
+            error!("vmroot init binary: cannot lstat {init_path}: {e}");
+        }
+    }
+
+    // Stat the file (follows symlinks) for size and permissions.
+    match tokio::fs::metadata(&init_path).await {
+        Ok(meta) => {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            let size = meta.len();
+            let executable = mode & 0o111 != 0;
+            info!(
+                "vmroot init binary: {init_path} size={size} mode={mode:#06o} \
+                 executable={executable}"
+            );
+            if !executable {
+                error!(
+                    "vmroot init binary: {init_path} is NOT executable \
+                     (mode={mode:#06o}).  The kernel will fail with EACCES or \
+                     ENOEXEC."
+                );
+            }
+            if size == 0 {
+                error!("vmroot init binary: {init_path} is EMPTY (0 bytes)");
+            }
+        }
+        Err(e) => error!("vmroot init binary: cannot stat {init_path}: {e}"),
+    }
+
+    // ── 4. init binary ELF header ────────────────────────────────────
+    //
+    // Read the first 64 bytes (size of an ELF64 header) and parse the
+    // key fields that the kernel's load_elf_binary() checks before
+    // accepting the binary.
+    match tokio::fs::File::open(&init_path).await {
+        Ok(mut f) => {
+            let mut hdr = [0u8; 64];
+            match f.read_exact(&mut hdr).await {
+                Ok(_) => {
+                    diagnose_elf_header(&init_path, &hdr);
+                }
+                Err(e) => error!(
+                    "vmroot init binary: failed to read 64-byte ELF header \
+                     from {init_path}: {e}"
+                ),
+            }
+        }
+        Err(e) => error!("vmroot init binary: cannot open {init_path}: {e}"),
+    }
+
+    // ── 5. essential guest directories ───────────────────────────────
+    for dir in ["/dev", "/proc", "/sys", "/tmp", "/run"] {
+        let path = format!("{root}{dir}");
+        match tokio::fs::try_exists(&path).await {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                "vmroot: {path} does not exist — the kernel cannot auto-mount \
+                 {dir} (e.g. devtmpfs at /dev) on a read-only root filesystem.  \
+                 Add 'mkdir -p $out{dir}' to the vmroot nix derivation."
+            ),
+            Err(e) => warn!("vmroot: cannot stat {path}: {e}"),
+        }
+    }
+
+    // ── 6. canary binary readability ─────────────────────────────────
+    //
+    // The canary is a trivial ~200-byte non-PIE static ELF with no
+    // CET notes and no nix store dependencies.  If the kernel also
+    // gets ENOEXEC on this file, the issue is in the virtiofs data
+    // path, not the binary format.
+    let canary_path = format!("{root}/bin/canary-init");
+    match tokio::fs::read(&canary_path).await {
+        Ok(contents) => {
+            let len = contents.len();
+            let magic_ok = contents.len() >= 4 && contents[0..4] == *b"\x7fELF";
+            let hex_head: String = contents
+                .iter()
+                .take(16)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            info!(
+                "vmroot canary: {canary_path} readable from container \
+                 (size={len}, ELF_magic={magic_ok}, head=[{hex_head}])"
+            );
+            if !magic_ok {
+                error!(
+                    "vmroot canary: {canary_path} does NOT have ELF magic. \
+                     First 16 bytes: [{hex_head}]"
+                );
+            }
+        }
+        Err(e) => error!(
+            "vmroot canary: CANNOT READ {canary_path} from container \
+             as uid={uid}/euid={euid}: {e}  — if virtiofsd also cannot \
+             read this file, the kernel will get empty data and ENOEXEC."
+        ),
+    }
+}
+
+/// Parses and logs the fields of a 64-byte ELF header buffer.
+///
+/// This is intentionally verbose so that the output can be compared
+/// byte-for-byte against `readelf -h` on the host when diagnosing
+/// ENOEXEC failures in the VM guest.
+fn diagnose_elf_header(path: &str, hdr: &[u8; 64]) {
+    // ── hex dump ─────────────────────────────────────────────────────
+    let hex: String = hdr
+        .chunks(16)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let hex_bytes: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            format!("  {offset:04x}: {hex}", offset = i * 16, hex = hex_bytes.join(" "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    info!("vmroot init binary: {path} first 64 bytes (ELF header):\n{hex}");
+
+    // ── magic ────────────────────────────────────────────────────────
+    if hdr[0..4] != *b"\x7fELF" {
+        error!(
+            "vmroot init binary: {path} does NOT have ELF magic \
+             (first 4 bytes: {:02x?}).  If these look like ASCII path \
+             characters (e.g. [2f 6e 69 78] = '/nix'), virtiofsd may be \
+             returning the symlink target string instead of file contents.",
+            &hdr[0..4]
+        );
+        return;
+    }
+
+    // ── e_ident fields ───────────────────────────────────────────────
+    let ei_class = hdr[4];
+    let ei_data = hdr[5];
+    let ei_version = hdr[6];
+    let ei_osabi = hdr[7];
+
+    let class_str = match ei_class {
+        1 => "ELF32",
+        2 => "ELF64",
+        _ => "UNKNOWN",
+    };
+    let data_str = match ei_data {
+        1 => "little-endian (LSB)",
+        2 => "big-endian (MSB)",
+        _ => "UNKNOWN",
+    };
+    let osabi_str = match ei_osabi {
+        0 => "ELFOSABI_NONE/SYSV",
+        3 => "ELFOSABI_LINUX",
+        _ => "other",
+    };
+
+    info!(
+        "vmroot init binary: {path} e_ident: class={class_str}({ei_class}) \
+         data={data_str}({ei_data}) version={ei_version} \
+         osabi={osabi_str}({ei_osabi})"
+    );
+
+    if ei_class != 2 {
+        error!(
+            "vmroot init binary: {path} is NOT ELF64 (class={ei_class}). \
+             The x86_64 kernel requires ELF64 binaries."
+        );
+        return;
+    }
+    if ei_data != 1 {
+        error!(
+            "vmroot init binary: {path} is NOT little-endian (data={ei_data}). \
+             x86_64 requires LSB encoding."
+        );
+        return;
+    }
+
+    // ── ELF64 header fields (little-endian) ──────────────────────────
+    let e_type = u16::from_le_bytes([hdr[16], hdr[17]]);
+    let e_machine = u16::from_le_bytes([hdr[18], hdr[19]]);
+    let e_version = u32::from_le_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]);
+    let e_entry = u64::from_le_bytes([
+        hdr[24], hdr[25], hdr[26], hdr[27], hdr[28], hdr[29], hdr[30], hdr[31],
+    ]);
+    let e_phoff = u64::from_le_bytes([
+        hdr[32], hdr[33], hdr[34], hdr[35], hdr[36], hdr[37], hdr[38], hdr[39],
+    ]);
+    let e_flags = u32::from_le_bytes([hdr[48], hdr[49], hdr[50], hdr[51]]);
+    let e_ehsize = u16::from_le_bytes([hdr[52], hdr[53]]);
+    let e_phentsize = u16::from_le_bytes([hdr[54], hdr[55]]);
+    let e_phnum = u16::from_le_bytes([hdr[56], hdr[57]]);
+
+    let type_str = match e_type {
+        0 => "ET_NONE",
+        1 => "ET_REL",
+        2 => "ET_EXEC",
+        3 => "ET_DYN (PIE or shared object)",
+        4 => "ET_CORE",
+        _ => "unknown",
+    };
+    let machine_str = match e_machine {
+        0x3E => "EM_X86_64",
+        0x03 => "EM_386",
+        0xB7 => "EM_AARCH64",
+        _ => "other",
+    };
+
+    info!(
+        "vmroot init binary: {path} ELF64 header: \
+         e_type={e_type}({type_str}) e_machine=0x{e_machine:x}({machine_str}) \
+         e_version={e_version} e_entry=0x{e_entry:x} e_phoff={e_phoff} \
+         e_flags=0x{e_flags:x} e_ehsize={e_ehsize} \
+         e_phentsize={e_phentsize} e_phnum={e_phnum}"
+    );
+
+    // ── sanity checks ────────────────────────────────────────────────
+    if e_machine != 0x3E {
+        error!(
+            "vmroot init binary: {path} e_machine=0x{e_machine:x} is NOT \
+             EM_X86_64 (0x3e).  The kernel will return ENOEXEC."
+        );
+    }
+    if e_type != 2 && e_type != 3 {
+        error!(
+            "vmroot init binary: {path} e_type={e_type} is neither ET_EXEC(2) \
+             nor ET_DYN(3).  The kernel only executes these types."
+        );
+    }
+    if e_type == 3 {
+        info!(
+            "vmroot init binary: {path} is ET_DYN (static-pie or dynamic). \
+             If statically linked, the kernel handles this as a static PIE \
+             executable (supported since Linux 5.x)."
+        );
+    }
+    if e_phnum == 0 {
+        error!(
+            "vmroot init binary: {path} has NO program headers (e_phnum=0). \
+             The kernel cannot load a binary with no segments."
+        );
+    }
+    if e_ehsize != 64 {
+        warn!(
+            "vmroot init binary: {path} unexpected e_ehsize={e_ehsize} \
+             (expected 64 for ELF64)"
+        );
     }
 }
 
@@ -205,7 +596,18 @@ impl ProcessOutput {
 /// ```
 pub struct TestVmParams<'a> {
     /// Full path to the test binary (e.g. `/path/to/deps/my_test-abc123`).
+    ///
+    /// This is the host-side (container-side) path.  It is used as
+    /// `argv[0]` when the container re-executes the test binary.
     pub full_bin_path: &'a Path,
+    /// Path to the test binary as seen by the VM guest.
+    ///
+    /// The container mounts the binary directory at the well-known
+    /// [`VM_TEST_BIN_DIR`](n_vm_protocol::VM_TEST_BIN_DIR) mount point
+    /// inside `vmroot`, so the VM guest sees the binary at
+    /// `/{VM_TEST_BIN_DIR}/{bin_name}`.  This path is passed on the
+    /// kernel command line so that `n-it` can execute it.
+    pub vm_bin_path: String,
     /// Short binary name (filename component only, e.g. `my_test-abc123`).
     pub bin_name: &'a str,
     /// Fully-qualified test name (e.g. `module::test_name`).
@@ -220,6 +622,15 @@ pub struct TestVmParams<'a> {
     /// When `false` (the default), no virtual IOMMU is configured and
     /// devices use direct DMA.
     pub iommu: bool,
+    /// Dynamically-allocated vsock resources for this VM instance.
+    ///
+    /// Vsock CIDs and `AF_VSOCK` port bindings are **host-global** (not
+    /// namespaced by containers).  Each VM must use a unique allocation
+    /// to avoid collisions when multiple tests run in parallel.
+    ///
+    /// See [`VsockAllocation`] for details on why this is necessary and
+    /// how the ports are communicated to the guest init system.
+    pub vsock: VsockAllocation,
 }
 
 // ── VmTestOutput ─────────────────────────────────────────────────────
@@ -406,14 +817,21 @@ impl<B: HypervisorBackend> TestVm<B> {
     /// automatically aborted when their handles drop.  Child processes use
     /// `kill_on_drop(true)` for the same guarantee.
     pub async fn launch(params: &TestVmParams<'_>) -> Result<Self, VmError> {
+        // Run pre-flight diagnostics on the vmroot filesystem before
+        // starting virtiofsd.  This catches common misconfigurations
+        // (empty /nix/store bind mount, missing /dev directory, broken
+        // symlinks) and logs actionable error messages instead of letting
+        // the VM kernel-panic with a cryptic ENOEXEC.
+        diagnose_vmroot_share().await;
+
         let virtiofsd = Self::launch_virtiofsd(VM_ROOT_SHARE_PATH).await?;
         // All listeners must be bound *before* the VM boots so that the
         // guest-side vsock connections succeed immediately.  The listener
         // type is backend-specific: cloud-hypervisor uses Unix sockets,
         // QEMU uses AF_VSOCK via the kernel's vhost-vsock module.
-        let init_trace = B::spawn_vsock_reader(&VsockChannel::INIT_TRACE)?;
-        let test_stdout = B::spawn_vsock_reader(&VsockChannel::TEST_STDOUT)?;
-        let test_stderr = B::spawn_vsock_reader(&VsockChannel::TEST_STDERR)?;
+        let init_trace = B::spawn_vsock_reader(&params.vsock.init_trace)?;
+        let test_stdout = B::spawn_vsock_reader(&params.vsock.test_stdout)?;
+        let test_stderr = B::spawn_vsock_reader(&params.vsock.test_stderr)?;
 
         let launched = B::launch(params).await?;
 
@@ -460,37 +878,56 @@ impl<B: HypervisorBackend> TestVm<B> {
         let test_stderr = test_stderr.into_inner();
         let kernel_log = kernel_log.into_inner();
 
-        // The vsock readers complete when the guest-side streams close
-        // (test process exits -> stdout/stderr close; n-it exits ->
-        // init_trace closes).
-        let init_trace =
-            ProcessOutput::join_task_or_fallback(init_trace, "init system trace").await;
-        let test_stdout = ProcessOutput::join_task_or_fallback(test_stdout, "test stdout").await;
-        let test_stderr = ProcessOutput::join_task_or_fallback(test_stderr, "test stderr").await;
-
+        // ── Phase 1: wait for the VM to reach a terminal state ───
+        //
         // The event watcher completes when the hypervisor emits a
-        // terminal event (Shutdown / Panic) or the pipe/socket closes.
-        let (hypervisor_events, hypervisor_verdict) = match event_watcher.await {
-            Ok(result) => result,
-            Err(err) => {
-                error!("hypervisor event watcher task failed: {err}");
+        // terminal event (Shutdown / Panic) or the event pipe closes.
+        // If the guest hangs, the timeout fires instead.  In either
+        // case we call B::shutdown() afterward -- it is idempotent,
+        // so in the happy path it harmlessly confirms the VM is
+        // already down, while in the timeout path it force-kills the
+        // guest and unblocks all pending stream readers.
+        let (hypervisor_events, hypervisor_verdict) = tokio::select! {
+            biased;
+            result = event_watcher => {
+                match result {
+                    Ok(r) => r,
+                    Err(err) => {
+                        error!("hypervisor event watcher task failed: {err}");
+                        (B::EventLog::default(), HypervisorVerdict::Failure)
+                    }
+                }
+            }
+            _ = tokio::time::sleep(VM_TEST_TIMEOUT) => {
+                warn!(
+                    "VM test did not complete within {VM_TEST_TIMEOUT:?}; \
+                     forcing hypervisor shutdown to collect diagnostics"
+                );
                 (B::EventLog::default(), HypervisorVerdict::Failure)
             }
         };
 
-        // Best-effort shutdown BEFORE waiting for the hypervisor process
-        // to exit.  In the normal path the VM has already powered off
-        // (n-it calls reboot(RB_POWER_OFF) or aborts), so these calls
-        // will fail harmlessly.  But if the guest init hangs or the
-        // shutdown path fails, these calls break the deadlock that would
-        // otherwise occur when `from_child` waits for the hypervisor
-        // process to exit.
         B::shutdown(&controller).await;
+
+        // ── Phase 2: collect output from all subsystems ──────────
+        //
+        // After shutdown the hypervisor process exits, which closes
+        // the vsock streams and serial console socket.  All pending
+        // readers should complete promptly.  A safety-net timeout on
+        // each prevents a misbehaving reader from blocking forever.
+        const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let init_trace =
+            drain_or_fallback(init_trace, "init system trace", DRAIN_TIMEOUT).await;
+        let test_stdout =
+            drain_or_fallback(test_stdout, "test stdout", DRAIN_TIMEOUT).await;
+        let test_stderr =
+            drain_or_fallback(test_stderr, "test stderr", DRAIN_TIMEOUT).await;
 
         let hypervisor_output = ProcessOutput::from_child(hypervisor, B::NAME).await;
 
-        // The kernel serial socket closes when the hypervisor exits.
-        let kernel_log = ProcessOutput::join_task_or_fallback(kernel_log, "kernel log").await;
+        let kernel_log =
+            drain_or_fallback(kernel_log, "kernel log", DRAIN_TIMEOUT).await;
 
         let virtiofsd_output = ProcessOutput::from_child(virtiofsd, "virtiofsd").await;
 
@@ -532,17 +969,90 @@ impl<B: HypervisorBackend> TestVm<B> {
     }
 }
 
+/// Awaits a [`JoinHandle<String>`] with a timeout, returning a fallback
+/// diagnostic message if the task does not complete in time.
+///
+/// Used during [`TestVm::collect`]'s drain phase to prevent a
+/// misbehaving stream reader from blocking output collection after the
+/// hypervisor has been shut down.
+async fn drain_or_fallback(
+    handle: JoinHandle<String>,
+    label: &str,
+    timeout: Duration,
+) -> String {
+    match tokio::time::timeout(
+        timeout,
+        ProcessOutput::join_task_or_fallback(handle, label),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(_) => {
+            warn!("{label} did not complete within {timeout:?} after shutdown");
+            format!(
+                "!!!{} UNAVAILABLE: timed out after shutdown!!!",
+                label.to_uppercase()
+            )
+        }
+    }
+}
+
 // ── run_in_vm ────────────────────────────────────────────────────────
 
 /// Boots a VM using the given [`HypervisorBackend`] and runs the test
 /// function inside it.
 ///
-/// This is the **container-tier** entry point, called from the code generated
-/// by `#[in_vm]` when `IN_TEST_CONTAINER=YES`.  It:
+/// Allocates a random set of vsock resources (CID + three channel ports).
 ///
-/// 1. Resolves the test identity from the type parameter and `argv[0]`.
-/// 2. Delegates to [`TestVm::launch`] to prepare and boot the VM.
-/// 3. Delegates to [`TestVm::collect`] to wait for the test and gather output.
+/// The CID is chosen uniformly from the valid guest range
+/// ([`VsockCid::GUEST_MIN`]..=[`VsockCid::GUEST_MAX`]) and the three
+/// ports are chosen uniformly from the dynamic range
+/// ([`VsockPort::DYNAMIC_MIN`]..=[`VsockPort::DYNAMIC_MAX`]) with a gap
+/// of 3 between the base and the last port.
+///
+/// With ~4 billion possible CIDs and ~4 billion possible port bases, the
+/// probability of collision between two concurrent tests is negligible
+/// (~1 in 4 × 10⁹).
+fn allocate_vsock_resources() -> VsockAllocation {
+    let mut rng = rand::rng();
+
+    let cid = rng.random_range(VsockCid::GUEST_MIN.as_raw()..=VsockCid::GUEST_MAX.as_raw());
+
+    // Pick a port base and reserve 3 consecutive ports (trace, stdout,
+    // stderr).  Ensure the base + 2 does not overflow past DYNAMIC_MAX.
+    let port_max = VsockPort::DYNAMIC_MAX.as_raw() - 2;
+    let port_base = rng.random_range(VsockPort::DYNAMIC_MIN.as_raw()..=port_max);
+
+    VsockAllocation {
+        cid: VsockCid::new(cid),
+        init_trace: VsockChannel {
+            port: VsockPort::new(port_base),
+            label: "init-trace",
+        },
+        test_stdout: VsockChannel {
+            port: VsockPort::new(port_base + 1),
+            label: "test-stdout",
+        },
+        test_stderr: VsockChannel {
+            port: VsockPort::new(port_base + 2),
+            label: "test-stderr",
+        },
+    }
+}
+
+/// Convenience wrapper that launches a VM, runs the test, and collects
+/// output.
+///
+/// This is the **container-tier** entry point, called from the code
+/// generated by `#[in_vm]` when `IN_TEST_CONTAINER=YES`.  It:
+///
+/// 1. Allocates unique vsock resources (CID + ports) via
+///    [`allocate_vsock_resources`] so that parallel test runs do not
+///    collide on the host-global `AF_VSOCK` address space.
+/// 2. Resolves the test identity from the type parameter and `argv[0]`.
+/// 3. Delegates to [`TestVm::launch`] to prepare and boot the VM.
+/// 4. Delegates to [`TestVm::collect`] to wait for the test and gather
+///    output.
 ///
 /// The type parameter `B` selects the hypervisor backend.  The `#[in_vm]`
 /// proc macro currently passes
@@ -551,7 +1061,8 @@ impl<B: HypervisorBackend> TestVm<B> {
 /// [`HypervisorBackend`].
 ///
 /// The type parameter `F` is used only to derive the test name via
-/// [`std::any::type_name`]; the function itself is never called in this tier.
+/// [`std::any::type_name`]; the function itself is never called in this
+/// tier.
 ///
 /// # Errors
 ///
@@ -573,11 +1084,18 @@ pub async fn run_in_vm<B: HypervisorBackend, F: FnOnce()>(
                 path: PathBuf::from(&full_bin_path),
             })?;
 
+    let vm_bin_path = format!("/{}/{bin_name}", n_vm_protocol::VM_TEST_BIN_DIR);
+
+    let vsock = allocate_vsock_resources();
+    info!("allocated vsock resources: {vsock}");
+
     let params = TestVmParams {
         full_bin_path: Path::new(&full_bin_path),
+        vm_bin_path,
         bin_name,
         test_name,
         iommu,
+        vsock,
     };
 
     let vm = TestVm::<B>::launch(&params).await?;
