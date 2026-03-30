@@ -73,3 +73,99 @@ fn test_which_runs_in_vm_with_qemu_iommu() {
 fn test_which_runs_in_vm_with_cloud_hypervisor_iommu() {
     assert_eq!(2 + 2, 4);
 }
+
+// ── Host page size integration tests ─────────────────────────────────
+//
+// These tests verify the VM boots correctly with each supported host
+// memory backing.  The `host_pages = "4k"` variant is particularly
+// important because it requires no physical hugepages on the host,
+// making it viable for CI environments.
+
+#[test]
+#[in_vm]
+#[hypervisor(host_pages = "4k")]
+fn vm_boots_with_standard_host_pages() {
+    assert!(std::path::Path::new("/proc/meminfo").exists());
+}
+
+#[test]
+#[in_vm(qemu)]
+#[hypervisor(host_pages = "4k")]
+fn vm_boots_with_standard_host_pages_on_qemu() {
+    assert!(std::path::Path::new("/proc/meminfo").exists());
+}
+
+// ── Guest hugepage integration tests ─────────────────────────────────
+//
+// These tests exercise the guest-side hugepage reservation axis,
+// verifying the kernel command-line parameters are applied correctly
+// and the VM boots with the requested hugepage configuration.
+
+#[test]
+#[in_vm]
+#[guest(hugepage_size = "none")]
+fn vm_boots_without_guest_hugepages() {
+    // When hugepage_size = "none", no hugepage pool should be reserved.
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();
+    let huge_total: u64 = meminfo
+        .lines()
+        .find(|l| l.starts_with("HugePages_Total:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(huge_total, 0, "expected no guest hugepages when hugepage_size = none");
+}
+
+#[test]
+#[in_vm]
+#[guest(hugepage_size = "2m", hugepage_count = 64)]
+fn vm_boots_with_2m_guest_hugepages() {
+    // The kernel should have reserved exactly the requested count of
+    // 2 MiB hugepages.
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();
+    let huge_total: u64 = meminfo
+        .lines()
+        .find(|l| l.starts_with("HugePages_Total:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(huge_total, 64, "expected 64 guest hugepages from kernel reservation");
+}
+
+// ── Combined configuration integration tests ─────────────────────────
+//
+// These tests exercise both axes together, demonstrating that host
+// page size and guest hugepage reservation are truly independent.
+
+#[test]
+#[in_vm]
+#[hypervisor(host_pages = "4k")]
+#[guest(hugepage_size = "none")]
+fn vm_boots_with_4k_host_pages_and_no_guest_hugepages() {
+    // Most CI-friendly configuration: no hugepages anywhere.
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();
+    let huge_total: u64 = meminfo
+        .lines()
+        .find(|l| l.starts_with("HugePages_Total:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(huge_total, 0, "expected no guest hugepages in CI-friendly mode");
+}
+
+#[test]
+#[in_vm(qemu)]
+#[hypervisor(iommu, host_pages = "4k")]
+#[guest(hugepage_size = "2m", hugepage_count = 64)]
+fn vm_boots_with_4k_host_and_2m_guest_hugepages_on_qemu() {
+    // Standard host pages but 2M guest hugepages with IOMMU -- the two
+    // axes are independent, so this combination must work.
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();
+    let huge_total: u64 = meminfo
+        .lines()
+        .find(|l| l.starts_with("HugePages_Total:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(huge_total, 64, "expected 64 guest hugepages with 4K host backing");
+}
