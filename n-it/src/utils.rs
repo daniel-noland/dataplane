@@ -1,6 +1,6 @@
-// NOTE: do not call `panic!` anywhere in this file.  Instead, use the `fatal!` macro.
-// It is important that we flush stdout and stderr before exiting, and panic!
-// does not do that correctly in the case of an init system.
+// The `fatal!` macro must be used instead of `panic!` throughout this crate.
+// `panic!` does not reliably flush stdout/stderr in an init system context,
+// and tokio's panic-forwarding can mangle the final error output.
 macro_rules! fatal {
     ($($arg:tt)*) => {
         {
@@ -21,16 +21,9 @@ macro_rules! fatal {
             let _ = ::nix::unistd::close(0);
             let _ = ::nix::unistd::close(1);
             let _ = ::nix::unistd::close(2);
-            // Note: I use abort here so that the panic handlers can't interfere with the shutdown process.
-            //
-            // If we use panic! then the last few lines of the error message can get mangled because
-            // tokio can forward the panic through task join handles and additional output may occur there.
-            // That shouldn't be possible because we have closed stdout, stderr, and stdin.
-            // But even then, the best case is that we fail for spurious reasons by attempting to write to closed
-            // fds.
-            //
-            // Even worse, if additional files are somehow opened, they may get fd 0, 1, or 2 and then we have no idea
-            // what will happen when messages are printed.  Best to just be heavy handed and abort.
+            // Abort rather than panic to prevent tokio's panic-forwarding
+            // from writing to fds 0/1/2 after they have been closed (or
+            // worse, to unrelated file descriptors that reused those numbers).
             ::std::process::abort();
         }
     };
