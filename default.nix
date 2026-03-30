@@ -446,7 +446,20 @@ let
     # Without /dev in particular, the kernel logs
     # "devtmpfs: error mounting -2" and init may fail with ENOEXEC (-8)
     # because /dev/console cannot be opened.
-    mkdir -p $out/dev $out/proc $out/sys $out/tmp $out/run $out/etc
+    mkdir -p $out/dev $out/proc $out/sys $out/tmp $out/run $out/etc $out/var
+
+    # /var/run → /run symlink.
+    #
+    # Many daemons (including DPDK) default to writing runtime state
+    # under /var/run.  On a conventional Linux system /var/run is
+    # either a symlink to /run or a tmpfs in its own right.  Since our
+    # root filesystem is read-only via virtiofs, we bake the symlink
+    # into the image so that /var/run/dpdk (and friends) resolve to
+    # the writable /run tmpfs mounted by n-it.
+    #
+    # This mirrors what the dataplane container image already does
+    # (see the `dataplane.tar` buildPhase above).
+    ln -s /run $out/var/run
 
     # n-it init system binary.
     # The cargo package is "dataplane-n-it" but the VM expects the

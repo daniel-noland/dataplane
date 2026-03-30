@@ -381,7 +381,7 @@ pub(crate) async fn diagnose_vmroot_share() {
     }
 
     // ── 5. essential guest directories ───────────────────────────────
-    for dir in ["/dev", "/proc", "/sys", "/tmp", "/run"] {
+    for dir in ["/dev", "/proc", "/sys", "/tmp", "/run", "/var", "/var/run"] {
         let path = format!("{root}{dir}");
         match tokio::fs::try_exists(&path).await {
             Ok(true) => {}
