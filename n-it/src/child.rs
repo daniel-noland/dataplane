@@ -7,7 +7,7 @@
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::process::Stdio;
 
-use n_vm_protocol::{ENV_IN_VM, ENV_MARKER_VALUE, VsockChannel};
+use n_vm_protocol::{ENV_IN_VM, ENV_MARKER_VALUE};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -66,21 +66,23 @@ pub async fn spawn_main_process() -> Result<Child, SpawnError> {
     args.next().expect("argv[0] missing"); // skip self
 
     // Connect vsock streams for stdout and stderr.  The container tier
-    // has already bound Unix listeners at the corresponding paths, so
+    // has already bound listeners at the dynamically-allocated ports, so
     // these connections succeed immediately.
+    let alloc = crate::vsock_allocation();
+
     let stdout_addr =
-        vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDOUT.port.as_raw());
+        vsock::VsockAddr::new(VMADDR_CID_HOST, alloc.test_stdout.port.as_raw());
     let stdout_stream =
         vsock::VsockStream::connect(&stdout_addr).map_err(|e| SpawnError::VsockConnect {
-            channel: VsockChannel::TEST_STDOUT,
+            channel: alloc.test_stdout,
             source: e,
         })?;
 
     let stderr_addr =
-        vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::TEST_STDERR.port.as_raw());
+        vsock::VsockAddr::new(VMADDR_CID_HOST, alloc.test_stderr.port.as_raw());
     let stderr_stream =
         vsock::VsockStream::connect(&stderr_addr).map_err(|e| SpawnError::VsockConnect {
-            channel: VsockChannel::TEST_STDERR,
+            channel: alloc.test_stderr,
             source: e,
         })?;
 

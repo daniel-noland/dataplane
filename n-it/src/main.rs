@@ -25,9 +25,29 @@
 use std::convert::Infallible;
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
-use n_vm_protocol::VsockChannel;
+use n_vm_protocol::VsockAllocation;
 use tokio_vsock::VMADDR_CID_HOST;
+
+/// The dynamically-allocated vsock resources for this VM instance.
+///
+/// Populated once during early init by parsing `/proc/cmdline`.  All
+/// modules in this crate access the allocation through
+/// [`vsock_allocation`].
+static VSOCK_ALLOCATION: OnceLock<VsockAllocation> = OnceLock::new();
+
+/// Returns the vsock allocation parsed from the kernel command line.
+///
+/// # Panics
+///
+/// Panics if called before [`VSOCK_ALLOCATION`] has been initialized
+/// (i.e. before `main` has run its early-init phase).
+pub(crate) fn vsock_allocation() -> &'static VsockAllocation {
+    VSOCK_ALLOCATION
+        .get()
+        .expect("vsock_allocation() called before /proc/cmdline was parsed")
+}
 
 // NOTE: `utils` must be declared before modules that use the `fatal!` macro.
 #[macro_use]
@@ -60,9 +80,51 @@ fn main() -> Infallible {
             std::process::abort();
         });
     runtime.block_on(async {
-        eprintln!("init system runtime started: connecting to tracing vsock");
+        eprintln!("init system runtime started: parsing vsock allocation from /proc/cmdline");
+
+        // Read the kernel command line to discover dynamically-allocated
+        // vsock ports.  /proc isn't mounted yet (mount_essential_filesystems
+        // handles the canonical mount later), so we do a temporary
+        // read-only mount, grab the contents, and immediately unmount.
+        let cmdline = {
+            let _ = std::fs::create_dir_all("/proc");
+            let mount_result = nix::mount::mount(
+                Some("proc"),
+                "/proc",
+                Some("proc"),
+                nix::mount::MsFlags::MS_RDONLY
+                    | nix::mount::MsFlags::MS_NOSUID
+                    | nix::mount::MsFlags::MS_NODEV
+                    | nix::mount::MsFlags::MS_NOEXEC,
+                None::<&str>,
+            );
+            if let Err(e) = &mount_result {
+                eprintln!("WARNING: early /proc mount failed: {e}; will try fallback");
+            }
+            let result = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+            if mount_result.is_ok() {
+                let _ = nix::mount::umount("/proc");
+            }
+            result
+        };
+
+        let alloc = VsockAllocation::parse_kernel_cmdline(&cmdline).unwrap_or_else(|| {
+            eprintln!(
+                "WARNING: failed to parse vsock ports from /proc/cmdline, \
+                 falling back to static defaults.  cmdline: {cmdline:?}"
+            );
+            VsockAllocation::with_defaults()
+        });
+        eprintln!(
+            "vsock allocation: trace={}, stdout={}, stderr={}",
+            alloc.init_trace.port, alloc.test_stdout.port, alloc.test_stderr.port,
+        );
+        VSOCK_ALLOCATION.set(alloc).expect("VSOCK_ALLOCATION already initialized");
+
+        let alloc = vsock_allocation();
+        eprintln!("connecting to tracing vsock on port {}", alloc.init_trace.port);
         let tracing_addr =
-            vsock::VsockAddr::new(VMADDR_CID_HOST, VsockChannel::INIT_TRACE.port.as_raw());
+            vsock::VsockAddr::new(VMADDR_CID_HOST, alloc.init_trace.port.as_raw());
         let tracing_vsock = VsockWriter::new(
             vsock::VsockStream::connect(&tracing_addr).unwrap_or_else(|e| {
                 eprintln!("FATAL: failed to connect tracing vsock to host: {e}");
