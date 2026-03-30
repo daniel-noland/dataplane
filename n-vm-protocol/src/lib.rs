@@ -25,41 +25,15 @@
 
 use std::path::PathBuf;
 
-// == Container image ==
-
-/// Default Docker image used by the host tier to launch the test container.
-///
-/// This image contains the hypervisor binaries (cloud-hypervisor, and
-/// eventually QEMU), virtiofsd, the `n-it` init system binary, and a
-/// minimal Linux kernel (`bzImage`).
-///
-/// This default is used when neither [`ENV_CONTAINER_IMAGE`] nor
-/// [`ENV_TEST_ROOT`] is set.  When [`ENV_TEST_ROOT`] is set the test
-/// infrastructure runs in *scratch mode* (see [`ScratchRoots`]), and
-/// this constant is ignored.
-pub const CONTAINER_IMAGE_DEFAULT: &str = "ghcr.io/githedgehog/testn/n-vm:v0.0.9";
-
-/// Environment variable that overrides the Docker image used for the
-/// test container.
-///
-/// When set, its value is used as the image name instead of
-/// [`CONTAINER_IMAGE_DEFAULT`].  This is a simpler alternative to full
-/// scratch mode for cases where a custom pre-built image is desired.
-///
-/// This variable is ignored when [`ENV_TEST_ROOT`] is set (scratch mode
-/// takes precedence).
-pub const ENV_CONTAINER_IMAGE: &str = "N_VM_CONTAINER_IMAGE";
-
 /// Platform string passed to the Docker engine when creating the container.
 pub const CONTAINER_PLATFORM: &str = "linux/amd64";
 
-// == Scratch container mode ==
+// == Container mode ==
 //
-// In scratch mode the test infrastructure replaces the pre-built
-// container image with a `scratch` (empty) Docker image and
+// The test infrastructure uses a locally-created empty Docker image and
 // volume-mounts nix-built directory trees into it.  This eliminates
 // version drift between the nix store paths baked into test binary
-// rpaths and the libraries shipped in the container image.
+// rpaths and libraries shipped in an external container image.
 //
 // Two root directories are required:
 //
@@ -79,10 +53,8 @@ pub const CONTAINER_PLATFORM: &str = "linux/amd64";
 
 /// Environment variable pointing to the resolved `testroot` directory.
 ///
-/// When set, the test infrastructure switches to *scratch mode*: it
-/// launches a minimal (empty) Docker image and volume-mounts this
-/// directory's contents at the standard container paths (`/bin`, `/lib`,
-/// etc.), along with a read-only `/nix/store` bind mount from the host.
+/// When set, [`ScratchRoots::resolve`] uses this path instead of
+/// auto-detecting the `testroot` symlink in the working directory.
 ///
 /// The value must be an absolute path to the nix-built `testroot`
 /// symlink (or the store path it resolves to).
@@ -90,20 +62,19 @@ pub const ENV_TEST_ROOT: &str = "N_VM_TEST_ROOT";
 
 /// Environment variable pointing to the resolved `vmroot` directory.
 ///
-/// In scratch mode this directory is volume-mounted at
-/// [`VM_ROOT_SHARE_PATH`] inside the container.  virtiofsd then
-/// exposes it as the VM guest's root filesystem.
+/// When set, [`ScratchRoots::resolve`] uses this path instead of
+/// auto-detecting the `vmroot` symlink in the working directory.
 ///
 /// The value must be an absolute path to the nix-built `vmroot`
 /// symlink (or the store path it resolves to).
 pub const ENV_VM_ROOT: &str = "N_VM_VM_ROOT";
 
-/// Resolved scratch-mode root directories.
+/// Resolved root directories for the test container infrastructure.
 ///
-/// This struct is returned by [`ScratchRoots::from_env`] when both
-/// [`ENV_TEST_ROOT`] and [`ENV_VM_ROOT`] are set.  It carries the
-/// resolved (canonicalized) paths so that the container configuration
-/// code does not need to repeat the resolution logic.
+/// Returned by [`ScratchRoots::resolve`], which tries environment
+/// variables first ([`ENV_TEST_ROOT`] / [`ENV_VM_ROOT`]) and falls
+/// back to auto-detecting `testroot` and `vmroot` symlinks in the
+/// current working directory.
 #[derive(Debug, Clone)]
 pub struct ScratchRoots {
     /// Absolute path to the `testroot` directory (container-tier tools).
@@ -113,17 +84,36 @@ pub struct ScratchRoots {
 }
 
 impl ScratchRoots {
-    /// Attempts to resolve scratch-mode roots from the environment.
+    /// Resolves the `testroot` and `vmroot` directories.
     ///
-    /// Returns `Some(ScratchRoots)` when both [`ENV_TEST_ROOT`] and
-    /// [`ENV_VM_ROOT`] are set and point to existing directories.
-    /// Returns `None` if either variable is absent.
+    /// Resolution order:
+    ///
+    /// 1. **Environment variables** — if [`ENV_TEST_ROOT`] and
+    ///    [`ENV_VM_ROOT`] are both set, their values are used.
+    /// 2. **Working-directory auto-detection** — looks for `testroot`
+    ///    and `vmroot` symlinks (or directories) in
+    ///    [`std::env::current_dir`].
     ///
     /// # Errors
     ///
-    /// Returns an error if a variable is set but the path does not exist
-    /// or cannot be canonicalized.
-    pub fn from_env() -> Result<Option<Self>, ScratchRootError> {
+    /// - [`ScratchRootError::InvalidPath`] if an environment variable is
+    ///   set but the path cannot be canonicalized.
+    /// - [`ScratchRootError::NotFound`] if neither detection method
+    ///   locates both roots.
+    pub fn resolve() -> Result<Self, ScratchRootError> {
+        if let Some(roots) = Self::from_env()? {
+            return Ok(roots);
+        }
+        if let Some(roots) = Self::from_cwd() {
+            return Ok(roots);
+        }
+        Err(ScratchRootError::NotFound)
+    }
+
+    /// Tries to resolve roots from [`ENV_TEST_ROOT`] and [`ENV_VM_ROOT`].
+    ///
+    /// Returns `Ok(None)` when either variable is absent or empty.
+    fn from_env() -> Result<Option<Self>, ScratchRootError> {
         let test_root_raw = match std::env::var(ENV_TEST_ROOT) {
             Ok(v) if !v.is_empty() => v,
             _ => return Ok(None),
@@ -133,62 +123,83 @@ impl ScratchRoots {
             _ => return Ok(None),
         };
 
-        let test_root =
-            std::fs::canonicalize(&test_root_raw).map_err(|source| ScratchRootError {
+        let test_root = std::fs::canonicalize(&test_root_raw).map_err(|source| {
+            ScratchRootError::InvalidPath {
                 var: ENV_TEST_ROOT,
                 path: PathBuf::from(&test_root_raw),
                 source,
-            })?;
-        let vm_root = std::fs::canonicalize(&vm_root_raw).map_err(|source| ScratchRootError {
-            var: ENV_VM_ROOT,
-            path: PathBuf::from(&vm_root_raw),
-            source,
+            }
+        })?;
+        let vm_root = std::fs::canonicalize(&vm_root_raw).map_err(|source| {
+            ScratchRootError::InvalidPath {
+                var: ENV_VM_ROOT,
+                path: PathBuf::from(&vm_root_raw),
+                source,
+            }
         })?;
 
         Ok(Some(Self { test_root, vm_root }))
     }
+
+    /// Tries to find `testroot` and `vmroot` in the current working
+    /// directory.
+    ///
+    /// Returns `None` if the CWD cannot be determined or either path
+    /// does not exist.
+    fn from_cwd() -> Option<Self> {
+        let cwd = std::env::current_dir().ok()?;
+        let test_root = std::fs::canonicalize(cwd.join("testroot")).ok()?;
+        let vm_root = std::fs::canonicalize(cwd.join("vmroot")).ok()?;
+        Some(Self { test_root, vm_root })
+    }
 }
 
-/// Error returned when a scratch-mode environment variable is set but
-/// the path it references cannot be resolved.
+/// Error resolving the test container root directories.
 #[derive(Debug)]
-pub struct ScratchRootError {
-    /// The environment variable name that was set.
-    pub var: &'static str,
-    /// The raw path value from the environment.
-    pub path: PathBuf,
-    /// The underlying I/O error from canonicalization.
-    pub source: std::io::Error,
+pub enum ScratchRootError {
+    /// An environment variable was set but the path it references
+    /// cannot be canonicalized.
+    InvalidPath {
+        /// The environment variable name.
+        var: &'static str,
+        /// The raw path value from the environment.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+    /// Neither environment variables nor working-directory
+    /// auto-detection found `testroot` and `vmroot`.
+    ///
+    /// Run `just setup-roots` from the workspace root to create them,
+    /// or set [`ENV_TEST_ROOT`] and [`ENV_VM_ROOT`] explicitly.
+    NotFound,
 }
 
 impl std::fmt::Display for ScratchRootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "scratch root {} = {:?} is not accessible",
-            self.var, self.path
-        )
+        match self {
+            Self::InvalidPath { var, path, .. } => {
+                write!(f, "scratch root {var} = {path:?} is not accessible")
+            }
+            Self::NotFound => {
+                write!(
+                    f,
+                    "could not find testroot/vmroot in the working directory \
+                     and {ENV_TEST_ROOT}/{ENV_VM_ROOT} are not set; \
+                     run `just setup-roots` from the workspace root"
+                )
+            }
+        }
     }
 }
 
 impl std::error::Error for ScratchRootError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        match self {
+            Self::InvalidPath { source, .. } => Some(source),
+            Self::NotFound => None,
+        }
     }
-}
-
-/// Returns the Docker image name to use for the test container.
-///
-/// Resolution order:
-/// 1. If [`ENV_CONTAINER_IMAGE`] is set, its value is returned.
-/// 2. Otherwise, [`CONTAINER_IMAGE_DEFAULT`] is returned.
-///
-/// Callers should check [`ScratchRoots::from_env`] *first*.  If scratch
-/// mode is active the image name is irrelevant (a locally-created empty
-/// image is used instead).
-#[must_use]
-pub fn container_image() -> String {
-    std::env::var(ENV_CONTAINER_IMAGE).unwrap_or_else(|_| CONTAINER_IMAGE_DEFAULT.to_owned())
 }
 
 // == Environment variables ==
@@ -218,6 +229,18 @@ pub const ENV_MARKER_VALUE: &str = "YES";
 pub struct VsockPort(u32);
 
 impl VsockPort {
+    /// The smallest port suitable for dynamic allocation.
+    ///
+    /// Ports below 1024 are conventionally reserved (similar to TCP/UDP
+    /// well-known ports).  Dynamic allocators should pick from
+    /// [`DYNAMIC_MIN`](Self::DYNAMIC_MIN)..=[`DYNAMIC_MAX`](Self::DYNAMIC_MAX).
+    pub const DYNAMIC_MIN: Self = Self(1024);
+
+    /// The largest port suitable for dynamic allocation.
+    ///
+    /// `VMADDR_PORT_ANY` (`u32::MAX`) is reserved as a wildcard.
+    pub const DYNAMIC_MAX: Self = Self(u32::MAX - 1);
+
     /// Creates a new [`VsockPort`] from a raw port number.
     ///
     /// # Panics
@@ -266,6 +289,19 @@ impl VsockCid {
 
     /// The host CID (`VMADDR_CID_HOST`).
     pub const HOST: Self = Self(2);
+
+    /// The first CID available for guest use.
+    ///
+    /// CIDs 0–2 are reserved by the kernel; valid guest CIDs start at 3.
+    pub const GUEST_MIN: Self = Self(3);
+
+    /// The largest CID available for guest use.
+    ///
+    /// `VMADDR_CID_ANY` (`u32::MAX`) is reserved as a wildcard, so the
+    /// maximum usable guest CID is `u32::MAX - 1`.  Although [`VsockCid`]
+    /// stores a `u64`, the kernel's vhost-vsock ioctl and QEMU both
+    /// truncate to `u32`.
+    pub const GUEST_MAX: Self = Self(u32::MAX as u64 - 1);
 
     /// Creates a new [`VsockCid`] from a raw CID value.
     ///
@@ -390,7 +426,169 @@ impl std::fmt::Display for VsockChannel {
 }
 
 /// The vsock context identifier (CID) assigned to the VM guest.
+///
+/// **Deprecated in spirit** -- prefer [`VsockAllocation`] for new code.
+/// This constant remains for backward compatibility with existing tests
+/// that do not exercise parallel execution.  Production and CI paths
+/// should always use a dynamically-allocated CID to avoid host-global
+/// collisions when multiple VMs run concurrently.
 pub const VM_GUEST_CID: VsockCid = VsockCid::new(3);
+
+// ── Dynamic vsock resource allocation ────────────────────────────────
+//
+// Vsock CIDs and AF_VSOCK port bindings are host-global: they are NOT
+// namespaced by containers, network namespaces, or cgroups.  When
+// multiple test containers launch QEMU in parallel, each VM must use a
+// unique CID and unique listener ports to avoid EADDRINUSE collisions.
+//
+// The types and constants below support dynamic allocation of these
+// resources and a kernel-command-line protocol for passing the chosen
+// port numbers into the guest.
+
+/// Kernel command-line parameter: init-trace vsock port.
+pub const CMDLINE_TRACE_PORT: &str = "n_it.trace_port";
+
+/// Kernel command-line parameter: test-stdout vsock port.
+pub const CMDLINE_STDOUT_PORT: &str = "n_it.stdout_port";
+
+/// Kernel command-line parameter: test-stderr vsock port.
+pub const CMDLINE_STDERR_PORT: &str = "n_it.stderr_port";
+
+/// A complete set of dynamically-allocated vsock resources for a single
+/// VM instance.
+///
+/// Vsock CIDs and `AF_VSOCK` port bindings are **host-global** — they
+/// are *not* namespaced by containers, network namespaces, or cgroups.
+/// When multiple test VMs run in parallel (even in separate containers),
+/// each must use a unique CID and unique listener ports to avoid
+/// `EADDRINUSE` collisions.
+///
+/// `VsockAllocation` bundles a randomly-chosen guest CID with three
+/// vsock channels whose port numbers are also randomly chosen.  The
+/// container tier generates one allocation per test run and threads it
+/// through:
+///
+/// - The hypervisor configuration (CID for the vsock device).
+/// - The vsock listeners (port numbers for `AF_VSOCK` or Unix sockets).
+/// - The kernel command line (port numbers so `n-it` can connect back).
+///
+/// # Guest side
+///
+/// The guest init system recovers the port numbers by calling
+/// [`VsockAllocation::parse_kernel_cmdline`] on the contents of
+/// `/proc/cmdline`.  The guest does not need the CID — it always
+/// connects to `VMADDR_CID_HOST`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsockAllocation {
+    /// The guest CID passed to the hypervisor's vsock device.
+    pub cid: VsockCid,
+    /// Channel for the init system's tracing output.
+    pub init_trace: VsockChannel,
+    /// Channel for the test process's stdout.
+    pub test_stdout: VsockChannel,
+    /// Channel for the test process's stderr.
+    pub test_stderr: VsockChannel,
+}
+
+impl VsockAllocation {
+    /// Creates an allocation using the legacy static values.
+    ///
+    /// This exists only for unit tests and single-VM scenarios where
+    /// collision is impossible.  Production / CI code should use the
+    /// random allocator in `n-vm`.
+    pub const fn with_defaults() -> Self {
+        Self {
+            cid: VM_GUEST_CID,
+            init_trace: VsockChannel::INIT_TRACE,
+            test_stdout: VsockChannel::TEST_STDOUT,
+            test_stderr: VsockChannel::TEST_STDERR,
+        }
+    }
+
+    /// Formats the vsock port assignments as kernel command-line
+    /// parameters.
+    ///
+    /// The returned string contains space-separated `key=value` pairs
+    /// that the guest can parse from `/proc/cmdline` via
+    /// [`parse_kernel_cmdline`](Self::parse_kernel_cmdline).
+    pub fn kernel_cmdline_fragment(&self) -> String {
+        format!(
+            "{CMDLINE_TRACE_PORT}={} {CMDLINE_STDOUT_PORT}={} {CMDLINE_STDERR_PORT}={}",
+            self.init_trace.port.as_raw(),
+            self.test_stdout.port.as_raw(),
+            self.test_stderr.port.as_raw(),
+        )
+    }
+
+    /// Parses vsock port assignments from a kernel command-line string.
+    ///
+    /// This is the inverse of
+    /// [`kernel_cmdline_fragment`](Self::kernel_cmdline_fragment).  The
+    /// guest init system calls this with the contents of `/proc/cmdline`
+    /// to discover which ports to connect to.
+    ///
+    /// The CID is set to [`VM_GUEST_CID`] because the guest does not
+    /// need its own CID for outbound vsock connections (it always
+    /// connects to `VMADDR_CID_HOST`).
+    ///
+    /// Returns `None` if any of the three port parameters are missing,
+    /// cannot be parsed as `u32`, or would equal `VMADDR_PORT_ANY`.
+    pub fn parse_kernel_cmdline(cmdline: &str) -> Option<Self> {
+        let mut trace_port: Option<u32> = None;
+        let mut stdout_port: Option<u32> = None;
+        let mut stderr_port: Option<u32> = None;
+
+        for token in cmdline.split_whitespace() {
+            if let Some((key, value)) = token.split_once('=') {
+                match key {
+                    k if k == CMDLINE_TRACE_PORT => {
+                        trace_port = value.parse().ok();
+                    }
+                    k if k == CMDLINE_STDOUT_PORT => {
+                        stdout_port = value.parse().ok();
+                    }
+                    k if k == CMDLINE_STDERR_PORT => {
+                        stderr_port = value.parse().ok();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Filter out VMADDR_PORT_ANY (u32::MAX) — VsockPort::new would
+        // panic on it.
+        let trace_port = trace_port.filter(|&p| p != u32::MAX)?;
+        let stdout_port = stdout_port.filter(|&p| p != u32::MAX)?;
+        let stderr_port = stderr_port.filter(|&p| p != u32::MAX)?;
+
+        Some(Self {
+            // Guest doesn't need the real CID; it connects to CID_HOST.
+            cid: VM_GUEST_CID,
+            init_trace: VsockChannel {
+                port: VsockPort::new(trace_port),
+                label: "init-trace",
+            },
+            test_stdout: VsockChannel {
+                port: VsockPort::new(stdout_port),
+                label: "test-stdout",
+            },
+            test_stderr: VsockChannel {
+                port: VsockPort::new(stderr_port),
+                label: "test-stderr",
+            },
+        })
+    }
+}
+
+impl std::fmt::Display for VsockAllocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cid={}, trace={}, stdout={}, stderr={}",
+            self.cid, self.init_trace.port, self.test_stdout.port, self.test_stderr.port,
+        )
+    }
+}
 
 // == Filesystem paths (inside the container / VM working directory) ==
 
@@ -422,6 +620,18 @@ pub const VM_ROOT_SHARE_PATH: &str = "/vm.root";
 /// The virtiofs tag used to identify the root filesystem inside the guest.
 pub const VIRTIOFS_ROOT_TAG: &str = "root";
 
+/// Well-known directory inside the VM guest where the test binary
+/// directory is mounted.
+///
+/// The `vmroot` nix derivation pre-creates this directory so that Docker
+/// can bind-mount the host-side binary directory at
+/// `{VM_ROOT_SHARE_PATH}/{VM_TEST_BIN_DIR}` without needing to create
+/// intermediate directories on the (read-only) nix store path.
+///
+/// Inside the VM guest, the test binary is executed as
+/// `/{VM_TEST_BIN_DIR}/{binary_name}`.
+pub const VM_TEST_BIN_DIR: &str = "test-bin";
+
 // == Binary paths (inside the container) ==
 
 /// Path to the Linux kernel image used to boot the VM.
@@ -452,3 +662,123 @@ pub const CLOUD_HYPERVISOR_BINARY_PATH: &str = "/bin/cloud-hypervisor";
 /// **Backend-specific**: used only by the
 /// [`Qemu`](../n_vm/qemu/struct.Qemu.html) backend.
 pub const QEMU_BINARY_PATH: &str = "/bin/qemu-system-x86_64";
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── VsockCid range constants ─────────────────────────────────────
+
+    #[test]
+    fn guest_min_cid_is_three() {
+        assert_eq!(VsockCid::GUEST_MIN.as_raw(), 3);
+    }
+
+    #[test]
+    fn guest_max_cid_is_below_u32_max() {
+        assert_eq!(VsockCid::GUEST_MAX.as_raw(), u32::MAX as u64 - 1);
+    }
+
+    // ── VsockPort range constants ────────────────────────────────────
+
+    #[test]
+    fn dynamic_port_min_is_1024() {
+        assert_eq!(VsockPort::DYNAMIC_MIN.as_raw(), 1024);
+    }
+
+    #[test]
+    fn dynamic_port_max_is_below_u32_max() {
+        assert_eq!(VsockPort::DYNAMIC_MAX.as_raw(), u32::MAX - 1);
+    }
+
+    // ── VsockAllocation round-trip ───────────────────────────────────
+
+    #[test]
+    fn kernel_cmdline_round_trip() {
+        let alloc = VsockAllocation {
+            cid: VsockCid::new(42),
+            init_trace: VsockChannel {
+                port: VsockPort::new(50_000),
+                label: "init-trace",
+            },
+            test_stdout: VsockChannel {
+                port: VsockPort::new(50_001),
+                label: "test-stdout",
+            },
+            test_stderr: VsockChannel {
+                port: VsockPort::new(50_002),
+                label: "test-stderr",
+            },
+        };
+
+        let fragment = alloc.kernel_cmdline_fragment();
+        assert_eq!(
+            fragment,
+            "n_it.trace_port=50000 n_it.stdout_port=50001 n_it.stderr_port=50002",
+        );
+
+        // Embed in a realistic kernel cmdline with other parameters.
+        let cmdline = format!(
+            "console=ttyS0 ro rootfstype=virtiofs root=root {} init=/bin/n-it -- /test my_test",
+            fragment,
+        );
+
+        let parsed = VsockAllocation::parse_kernel_cmdline(&cmdline)
+            .expect("should parse successfully");
+
+        assert_eq!(parsed.init_trace.port, alloc.init_trace.port);
+        assert_eq!(parsed.test_stdout.port, alloc.test_stdout.port);
+        assert_eq!(parsed.test_stderr.port, alloc.test_stderr.port);
+    }
+
+    #[test]
+    fn parse_returns_none_on_missing_params() {
+        let cmdline = "console=ttyS0 n_it.trace_port=50000 n_it.stdout_port=50001";
+        assert!(
+            VsockAllocation::parse_kernel_cmdline(cmdline).is_none(),
+            "should fail when stderr port is missing",
+        );
+    }
+
+    #[test]
+    fn parse_returns_none_on_invalid_port() {
+        let cmdline = "n_it.trace_port=abc n_it.stdout_port=50001 n_it.stderr_port=50002";
+        assert!(
+            VsockAllocation::parse_kernel_cmdline(cmdline).is_none(),
+            "should fail when a port is not a valid u32",
+        );
+    }
+
+    #[test]
+    fn parse_rejects_vmaddr_port_any() {
+        let cmdline = format!(
+            "n_it.trace_port={} n_it.stdout_port=50001 n_it.stderr_port=50002",
+            u32::MAX,
+        );
+        assert!(
+            VsockAllocation::parse_kernel_cmdline(&cmdline).is_none(),
+            "should reject VMADDR_PORT_ANY (u32::MAX)",
+        );
+    }
+
+    #[test]
+    fn with_defaults_matches_legacy_constants() {
+        let alloc = VsockAllocation::with_defaults();
+        assert_eq!(alloc.cid, VM_GUEST_CID);
+        assert_eq!(alloc.init_trace, VsockChannel::INIT_TRACE);
+        assert_eq!(alloc.test_stdout, VsockChannel::TEST_STDOUT);
+        assert_eq!(alloc.test_stderr, VsockChannel::TEST_STDERR);
+    }
+
+    #[test]
+    fn display_shows_all_fields() {
+        let alloc = VsockAllocation::with_defaults();
+        let display = format!("{alloc}");
+        assert!(display.contains("cid=3"), "{display}");
+        assert!(display.contains("trace=123456"), "{display}");
+        assert!(display.contains("stdout=123457"), "{display}");
+        assert!(display.contains("stderr=123458"), "{display}");
+    }
+}
