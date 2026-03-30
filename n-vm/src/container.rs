@@ -35,8 +35,8 @@ use bollard::secret::{
     RestartPolicyNameEnum,
 };
 use n_vm_protocol::{
-    CONTAINER_PLATFORM, ENV_IN_TEST_CONTAINER, ENV_MARKER_VALUE, ScratchRoots,
-    VM_ROOT_SHARE_PATH, VM_RUN_DIR, VM_TEST_BIN_DIR,
+    CONTAINER_PLATFORM, ENV_IN_TEST_CONTAINER, ENV_MARKER_VALUE, ScratchRoots, VM_ROOT_SHARE_PATH,
+    VM_RUN_DIR, VM_TEST_BIN_DIR,
 };
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
@@ -51,13 +51,41 @@ use crate::error::ContainerError;
 const SCRATCH_IMAGE_TAG: &str = "dataplane-test-scratch:local";
 
 /// Linux capabilities required inside the test container.
-const REQUIRED_CAPS: [&str; 6] = [
-    "SYS_CHROOT",       // for chroot (required by virtiofsd)
-    "SYS_RAWIO",        // for af-packet
-    "IPC_LOCK",         // for hugepages
-    "NET_ADMIN",        // for tap device creation and network interface configuration
-    "NET_RAW",          // for raw socket access in network tests
-    "NET_BIND_SERVICE", // for vsocket listeners
+///
+/// These fall into three groups:
+///
+/// 1. **virtiofsd** -- even with `--sandbox=none --readonly`, virtiofsd
+///    calls `capset()` during init to set up capabilities it needs for
+///    faithful FUSE file serving (ownership, permission checks, special
+///    bits).  Every capability it requests must already be in the
+///    process's bounding set, or `capset()` returns `EPERM` and
+///    virtiofsd exits before creating its socket.
+///
+/// 2. **Hypervisor / VM** -- KVM, hugepage locking, raw I/O.
+///
+/// 3. **Network** -- tap device creation, raw sockets, vsock listeners.
+const REQUIRED_CAPS: [&str; 16] = [
+    // ── virtiofsd: process credential management ─────────────────
+    "SETPCAP", // modify own capability bounding set (capset(2))
+    "SETUID",  // virtiofsd UID mapping (--translate-uid)
+    "SETGID",  // drop supplemental groups (setgroups(2))
+    // ── virtiofsd: FUSE file-serving ─────────────────────────────
+    "CHOWN",           // serve chown/fchown FUSE ops
+    "DAC_OVERRIDE",    // bypass file read/write/execute permission checks
+    "DAC_READ_SEARCH", // bypass directory read and execute permission checks
+    "FOWNER",          // bypass checks requiring file UID == process UID
+    "FSETID",          // preserve set-user-ID / set-group-ID bits
+    "MKNOD",           // serve mknod FUSE ops (device special files)
+    "SETFCAP",         // serve file-capability xattrs
+    // ── virtiofsd: resource limits ───────────────────────────────
+    "SYS_RESOURCE", // override RLIMIT_NOFILE (--rlimit-nofile=0)
+    // ── hypervisor / VM ──────────────────────────────────────────
+    "SYS_RAWIO", // raw I/O port access (af-packet, DPDK)
+    "IPC_LOCK",  // mlock hugepage-backed guest memory
+    // ── network ──────────────────────────────────────────────────
+    "NET_ADMIN",        // tap device creation, interface configuration
+    "NET_RAW",          // raw socket access in network tests
+    "NET_BIND_SERVICE", // vsock listeners
 ];
 
 /// Device nodes that must be mapped into the container.
@@ -171,8 +199,7 @@ impl ContainerParams {
 
         let device_groups = Self::resolve_device_groups()?;
 
-        let scratch_roots =
-            ScratchRoots::resolve().map_err(ContainerError::ScratchRootResolve)?;
+        let scratch_roots = ScratchRoots::resolve().map_err(ContainerError::ScratchRootResolve)?;
 
         Ok(Self {
             bin_path,
@@ -284,11 +311,6 @@ impl ContainerParams {
                 format!("{ENV_IN_TEST_CONTAINER}={ENV_MARKER_VALUE}"),
                 "RUST_BACKTRACE=1".into(),
             ]),
-            // user: Some(format!(
-            //     "{uid}:{gid}",
-            //     uid = self.uid.as_raw(),
-            //     gid = self.gid.as_raw()
-            // )),
             user: Some("0:0".into()),
             host_config: Some(HostConfig {
                 devices: Some(Self::build_device_mappings()),
@@ -308,15 +330,33 @@ impl ContainerParams {
                 readonly_rootfs: Some(true),
                 mounts: Some(self.build_mounts()),
                 tmpfs: Some(self.build_tmpfs()),
-                privileged: Some(true),
+                privileged: Some(false),
                 cap_add: Some(REQUIRED_CAPS.iter().map(|&c| c.into()).collect()),
-                // NOTE: we intentionally do NOT set cap_drop: ["ALL"] here.
-                // Docker's default capability set is already minimal (no
-                // NET_ADMIN, SYS_RAWIO, IPC_LOCK, etc.).  Dropping ALL and
-                // re-adding specific caps prevents runc from setting ambient
-                // capabilities for non-root processes, which causes EPERM on
-                // TAP ioctls and other privileged operations even though
-                // the caps appear in the bounding set.
+                cap_drop: Some(vec!["ALL".into()]),
+                // Disable Docker's default seccomp and AppArmor
+                // profiles.  Both are independent security layers
+                // that `privileged: false` leaves active even when
+                // explicit capabilities are granted.
+                //
+                // seccomp: Docker's default allowlist covers common
+                // socket families (AF_INET, AF_UNIX, AF_NETLINK,
+                // AF_PACKET, …) but blocks AF_VSOCK (family 40).
+                // The QEMU backend binds AF_VSOCK listeners for
+                // guest-to-host vsock channels, so the default
+                // profile causes EPERM on the socket() syscall.
+                //
+                // AppArmor: Docker's `docker-default` profile
+                // restricts mount operations, /proc and /sys writes,
+                // and various filesystem operations.  virtiofsd
+                // serves a FUSE filesystem and fails to initialise
+                // under this profile — it exits before creating its
+                // Unix socket, causing downstream hypervisor launch
+                // failures (QEMU: SocketTimeout on QMP socket;
+                // cloud-hypervisor: "Cannot create virtio-fs device").
+                security_opt: Some(vec![
+                    "seccomp=unconfined".into(),
+                    "apparmor=unconfined".into(),
+                ]),
                 ..Default::default()
             }),
             ..Default::default()
@@ -366,10 +406,7 @@ impl ContainerParams {
         let bin_dir = self.bin_dir_str();
         let mut mounts = vec![
             Self::read_only_bind_mount(bin_dir, bin_dir.to_owned()),
-            Self::read_only_bind_mount(
-                bin_dir,
-                format!("{VM_ROOT_SHARE_PATH}/{VM_TEST_BIN_DIR}"),
-            ),
+            Self::read_only_bind_mount(bin_dir, format!("{VM_ROOT_SHARE_PATH}/{VM_TEST_BIN_DIR}")),
         ];
 
         mounts.extend(Self::build_scratch_mounts(&self.scratch_roots));
@@ -471,6 +508,27 @@ impl ContainerParams {
         ));
 
         // Mount the host's hugetlbfs at /dev/hugepages (read-write).
+        //
+        // Currently the developer must ensure hugetlbfs is mounted on
+        // the host before running tests.  Ideally the container would
+        // set this up automatically.  Options considered:
+        //
+        // A) Add CAP_SYS_ADMIN and run `mount -t hugetlbfs` inside the
+        //    container.  Downside: SYS_ADMIN is an extremely broad
+        //    capability that undermines the minimal-privilege model we
+        //    established for this container.
+        //
+        // B) Use a Docker tmpfs mount with hugetlbfs options (bollard
+        //    supports tmpfs mount parameters).  This would let Docker
+        //    create the hugetlbfs mount without granting SYS_ADMIN to
+        //    the container process.  Needs investigation into whether
+        //    Docker's tmpfs driver supports `fstype=hugetlbfs`.
+        //
+        // C) Keep the host-side requirement but improve the pre-flight
+        //    error message (in `check_hugepages_accessible`) to include
+        //    the exact `mount` command the developer should run.
+        //
+        // Option B or C is the pragmatic path forward.
         // Both cloud-hypervisor and QEMU allocate hugepage-backed guest
         // memory by creating files under this mount.  In a normal
         // (non-scratch) container Docker propagates this mount
@@ -1030,12 +1088,20 @@ mod tests {
     }
 
     #[test]
-    fn config_sets_user_and_groups() {
+    fn config_runs_as_root() {
+        let config = sample_params().build_config();
+        // The container runs as root so that capabilities in the
+        // bounding set are effective without ambient-cap gymnastics.
+        assert_eq!(config.user.as_deref(), Some("0:0"));
+    }
+
+    #[test]
+    fn config_passes_device_groups() {
         let params = sample_params();
         let config = params.build_config();
-        assert_eq!(config.user.as_deref(), Some("1000:1000"));
         let host = config.host_config.as_ref().expect("host_config");
         let groups = host.group_add.as_ref().expect("group_add");
+        // The sample_params use GIDs 36 and 108.
         assert!(groups.contains(&"36".to_string()));
         assert!(groups.contains(&"108".to_string()));
     }
@@ -1045,13 +1111,11 @@ mod tests {
         let config = sample_params().build_config();
         let host = config.host_config.as_ref().expect("host_config");
         assert_eq!(host.privileged, Some(false));
-        // cap_drop is intentionally NOT set — dropping ALL and re-adding
-        // prevents runc from setting ambient capabilities for non-root
-        // processes.  Docker's defaults are already minimal.
-        assert_eq!(
-            host.cap_drop, None,
-            "cap_drop should not be set (ambient capability issue)",
-        );
+
+        // All default caps are dropped; only REQUIRED_CAPS are added back.
+        let drop = host.cap_drop.as_ref().expect("cap_drop");
+        assert_eq!(drop, &["ALL"], "cap_drop should drop ALL capabilities");
+
         let caps = host.cap_add.as_ref().expect("cap_add");
         for required in &REQUIRED_CAPS {
             assert!(
@@ -1059,6 +1123,23 @@ mod tests {
                 "missing required capability: {required}",
             );
         }
+
+        // Seccomp must be disabled so that AF_VSOCK sockets (family 40)
+        // are not blocked by Docker's default seccomp profile.
+        let security = host.security_opt.as_ref().expect("security_opt");
+        assert!(
+            security.iter().any(|s| s == "seccomp=unconfined"),
+            "security_opt should contain seccomp=unconfined: {security:?}",
+        );
+
+        // AppArmor must be disabled so that virtiofsd can initialise
+        // its FUSE filesystem server.  Docker's `docker-default`
+        // AppArmor profile restricts operations that virtiofsd needs,
+        // causing it to exit before creating its Unix socket.
+        assert!(
+            security.iter().any(|s| s == "apparmor=unconfined"),
+            "security_opt should contain apparmor=unconfined: {security:?}",
+        );
     }
 
     #[test]
@@ -1187,10 +1268,7 @@ mod tests {
             "scratch mounts should include {VM_ROOT_SHARE_PATH}",
         );
         let vm_mount = vm_mount.unwrap();
-        assert_eq!(
-            vm_mount.source.as_deref(),
-            Some("/nix/store/fake-vm-root"),
-        );
+        assert_eq!(vm_mount.source.as_deref(), Some("/nix/store/fake-vm-root"),);
         assert_eq!(vm_mount.read_only, Some(true));
     }
 

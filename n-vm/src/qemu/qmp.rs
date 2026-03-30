@@ -115,10 +115,10 @@ impl std::fmt::Display for EventDisplay<'_> {
         // Append the data payload unless it is an empty object (which
         // is the serialized form of events that carry no payload, e.g.
         // `STOP`, `RESUME`).
-        if let Some(data) = json.get("data") {
-            if !data.as_object().is_some_and(serde_json::Map::is_empty) {
-                write!(f, " {data}")?;
-            }
+        if let Some(data) = json.get("data")
+            && !data.as_object().is_some_and(serde_json::Map::is_empty)
+        {
+            write!(f, " {data}")?;
         }
 
         Ok(())
