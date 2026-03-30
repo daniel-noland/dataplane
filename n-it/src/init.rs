@@ -56,7 +56,7 @@ impl InitSystem {
         let mut signals = SignalSet::register(SIGNAL_TABLE);
         debug!("signal handlers registered");
 
-        match tokio::task::spawn_blocking(|| mount::mount_essential_filesystems()).await {
+        match tokio::task::spawn_blocking(mount::mount_essential_filesystems).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => fatal!("filesystem setup failed: {e}"),
             Err(e) => fatal!("mount filesystem task panicked: {e}"),
@@ -156,7 +156,7 @@ impl InitSystem {
             Ok(_) => {
                 // Normally unreachable -- the blocking task either powers off
                 // or aborts.  Use fatal! to ensure stdio is flushed.
-                fatal!("unreachable code?");
+                fatal!("shutdown task returned unexpectedly");
             }
             Err(err) => {
                 fatal!("failed to shutdown system: {err}");
