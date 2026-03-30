@@ -60,8 +60,6 @@ use crate::vm::{TestVmParams, check_hugepages_accessible, check_kvm_accessible, 
 /// It must match the `--event-monitor fd=N` argument.
 const EVENT_MONITOR_FD: RawFd = 3;
 
-
-
 // ── Public types ─────────────────────────────────────────────────────
 
 /// Cloud-hypervisor [`HypervisorBackend`] implementation.

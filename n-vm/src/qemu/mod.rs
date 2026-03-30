@@ -70,8 +70,6 @@ use crate::vm::{TestVmParams, check_hugepages_accessible, check_kvm_accessible, 
 
 use self::qmp::{EventDisplay, QmpCommandName, QmpConnection, QmpEventStream, QmpWriter};
 
-
-
 // ── Public types ─────────────────────────────────────────────────────
 
 /// QEMU [`HypervisorBackend`] implementation.
@@ -353,8 +351,6 @@ async fn spawn_qemu_process(
         }
     }
 }
-
-
 
 // ── CLI argument builders ────────────────────────────────────────────
 //
