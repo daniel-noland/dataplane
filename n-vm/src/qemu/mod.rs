@@ -59,7 +59,7 @@ use std::time::Duration;
 
 use n_vm_protocol::{
     HYPERVISOR_API_SOCKET_PATH, INIT_BINARY_PATH, KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH,
-    QEMU_BINARY_PATH, VIRTIOFS_ROOT_TAG, VIRTIOFSD_SOCKET_PATH, VM_GUEST_CID, VsockChannel,
+    QEMU_BINARY_PATH, VIRTIOFS_ROOT_TAG, VIRTIOFSD_SOCKET_PATH, VsockAllocation, VsockChannel,
 };
 use tokio::io::AsyncReadExt;
 use tracing::{debug, error, warn};
@@ -67,7 +67,7 @@ use tracing::{debug, error, warn};
 use crate::abort_on_drop::AbortOnDrop;
 use crate::backend::{HypervisorBackend, HypervisorVerdict, LaunchedHypervisor};
 use crate::error::VmError;
-use crate::vm::{TestVmParams, check_kvm_accessible, wait_for_socket};
+use crate::vm::{TestVmParams, check_hugepages_accessible, check_kvm_accessible, wait_for_socket};
 
 use self::qmp::{EventDisplay, QmpCommandName, QmpConnection, QmpEventStream, QmpWriter};
 
@@ -78,13 +78,15 @@ use self::qmp::{EventDisplay, QmpCommandName, QmpConnection, QmpEventStream, Qmp
 // match.  A shared configuration module would eliminate the duplication;
 // for now, keeping them backend-local avoids coupling the two modules.
 
-/// Total guest memory in MiB.
+/// Total guest memory in MiB (1 GiB).
 ///
+/// Must be a multiple of the host hugepage size.  The development
+/// machines use 1 GiB hugepages, so the minimum (and default) is 1 GiB.
 /// Matches the cloud-hypervisor backend's `VM_MEMORY_BYTES / 1 MiB`.
-const VM_MEMORY_MIB: u32 = 512;
+const VM_MEMORY_MIB: u32 = 1024;
 
-/// Number of 2 MiB hugepages to reserve on the kernel command line.
-const VM_HUGEPAGE_COUNT: u32 = 16;
+/// Number of 1 GiB hugepages to reserve on the guest kernel command line.
+const VM_HUGEPAGE_COUNT: u32 = 1;
 
 /// Number of vCPUs.
 const VM_VCPUS: u32 = 6;
@@ -389,22 +391,30 @@ pub fn compute_verdict(events: &[qapi_qmp::Event], had_stream_errors: bool) -> H
 
 // ── Process spawning ─────────────────────────────────────────────────
 
-/// Verifies KVM accessibility, spawns the QEMU process, waits for the
-/// QMP socket, and establishes the QMP connection.
+/// Verifies KVM and hugepage accessibility, spawns the QEMU process,
+/// waits for the QMP socket, and establishes the QMP connection.
 ///
 /// QEMU boots the VM immediately on process start (no separate
 /// `create_vm` / `boot_vm` calls), so by the time the QMP connection is
 /// established the VM is either running or has already failed to boot.
+///
+/// If the QMP socket appears but the connection or negotiation fails
+/// (e.g. QEMU crashes during early init), this function attempts to
+/// drain the child's stderr and log it before returning the error.
+/// Without this, the QEMU error output would be silently lost because
+/// the `dispatch` layer panics on [`VmError`] before the normal
+/// [`collect`](crate::vm::TestVm::collect) phase runs.
 async fn spawn_qemu_process(
     params: &TestVmParams<'_>,
 ) -> Result<(tokio::process::Child, QmpConnection), VmError> {
     check_kvm_accessible().await?;
+    check_hugepages_accessible().await?;
 
     let args = build_qemu_args(params);
 
     debug!("spawning QEMU: {} {}", QEMU_BINARY_PATH, args.join(" "));
 
-    let child = tokio::process::Command::new(QEMU_BINARY_PATH)
+    let mut child = tokio::process::Command::new(QEMU_BINARY_PATH)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -414,10 +424,54 @@ async fn spawn_qemu_process(
         .map_err(VmError::HypervisorSpawn)?;
 
     // Wait for QEMU to create the QMP socket, then connect and negotiate.
-    wait_for_socket(HYPERVISOR_API_SOCKET_PATH).await?;
-    let qmp = QmpConnection::connect(HYPERVISOR_API_SOCKET_PATH).await?;
+    // If either step fails, try to capture QEMU's stderr so the developer
+    // can see why QEMU crashed rather than just "Connection reset by peer".
+    let socket_result = wait_for_socket(HYPERVISOR_API_SOCKET_PATH).await;
+    if let Err(err) = socket_result {
+        drain_child_stderr(&mut child).await;
+        return Err(err);
+    }
 
-    Ok((child, qmp))
+    match QmpConnection::connect(HYPERVISOR_API_SOCKET_PATH).await {
+        Ok(qmp) => Ok((child, qmp)),
+        Err(qmp_err) => {
+            drain_child_stderr(&mut child).await;
+            Err(qmp_err.into())
+        }
+    }
+}
+
+/// Best-effort drain of a QEMU child process's stderr, logged at `error`
+/// level.
+///
+/// Called when the QMP socket or connection phase fails so that the
+/// developer can see QEMU's actual error output (e.g. "can't open
+/// backing store /dev/hugepages for guest RAM: ...") instead of just a
+/// cryptic "Connection reset by peer" or socket timeout.
+async fn drain_child_stderr(child: &mut tokio::process::Child) {
+    // Give QEMU a moment to flush its output before we kill it.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    if let Some(mut stderr) = child.stderr.take() {
+        let mut buf = String::with_capacity(4096);
+        match tokio::time::timeout(Duration::from_secs(2), stderr.read_to_string(&mut buf)).await {
+            Ok(Ok(_)) if !buf.is_empty() => {
+                error!("QEMU stderr (captured after launch failure):\n{buf}");
+            }
+            Ok(Ok(_)) => {
+                warn!("QEMU stderr was empty after launch failure");
+            }
+            Ok(Err(e)) => {
+                warn!("failed to read QEMU stderr: {e}");
+            }
+            Err(_) => {
+                warn!("timed out reading QEMU stderr");
+                if !buf.is_empty() {
+                    error!("QEMU stderr (partial, timed out):\n{buf}");
+                }
+            }
+        }
+    }
 }
 
 // ── CLI argument builders ────────────────────────────────────────────
@@ -438,8 +492,8 @@ fn build_qemu_args(params: &TestVmParams<'_>) -> Vec<String> {
     push_memory_args(&mut args);
     push_iommu_args(&mut args, iommu);
     push_kernel_args(&mut args, params);
-    push_fs_args(&mut args, iommu);
-    push_vsock_args(&mut args, iommu);
+    push_fs_args(&mut args);
+    push_vsock_args(&mut args, &params.vsock, iommu);
     push_network_args(&mut args, iommu);
     push_serial_args(&mut args);
     push_qmp_args(&mut args);
@@ -495,6 +549,8 @@ fn push_cpu_args(args: &mut Vec<String>) {
 /// guest's address space.
 fn push_memory_args(args: &mut Vec<String>) {
     args.extend([
+        "-m".into(),
+        format!("{VM_MEMORY_MIB}M"),
         "-object".into(),
         format!(
             "memory-backend-file,id=mem0,size={VM_MEMORY_MIB}M,\
@@ -524,7 +580,12 @@ fn push_memory_args(args: &mut Vec<String>) {
 /// Unlike cloud-hypervisor's per-segment IOMMU model, QEMU's Intel
 /// IOMMU covers the entire PCI topology.  Individual virtio devices
 /// opt in via `iommu_platform=on,ats=on` on their device strings (see
-/// [`push_network_args`], [`push_fs_args`], [`push_vsock_args`]).
+/// [`push_network_args`], [`push_vsock_args`]).
+///
+/// The `vhost-user-fs-pci` device does **not** support
+/// `iommu_platform`; vhost-user devices perform DMA from a separate
+/// userspace process rather than through QEMU's emulated IOMMU data
+/// path.  `caching-mode=on` on the Intel IOMMU handles this case.
 fn push_iommu_args(args: &mut Vec<String>, iommu: bool) {
     if iommu {
         args.extend([
@@ -539,6 +600,7 @@ fn push_iommu_args(args: &mut Vec<String>, iommu: bool) {
 /// The kernel command line passes the test binary path and name to the
 /// init system, matching the cloud-hypervisor backend exactly.
 fn push_kernel_args(args: &mut Vec<String>, params: &TestVmParams<'_>) {
+    let vsock_cmdline = params.vsock.kernel_cmdline_fragment();
     let cmdline = format!(
         "iommu=on \
          intel_iommu=on \
@@ -549,12 +611,13 @@ fn push_kernel_args(args: &mut Vec<String>, params: &TestVmParams<'_>) {
          ro \
          rootfstype=virtiofs \
          root=root \
-         default_hugepagesz=2M \
-         hugepagesz=2M \
+         default_hugepagesz=1G \
+         hugepagesz=1G \
          hugepages={VM_HUGEPAGE_COUNT} \
+         {vsock_cmdline} \
          init={INIT_BINARY_PATH} \
-         -- {full_bin_path} {test_name} --exact --no-capture --format=terse",
-        full_bin_path = params.full_bin_path.display(),
+         -- {vm_bin_path} {test_name} --exact --no-capture --format=terse",
+        vm_bin_path = params.vm_bin_path,
         test_name = params.test_name,
     );
 
@@ -572,21 +635,19 @@ fn push_kernel_args(args: &mut Vec<String>, params: &TestVmParams<'_>) {
 /// socket, matching the cloud-hypervisor backend's filesystem
 /// configuration.
 ///
-/// When `iommu` is `true`, appends `iommu_platform=on,ats=on` so that
-/// the device performs DMA through the virtual IOMMU.
-fn push_fs_args(args: &mut Vec<String>, iommu: bool) {
-    let iommu_suffix = if iommu {
-        ",iommu_platform=on,ats=on"
-    } else {
-        ""
-    };
+/// The `vhost-user-fs-pci` device does **not** support
+/// `iommu_platform=on` because vhost-user devices perform DMA from a
+/// separate userspace process (virtiofsd) rather than through QEMU's
+/// emulated IOMMU data path.  The Intel IOMMU's `caching-mode=on`
+/// (set in [`push_iommu_args`]) covers this case instead.
+fn push_fs_args(args: &mut Vec<String>) {
     args.extend([
         "-chardev".into(),
         format!("socket,id=virtiofs0,path={VIRTIOFSD_SOCKET_PATH}"),
         "-device".into(),
         format!(
             "vhost-user-fs-pci,queue-size={VIRTIOFS_QUEUE_SIZE},\
-             chardev=virtiofs0,tag={VIRTIOFS_ROOT_TAG}{iommu_suffix}"
+             chardev=virtiofs0,tag={VIRTIOFS_ROOT_TAG}"
         ),
     ]);
 }
@@ -595,8 +656,11 @@ fn push_fs_args(args: &mut Vec<String>, iommu: bool) {
 ///
 /// Uses `vhost-vsock-pci` with the kernel's vhost-vsock module.
 ///
-/// When `iommu` is `true`, appends `iommu_platform=on,ats=on` so that
-/// the device performs DMA through the virtual IOMMU.
+/// When `iommu` is `true`, uses `vhost-vsock-pci-non-transitional`
+/// (virtio 1.0+ only) with `iommu_platform=on,ats=on` so that vsock
+/// I/O is routed through the virtual IOMMU.  The transitional
+/// `vhost-vsock-pci` device does not support `VIRTIO_F_IOMMU_PLATFORM`,
+/// which is a modern-only feature.
 ///
 /// # Limitations
 ///
@@ -604,17 +668,17 @@ fn push_fs_args(args: &mut Vec<String>, iommu: bool) {
 /// limitation: this device uses kernel vhost-vsock (AF_VSOCK on the
 /// host), while the [`TestVm`](crate::vm::TestVm) infrastructure
 /// expects Unix sockets at `$VHOST_SOCKET_$PORT` paths.
-fn push_vsock_args(args: &mut Vec<String>, iommu: bool) {
-    let iommu_suffix = if iommu {
-        ",iommu_platform=on,ats=on"
+fn push_vsock_args(args: &mut Vec<String>, vsock: &VsockAllocation, iommu: bool) {
+    let (device, iommu_suffix) = if iommu {
+        ("vhost-vsock-pci-non-transitional", ",iommu_platform=on,ats=on")
     } else {
-        ""
+        ("vhost-vsock-pci", "")
     };
     args.extend([
         "-device".into(),
         format!(
-            "vhost-vsock-pci,guest-cid={}{iommu_suffix}",
-            VM_GUEST_CID.as_raw()
+            "{device},guest-cid={}{iommu_suffix}",
+            vsock.cid.as_raw()
         ),
     ]);
 }
@@ -633,14 +697,16 @@ fn push_vsock_args(args: &mut Vec<String>, iommu: bool) {
 /// backend sets MTU in the device configuration, which cloud-hypervisor
 /// applies to the TAP devices automatically.
 ///
-/// When `iommu` is `true`, appends `iommu_platform=on,ats=on` to each
-/// `virtio-net-pci` device string so that network I/O is routed through
-/// the virtual IOMMU.
+/// When `iommu` is `true`, uses `virtio-net-pci-non-transitional`
+/// (virtio 1.0+ only) with `iommu_platform=on,ats=on` so that network
+/// I/O is routed through the virtual IOMMU.  The transitional
+/// `virtio-net-pci` device does not support `VIRTIO_F_IOMMU_PLATFORM`,
+/// which is a modern-only feature.
 fn push_network_args(args: &mut Vec<String>, iommu: bool) {
-    let iommu_suffix = if iommu {
-        ",iommu_platform=on,ats=on"
+    let (device, iommu_suffix) = if iommu {
+        ("virtio-net-pci-non-transitional", ",iommu_platform=on,ats=on")
     } else {
-        ""
+        ("virtio-net-pci", "")
     };
     for iface in [&IFACE_MGMT, &IFACE_FABRIC1, &IFACE_FABRIC2] {
         args.extend([
@@ -652,7 +718,7 @@ fn push_network_args(args: &mut Vec<String>, iommu: bool) {
             ),
             "-device".into(),
             format!(
-                "virtio-net-pci,netdev=nd-{id},mac={mac}{iommu_suffix}",
+                "{device},netdev=nd-{id},mac={mac}{iommu_suffix}",
                 id = iface.id,
                 mac = iface.mac,
             ),
@@ -741,9 +807,11 @@ mod tests {
     fn sample_params() -> TestVmParams<'static> {
         TestVmParams {
             full_bin_path: Path::new("/deps/my_test-abc123"),
+            vm_bin_path: format!("/{}/my_test-abc123", n_vm_protocol::VM_TEST_BIN_DIR),
             bin_name: "my_test-abc123",
             test_name: "module::test_name",
             iommu: false,
+            vsock: n_vm_protocol::VsockAllocation::with_defaults(),
         }
     }
 
@@ -780,6 +848,14 @@ mod tests {
     // ── Memory ───────────────────────────────────────────────────────
 
     #[test]
+    fn memory_args_set_ram_size() {
+        let mut args = Vec::new();
+        push_memory_args(&mut args);
+        let idx = args.iter().position(|a| a == "-m").unwrap();
+        assert_eq!(args[idx + 1], format!("{VM_MEMORY_MIB}M"));
+    }
+
+    #[test]
     fn memory_args_use_hugepages_with_sharing() {
         let mut args = Vec::new();
         push_memory_args(&mut args);
@@ -787,7 +863,7 @@ mod tests {
             .iter()
             .find(|a| a.starts_with("memory-backend-file"))
             .unwrap();
-        assert!(obj.contains("size=512M"), "{obj}");
+        assert!(obj.contains("size=1024M"), "{obj}");
         assert!(obj.contains("mem-path=/dev/hugepages"), "{obj}");
         assert!(obj.contains("share=on"), "{obj}");
         assert!(obj.contains("prealloc=on"), "{obj}");
@@ -816,7 +892,11 @@ mod tests {
         push_kernel_args(&mut args, &sample_params());
         let idx = args.iter().position(|a| a == "-append").unwrap();
         let cmdline = &args[idx + 1];
-        assert!(cmdline.contains("/deps/my_test-abc123"), "{cmdline}");
+        let expected = format!("/{}/my_test-abc123", n_vm_protocol::VM_TEST_BIN_DIR);
+        assert!(
+            cmdline.contains(&expected),
+            "cmdline should contain the VM-side binary path ({expected}): {cmdline}",
+        );
         assert!(cmdline.contains("module::test_name"), "{cmdline}");
     }
 
@@ -838,8 +918,8 @@ mod tests {
         push_kernel_args(&mut args, &sample_params());
         let idx = args.iter().position(|a| a == "-append").unwrap();
         let cmdline = &args[idx + 1];
-        assert!(cmdline.contains("default_hugepagesz=2M"), "{cmdline}");
-        assert!(cmdline.contains("hugepagesz=2M"), "{cmdline}");
+        assert!(cmdline.contains("default_hugepagesz=1G"), "{cmdline}");
+        assert!(cmdline.contains("hugepagesz=1G"), "{cmdline}");
         assert!(
             cmdline.contains(&format!("hugepages={VM_HUGEPAGE_COUNT}")),
             "{cmdline}"
@@ -857,12 +937,26 @@ mod tests {
         assert!(cmdline.contains("--format=terse"), "{cmdline}");
     }
 
+    #[test]
+    fn kernel_cmdline_embeds_vsock_port_parameters() {
+        let params = sample_params();
+        let mut args = Vec::new();
+        push_kernel_args(&mut args, &params);
+        let idx = args.iter().position(|a| a == "-append").unwrap();
+        let cmdline = &args[idx + 1];
+        let fragment = params.vsock.kernel_cmdline_fragment();
+        assert!(
+            cmdline.contains(&fragment),
+            "kernel cmdline should contain vsock port parameters ({fragment}): {cmdline}",
+        );
+    }
+
     // ── Filesystem ───────────────────────────────────────────────────
 
     #[test]
     fn fs_args_use_virtiofs_tag_and_socket() {
         let mut args = Vec::new();
-        push_fs_args(&mut args, false);
+        push_fs_args(&mut args);
         let chardev = args
             .iter()
             .find(|a| a.starts_with("socket,id=virtiofs0"))
@@ -883,14 +977,15 @@ mod tests {
 
     #[test]
     fn vsock_args_use_guest_cid() {
+        let vsock = n_vm_protocol::VsockAllocation::with_defaults();
         let mut args = Vec::new();
-        push_vsock_args(&mut args, false);
+        push_vsock_args(&mut args, &vsock, false);
         let device = args
             .iter()
             .find(|a| a.starts_with("vhost-vsock-pci"))
             .unwrap();
         assert!(
-            device.contains(&format!("guest-cid={}", VM_GUEST_CID.as_raw())),
+            device.contains(&format!("guest-cid={}", vsock.cid.as_raw())),
             "{device}"
         );
     }
@@ -1088,7 +1183,7 @@ mod tests {
         push_network_args(&mut args, true);
         let devices: Vec<&String> = args
             .iter()
-            .filter(|a| a.starts_with("virtio-net-pci,"))
+            .filter(|a| a.starts_with("virtio-net-pci-non-transitional,"))
             .collect();
         assert_eq!(devices.len(), 3);
         for dev in &devices {
@@ -1113,40 +1208,27 @@ mod tests {
     }
 
     #[test]
-    fn fs_device_has_iommu_platform_when_enabled() {
+    fn fs_device_never_has_iommu_platform() {
         let mut args = Vec::new();
-        push_fs_args(&mut args, true);
-        let device = args
-            .iter()
-            .find(|a| a.starts_with("vhost-user-fs-pci"))
-            .unwrap();
-        assert!(
-            device.contains("iommu_platform=on,ats=on"),
-            "fs device should have iommu_platform: {device}",
-        );
-    }
-
-    #[test]
-    fn fs_device_omits_iommu_platform_when_disabled() {
-        let mut args = Vec::new();
-        push_fs_args(&mut args, false);
+        push_fs_args(&mut args);
         let device = args
             .iter()
             .find(|a| a.starts_with("vhost-user-fs-pci"))
             .unwrap();
         assert!(
             !device.contains("iommu_platform"),
-            "fs device should not have iommu_platform when disabled: {device}",
+            "vhost-user-fs-pci does not support iommu_platform: {device}",
         );
     }
 
     #[test]
     fn vsock_device_has_iommu_platform_when_enabled() {
+        let vsock = n_vm_protocol::VsockAllocation::with_defaults();
         let mut args = Vec::new();
-        push_vsock_args(&mut args, true);
+        push_vsock_args(&mut args, &vsock, true);
         let device = args
             .iter()
-            .find(|a| a.starts_with("vhost-vsock-pci"))
+            .find(|a| a.starts_with("vhost-vsock-pci-non-transitional"))
             .unwrap();
         assert!(
             device.contains("iommu_platform=on,ats=on"),
@@ -1156,11 +1238,12 @@ mod tests {
 
     #[test]
     fn vsock_device_omits_iommu_platform_when_disabled() {
+        let vsock = n_vm_protocol::VsockAllocation::with_defaults();
         let mut args = Vec::new();
-        push_vsock_args(&mut args, false);
+        push_vsock_args(&mut args, &vsock, false);
         let device = args
             .iter()
-            .find(|a| a.starts_with("vhost-vsock-pci"))
+            .find(|a| a.starts_with("vhost-vsock-pci,"))
             .unwrap();
         assert!(
             !device.contains("iommu_platform"),
