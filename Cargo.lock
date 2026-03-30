@@ -1658,6 +1658,7 @@ dependencies = [
  "nix 0.31.2",
  "qapi-qmp",
  "qapi-spec",
+ "rand 0.10.0",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
