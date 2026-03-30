@@ -25,7 +25,7 @@ use std::path::Path;
 use nix::errno::Errno;
 use nix::mount::{MntFlags, MsFlags, mount};
 use nix::unistd::sync;
-use tokio::time::Duration;
+use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::error::{MountError, UnmountError};
