@@ -133,15 +133,6 @@ pub enum BroadcastSignalOutcome {
     NoProcesses,
 }
 
-impl BroadcastSignalOutcome {
-    /// Returns `true` if the signal was delivered to at least one process.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn was_delivered(self) -> bool {
-        matches!(self, Self::Delivered)
-    }
-}
-
 /// An unrecoverable error when broadcasting a signal.
 ///
 /// `EPERM` from an init system is genuinely fatal -- if PID 1 cannot
