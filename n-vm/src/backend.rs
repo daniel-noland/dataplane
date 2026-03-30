@@ -156,7 +156,7 @@ pub struct LaunchedHypervisor<B: HypervisorBackend> {
 ///    stdout/stderr, and null stdin.
 /// 4. Wait for the hypervisor to become ready.  Use the shared
 ///    [`wait_for_socket()`](crate::vm::wait_for_socket) utility if the
-///    readiness signal is a socket appearing on the filesystem.
+///    readiness signal is a socket becoming connectable.
 /// 5. Spawn a background event-monitoring task wrapped in
 ///    [`AbortOnDrop`](crate::abort_on_drop::AbortOnDrop) that resolves
 ///    to `(Self::EventLog, HypervisorVerdict)`.
@@ -186,14 +186,22 @@ pub struct LaunchedHypervisor<B: HypervisorBackend> {
 ///
 /// The `#[in_vm]` proc macro (in `n-vm-macros`) generates a call to
 /// [`run_container_tier`](crate::dispatch::run_container_tier) with an
-/// explicit backend type parameter selected by an optional argument:
+/// explicit backend type parameter and a [`VmConfig`](crate::config::VmConfig)
+/// built from the `#[in_vm(…)]`, `#[hypervisor(…)]`, and `#[guest(…)]`
+/// attributes:
 ///
 /// ```ignore
 /// // #[in_vm] or #[in_vm(cloud_hypervisor)]
-/// ::n_vm::run_container_tier::<::n_vm::CloudHypervisor, _>(test_fn);
+/// ::n_vm::run_container_tier::<::n_vm::CloudHypervisor, _>(
+///     test_fn,
+///     ::n_vm::VmConfig { /* parsed from companion attrs */ },
+/// );
 ///
 /// // #[in_vm(qemu)]
-/// ::n_vm::run_container_tier::<::n_vm::Qemu, _>(test_fn);
+/// ::n_vm::run_container_tier::<::n_vm::Qemu, _>(
+///     test_fn,
+///     ::n_vm::VmConfig { /* parsed from companion attrs */ },
+/// );
 /// ```
 ///
 /// To make a new backend available to the proc macro:
@@ -217,8 +225,8 @@ pub struct LaunchedHypervisor<B: HypervisorBackend> {
 ///
 /// - [`check_kvm_accessible()`](crate::vm::check_kvm_accessible) --
 ///   pre-flight `/dev/kvm` check.
-/// - [`wait_for_socket()`](crate::vm::wait_for_socket) -- poll for a
-///   socket to appear on the filesystem after process spawn.
+/// - [`wait_for_socket()`](crate::vm::wait_for_socket) -- poll until a
+///   Unix socket is accepting connections after process spawn.
 ///
 /// ## Key differences: cloud-hypervisor vs QEMU
 ///
@@ -229,7 +237,7 @@ pub struct LaunchedHypervisor<B: HypervisorBackend> {
 /// | Event monitoring | `--event-monitor fd=N` pipe | QMP async events |
 /// | Shutdown | `shutdown_vm()` + `shutdown_vmm()` REST | `system_powerdown` + `quit` QMP |
 /// | vsock | `VsockConfig` in `VmConfig` JSON | `-device vhost-vsock-pci,guest-cid=N` CLI |
-/// | Hugepages | `MemoryConfig.hugepages` field | `-object memory-backend-file,mem-path=/dev/hugepages` |
+/// | Hugepages | `MemoryConfig.hugepages` field (via [`HostPageSize`](crate::config::HostPageSize)) | `-object memory-backend-file` or `memory-backend-memfd` (via [`HostPageSize`](crate::config::HostPageSize)) |
 #[expect(
     async_fn_in_trait,
     reason = "this trait is only used within the crate; auto-trait bounds on the \

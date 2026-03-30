@@ -40,15 +40,15 @@ use cloud_hypervisor_client::models::{
 };
 use command_fds::{CommandFdExt, FdMapping};
 use n_vm_protocol::{
-    CLOUD_HYPERVISOR_BINARY_PATH, HYPERVISOR_API_SOCKET_PATH, INIT_BINARY_PATH,
-    KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH, VHOST_VSOCK_SOCKET_PATH, VIRTIOFS_ROOT_TAG,
-    VIRTIOFSD_SOCKET_PATH, VsockChannel,
+    CLOUD_HYPERVISOR_BINARY_PATH, HYPERVISOR_API_SOCKET_PATH, KERNEL_CONSOLE_SOCKET_PATH,
+    KERNEL_IMAGE_PATH, VHOST_VSOCK_SOCKET_PATH, VIRTIOFS_ROOT_TAG, VIRTIOFSD_SOCKET_PATH,
+    VsockChannel,
 };
-use tokio::io::AsyncReadExt;
 use tracing::{debug, error};
 
 use crate::abort_on_drop::AbortOnDrop;
 use crate::backend::{HypervisorBackend, LaunchedHypervisor};
+use crate::config;
 use crate::error::VmError;
 use crate::vm::{TestVmParams, check_hugepages_accessible, check_kvm_accessible, wait_for_socket};
 
@@ -60,38 +60,7 @@ use crate::vm::{TestVmParams, check_hugepages_accessible, check_kvm_accessible, 
 /// It must match the `--event-monitor fd=N` argument.
 const EVENT_MONITOR_FD: RawFd = 3;
 
-/// Total guest memory in bytes (1 GiB).
-///
-/// Must be a multiple of the host hugepage size.  The development
-/// machines use 1 GiB hugepages, so the minimum (and default) is 1 GiB.
-const VM_MEMORY_BYTES: i64 = 1024 * 1024 * 1024;
 
-/// Hugepage size in bytes (1 GiB).
-///
-/// Must match the `pagesize=` of the hugetlbfs mount at `/dev/hugepages`
-/// on the host.
-const VM_HUGEPAGE_BYTES: i64 = 1024 * 1024 * 1024;
-
-/// Number of 1 GiB hugepages to reserve on the guest kernel command line.
-const VM_HUGEPAGE_COUNT: u32 = 1;
-
-/// MTU for the management network interface (standard Ethernet).
-const MGMT_MTU: i32 = 1500;
-
-/// MTU for fabric-facing network interfaces (jumbo frames).
-const FABRIC_MTU: i32 = 9500;
-
-/// Virtio queue depth for the management network interface.
-const MGMT_QUEUE_SIZE: i32 = 512;
-
-/// Virtio queue depth for fabric-facing network interfaces.
-const FABRIC_QUEUE_SIZE: i32 = 8192;
-
-/// Virtio queue depth for the virtiofs filesystem device.
-const VIRTIOFS_QUEUE_SIZE: i32 = 1024;
-
-/// Initial buffer capacity for vsock reader tasks.
-const VSOCK_READER_CAPACITY: usize = 32_768;
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -153,7 +122,8 @@ impl HypervisorBackend for CloudHypervisor {
     type Controller = CloudHypervisorController;
 
     async fn launch(params: &TestVmParams<'_>) -> Result<LaunchedHypervisor<Self>, VmError> {
-        let (child, event_receiver) = spawn_hypervisor_process().await?;
+        let (child, event_receiver) =
+            spawn_hypervisor_process(params.vm_config.host_page_size).await?;
 
         let config = build_vm_config(params);
 
@@ -212,8 +182,7 @@ impl HypervisorBackend for CloudHypervisor {
                 source,
             })?;
         Ok(AbortOnDrop::spawn(async move {
-            let mut buf = Vec::with_capacity(VSOCK_READER_CAPACITY);
-            let mut connection = match listen.accept().await {
+            let connection = match listen.accept().await {
                 Ok((stream, _)) => stream,
                 Err(e) => {
                     error!("failed to accept {label} vsock connection: {e}");
@@ -223,17 +192,7 @@ impl HypervisorBackend for CloudHypervisor {
                     );
                 }
             };
-            loop {
-                match connection.read_buf(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("error reading {label} vsock stream: {e}");
-                        break;
-                    }
-                }
-            }
-            String::from_utf8_lossy(&buf).into_owned()
+            config::read_vsock_stream(connection, label).await
         }))
     }
 }
@@ -245,8 +204,9 @@ impl HypervisorBackend for CloudHypervisor {
 ///
 /// Returns the child process handle and the event-monitor pipe receiver
 /// (which is consumed by [`hypervisor::watch`]).
-async fn spawn_hypervisor_process()
--> Result<(tokio::process::Child, tokio::net::unix::pipe::Receiver), VmError> {
+async fn spawn_hypervisor_process(
+    host_page_size: config::HostPageSize,
+) -> Result<(tokio::process::Child, tokio::net::unix::pipe::Receiver), VmError> {
     let (event_sender, event_receiver) =
         tokio::net::unix::pipe::pipe().map_err(CloudHypervisorError::EventPipe)?;
     let event_sender = event_sender
@@ -254,7 +214,7 @@ async fn spawn_hypervisor_process()
         .map_err(CloudHypervisorError::EventSenderFd)?;
 
     check_kvm_accessible().await?;
-    check_hugepages_accessible().await?;
+    check_hugepages_accessible(host_page_size).await?;
 
     let hypervisor = tokio::process::Command::new(CLOUD_HYPERVISOR_BINARY_PATH)
         .args([
@@ -308,8 +268,8 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
             ..Default::default()
         }),
         cpus: Some(build_cpu_config()),
-        memory: Some(build_memory_config()),
-        net: Some(build_network_configs(params.iommu)),
+        memory: Some(build_memory_config(params.vm_config.host_page_size)),
+        net: Some(build_network_configs(params.vm_config.iommu)),
         fs: Some(build_fs_config()),
         // The virtio-console is disabled: test stdout/stderr travel
         // over dedicated VsockChannels (TEST_STDOUT / TEST_STDERR).
@@ -319,7 +279,7 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
             socket: Some(KERNEL_CONSOLE_SOCKET_PATH.into()),
             ..Default::default()
         }),
-        iommu: Some(params.iommu),
+        iommu: Some(params.vm_config.iommu),
         watchdog: Some(true),
         platform: Some(build_platform_config(params)),
         pvpanic: Some(true),
@@ -335,28 +295,15 @@ fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
 /// Builds the kernel payload configuration, including the kernel command
 /// line that passes the test binary path and name to the init system.
 fn build_payload_config(params: &TestVmParams<'_>) -> PayloadConfig {
-    let vsock_cmdline = params.vsock.kernel_cmdline_fragment();
     PayloadConfig {
         firmware: None,
         kernel: Some(KERNEL_IMAGE_PATH.into()),
-        cmdline: Some(format!(
-            "iommu=on \
-             intel_iommu=on \
-             amd_iommu=on \
-             vfio.enable_unsafe_noiommu_mode=1 \
-             earlyprintk=ttyS0 \
-             console=ttyS0 \
-             ro \
-             rootfstype=virtiofs \
-             root=root \
-             default_hugepagesz=1G \
-             hugepagesz=1G \
-             hugepages={VM_HUGEPAGE_COUNT} \
-             {vsock_cmdline} \
-             init={INIT_BINARY_PATH} \
-             -- {vm_bin_path} {test_name} --exact --no-capture --format=terse",
-            vm_bin_path = params.vm_bin_path,
-            test_name = params.test_name,
+        cmdline: Some(config::build_kernel_cmdline(
+            &params.vm_bin_path,
+            params.test_name,
+            &params.vsock,
+            params.vm_config.iommu,
+            &params.vm_config.guest_hugepages,
         )),
         ..Default::default()
     }
@@ -366,27 +313,47 @@ fn build_payload_config(params: &TestVmParams<'_>) -> PayloadConfig {
 /// threads.
 fn build_cpu_config() -> CpusConfig {
     CpusConfig {
-        boot_vcpus: 6,
-        max_vcpus: 6,
+        boot_vcpus: config::VM_VCPUS as i32,
+        max_vcpus: config::VM_VCPUS as i32,
         topology: Some(CpuTopology {
-            threads_per_core: Some(2),
-            cores_per_die: Some(1),
-            dies_per_package: Some(3),
-            packages: Some(1),
+            threads_per_core: Some(config::VM_THREADS_PER_CORE as i32),
+            cores_per_die: Some(config::VM_CORES_PER_DIE as i32),
+            dies_per_package: Some(config::VM_DIES_PER_PACKAGE as i32),
+            packages: Some(config::VM_SOCKETS as i32),
         }),
         ..Default::default()
     }
 }
 
-/// Builds the memory configuration with hugepage and sharing support.
-fn build_memory_config() -> MemoryConfig {
+/// Builds the memory configuration with sharing support and optional
+/// hugepage backing based on the [`HostPageSize`](config::HostPageSize).
+///
+/// - [`Standard`](config::HostPageSize::Standard) -- `shared=on`,
+///   `hugepages=off`, `thp=off`.  No hugetlbfs mount required.
+/// - [`Huge2M`](config::HostPageSize::Huge2M) /
+///   [`Huge1G`](config::HostPageSize::Huge1G) -- `shared=on`,
+///   `hugepages=on` with the matching page size, `thp=off`.
+///
+/// `shared=on` is always set because virtiofsd (vhost-user-fs) requires
+/// `MAP_SHARED` memory to access the guest address space from a
+/// separate process.
+///
+/// THP (transparent huge pages) is always off.  Cloud-hypervisor's THP
+/// hint only applies to private anonymous memory (`shared=off`), so it
+/// has no effect when `shared=on`.
+fn build_memory_config(host_page_size: config::HostPageSize) -> MemoryConfig {
+    let (hugepages, hugepage_size) = if host_page_size.requires_hugepages() {
+        (Some(true), Some(host_page_size.bytes()))
+    } else {
+        (Some(false), None)
+    };
     MemoryConfig {
-        size: VM_MEMORY_BYTES,
+        size: config::VM_MEMORY_BYTES,
         mergeable: Some(true),
         shared: Some(true),
-        hugepages: Some(true),
-        hugepage_size: Some(VM_HUGEPAGE_BYTES),
-        thp: Some(true),
+        hugepages,
+        hugepage_size,
+        thp: Some(false),
         ..Default::default()
     }
 }
@@ -411,37 +378,37 @@ fn build_network_configs(iommu: bool) -> Vec<NetConfig> {
 
     vec![
         NetConfig {
-            tap: Some("mgmt".into()),
+            tap: Some(config::IFACE_MGMT.tap.into()),
             ip: Some("fe80::ffff:1".into()),
             mask: Some("ffff:ffff:ffff:ffff::".into()),
-            mac: Some("02:DE:AD:BE:EF:01".into()),
-            mtu: Some(MGMT_MTU),
-            id: Some("mgmt".into()),
+            mac: Some(config::IFACE_MGMT.mac.into()),
+            mtu: Some(config::MGMT_MTU),
+            id: Some(config::IFACE_MGMT.id.into()),
             pci_segment: Some(0),
-            queue_size: Some(MGMT_QUEUE_SIZE),
+            queue_size: Some(config::MGMT_QUEUE_SIZE),
             ..Default::default()
         },
         NetConfig {
-            tap: Some("fabric1".into()),
+            tap: Some(config::IFACE_FABRIC1.tap.into()),
             ip: Some("fe80::1".into()),
             mask: Some("ffff:ffff:ffff:ffff::".into()),
-            mac: Some("02:CA:FE:BA:BE:01".into()),
-            mtu: Some(FABRIC_MTU),
-            id: Some("fabric1".into()),
+            mac: Some(config::IFACE_FABRIC1.mac.into()),
+            mtu: Some(config::FABRIC_MTU),
+            id: Some(config::IFACE_FABRIC1.id.into()),
             pci_segment: Some(1),
-            queue_size: Some(FABRIC_QUEUE_SIZE),
+            queue_size: Some(config::FABRIC_QUEUE_SIZE),
             iommu: fabric_iommu,
             ..Default::default()
         },
         NetConfig {
-            tap: Some("fabric2".into()),
+            tap: Some(config::IFACE_FABRIC2.tap.into()),
             ip: Some("fe80::2".into()),
             mask: Some("ffff:ffff:ffff:ffff::".into()),
-            mac: Some("02:CA:FE:BA:BE:02".into()),
-            mtu: Some(FABRIC_MTU),
-            id: Some("fabric2".into()),
+            mac: Some(config::IFACE_FABRIC2.mac.into()),
+            mtu: Some(config::FABRIC_MTU),
+            id: Some(config::IFACE_FABRIC2.id.into()),
             pci_segment: Some(1),
-            queue_size: Some(FABRIC_QUEUE_SIZE),
+            queue_size: Some(config::FABRIC_QUEUE_SIZE),
             iommu: fabric_iommu,
             ..Default::default()
         },
@@ -455,7 +422,7 @@ fn build_fs_config() -> Vec<FsConfig> {
         tag: VIRTIOFS_ROOT_TAG.into(),
         socket: VIRTIOFSD_SOCKET_PATH.into(),
         num_queues: 1,
-        queue_size: VIRTIOFS_QUEUE_SIZE,
+        queue_size: config::VIRTIOFS_QUEUE_SIZE as i32,
         id: Some(VIRTIOFS_ROOT_TAG.into()),
         ..Default::default()
     }]
@@ -475,7 +442,7 @@ fn build_platform_config(params: &TestVmParams<'_>) -> PlatformConfig {
     // caller has requested vIOMMU support.  Leaving them as `None` when
     // iommu is disabled avoids sending unnecessary (and potentially
     // confusing) configuration to the hypervisor.
-    let (iommu_segments, iommu_address_width) = if params.iommu {
+    let (iommu_segments, iommu_address_width) = if params.vm_config.iommu {
         (Some(vec![1]), Some(48))
     } else {
         (None, None)
@@ -502,6 +469,11 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::config::{
+        self, FABRIC_MTU, FABRIC_QUEUE_SIZE, MGMT_MTU, MGMT_QUEUE_SIZE, VM_MEMORY_BYTES,
+    };
+    use n_vm_protocol::INIT_BINARY_PATH;
+    const VIRTIOFS_QUEUE_SIZE: i32 = crate::config::VIRTIOFS_QUEUE_SIZE as i32;
 
     /// Builds a representative [`TestVmParams`] for use in config builder
     /// tests.  The values are arbitrary but realistic.
@@ -511,7 +483,7 @@ mod tests {
             vm_bin_path: format!("/{}/my_test-abc123", n_vm_protocol::VM_TEST_BIN_DIR),
             bin_name: "my_test-abc123",
             test_name: "tests::my_test",
-            iommu: false,
+            vm_config: config::VmConfig::default(),
             vsock: n_vm_protocol::VsockAllocation::with_defaults(),
         }
     }
@@ -565,7 +537,7 @@ mod tests {
         let payload = build_payload_config(&params);
         let cmdline = payload.cmdline.as_deref().expect("cmdline should be set");
         assert!(
-            cmdline.contains(&format!("hugepages={VM_HUGEPAGE_COUNT}")),
+            cmdline.contains("hugepages=1"),
             "cmdline should configure hugepage count: {cmdline}",
         );
         assert!(
@@ -634,22 +606,47 @@ mod tests {
 
     #[test]
     fn memory_config_has_expected_size() {
-        let mem = build_memory_config();
+        let mem = build_memory_config(config::HostPageSize::default());
         assert_eq!(mem.size, VM_MEMORY_BYTES);
     }
 
     #[test]
-    fn memory_config_enables_hugepages_and_sharing() {
-        let mem = build_memory_config();
+    fn memory_config_enables_hugepages_and_sharing_for_1g() {
+        let mem = build_memory_config(config::HostPageSize::Huge1G);
         assert_eq!(mem.hugepages, Some(true));
-        assert_eq!(mem.hugepage_size, Some(VM_HUGEPAGE_BYTES));
+        assert_eq!(mem.hugepage_size, Some(1024 * 1024 * 1024));
         assert_eq!(
             mem.shared,
             Some(true),
             "shared memory is required for virtiofs"
         );
         assert_eq!(mem.mergeable, Some(true));
-        assert_eq!(mem.thp, Some(true));
+        assert_eq!(mem.thp, Some(false));
+    }
+
+    #[test]
+    fn memory_config_enables_hugepages_and_sharing_for_2m() {
+        let mem = build_memory_config(config::HostPageSize::Huge2M);
+        assert_eq!(mem.hugepages, Some(true));
+        assert_eq!(mem.hugepage_size, Some(2 * 1024 * 1024));
+        assert_eq!(
+            mem.shared,
+            Some(true),
+            "shared memory is required for virtiofs"
+        );
+    }
+
+    #[test]
+    fn memory_config_disables_hugepages_for_standard_pages() {
+        let mem = build_memory_config(config::HostPageSize::Standard);
+        assert_eq!(mem.hugepages, Some(false));
+        assert_eq!(mem.hugepage_size, None);
+        assert_eq!(
+            mem.shared,
+            Some(true),
+            "shared memory is required for virtiofs even without hugepages"
+        );
+        assert_eq!(mem.thp, Some(false));
     }
 
     // ── Network config ───────────────────────────────────────────────
@@ -797,10 +794,9 @@ mod tests {
 
     /// Helper that returns [`TestVmParams`] with vIOMMU enabled.
     fn sample_params_iommu() -> TestVmParams<'static> {
-        TestVmParams {
-            iommu: true,
-            ..sample_params()
-        }
+        let mut params = sample_params();
+        params.vm_config.iommu = true;
+        params
     }
 
     #[test]

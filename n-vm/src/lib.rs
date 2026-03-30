@@ -31,13 +31,16 @@
 //! over the backend.  The `#[in_vm]` proc macro selects the backend
 //! based on an optional argument:
 //!
-//! - `#[in_vm]` -- uses [`CloudHypervisor`] (the default), no vIOMMU.
+//! - `#[in_vm]` -- uses [`CloudHypervisor`] (the default).
 //! - `#[in_vm(cloud_hypervisor)]` -- same as above, explicitly.
 //! - `#[in_vm(qemu)]` -- uses [`Qemu`].
-//! - `#[in_vm(iommu)]` -- default backend with a virtual IOMMU device.
-//! - `#[in_vm(qemu, iommu)]` -- QEMU with a virtual IOMMU device.
-//! - `#[in_vm(cloud_hypervisor, iommu)]` -- cloud-hypervisor with a
-//!   virtual IOMMU device.
+//!
+//! Optional companion attributes configure the VM:
+//!
+//! - `#[hypervisor(iommu)]` -- enable virtual IOMMU.
+//! - `#[hypervisor(host_pages = "4k")]` -- 4 KiB host memory backing.
+//! - `#[guest(hugepage_size = "2m", hugepage_count = 512)]` -- guest
+//!   hugepage reservation.
 //!
 //! Callers can also substitute any backend that implements
 //! [`HypervisorBackend`] by invoking the generic functions directly.
@@ -57,6 +60,7 @@
 
 pub mod backend;
 pub mod cloud_hypervisor;
+pub mod config;
 pub mod dispatch;
 pub mod error;
 pub mod qemu;
@@ -69,10 +73,11 @@ mod vm;
 pub use abort_on_drop::AbortOnDrop;
 pub use backend::{HypervisorBackend, HypervisorVerdict, LaunchedHypervisor};
 pub use cloud_hypervisor::CloudHypervisor;
+pub use config::{GuestHugePageConfig, GuestHugePageSize, HostPageSize, VmConfig};
 pub use container::{ContainerTestResult, run_test_in_vm};
 pub use dispatch::{is_in_test_container, is_in_vm, run_container_tier, run_host_tier};
 pub use error::{ContainerError, VmError};
-pub use n_vm_macros::in_vm;
+pub use n_vm_macros::{guest, hypervisor, in_vm};
 pub use n_vm_protocol::{
     CLOUD_HYPERVISOR_BINARY_PATH, CONTAINER_PLATFORM, ENV_IN_TEST_CONTAINER, ENV_IN_VM,
     ENV_MARKER_VALUE, ENV_TEST_ROOT, ENV_VM_ROOT, HYPERVISOR_API_SOCKET_PATH, INIT_BINARY_PATH,

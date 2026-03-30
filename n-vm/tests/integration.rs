@@ -54,19 +54,22 @@ fn tmp_filesystem_in_vm_is_read_write() {
 // correctly when devices are behind DMA remapping.
 
 #[test]
-#[in_vm(iommu)]
+#[in_vm]
+#[hypervisor(iommu)]
 fn test_which_runs_in_vm_with_iommu() {
     assert_eq!(2 + 2, 4);
 }
 
 #[test]
-#[in_vm(qemu, iommu)]
+#[in_vm(qemu)]
+#[hypervisor(iommu)]
 fn test_which_runs_in_vm_with_qemu_iommu() {
     assert_eq!(2 + 2, 4);
 }
 
 #[test]
-#[in_vm(cloud_hypervisor, iommu)]
+#[in_vm(cloud_hypervisor)]
+#[hypervisor(iommu)]
 fn test_which_runs_in_vm_with_cloud_hypervisor_iommu() {
     assert_eq!(2 + 2, 4);
 }

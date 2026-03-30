@@ -5,19 +5,22 @@
 //!
 //! Both [`run_container_tier`] and [`run_host_tier`] are generic over a
 //! [`HypervisorBackend`](crate::backend::HypervisorBackend) so that the
-//! proc macro can select the backend at code-generation time.  The
-//! `#[in_vm]` macro selects the backend and VM options based on optional
-//! arguments:
+//! proc macro can select the backend at code-generation time.
+//!
+//! The `#[in_vm]` macro selects the backend, and optional companion
+//! attributes (`#[hypervisor(…)]`, `#[guest(…)]`) configure the VM:
 //!
 //! - `#[in_vm]` -- uses
 //!   [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor)
-//!   (the default), no vIOMMU.
-//! - `#[in_vm(cloud_hypervisor)]` -- same as above, explicitly.
+//!   (the default).
 //! - `#[in_vm(qemu)]` -- uses [`Qemu`](crate::qemu::Qemu).
-//! - `#[in_vm(iommu)]` -- default backend with a virtual IOMMU device.
-//! - `#[in_vm(qemu, iommu)]` -- QEMU with a virtual IOMMU device.
-//! - `#[in_vm(cloud_hypervisor, iommu)]` -- cloud-hypervisor with a
-//!   virtual IOMMU device.
+//! - `#[hypervisor(iommu)]` -- enable virtual IOMMU.
+//! - `#[hypervisor(host_pages = "4k")]` -- 4 KiB host memory backing.
+//! - `#[guest(hugepage_size = "2m", hugepage_count = 512)]` -- guest
+//!   hugepage reservation.
+//!
+//! All parsed attribute values are collected into a [`VmConfig`] that
+//! flows through the dispatch chain.
 //!
 //! The [`in_vm`](crate::in_vm) attribute macro rewrites a test function into a
 //! three-tier dispatch (host -> container -> VM guest).  Rather than generating
@@ -35,8 +38,11 @@
 //! All runtime policy (tracing configuration, tokio runtime construction,
 //! error formatting, exit-code interpretation) lives here in normal,
 //! testable Rust rather than inside `quote!` blocks.
+//!
+//! [`VmConfig`]: crate::config::VmConfig
 
 use crate::backend::HypervisorBackend;
+use crate::config::VmConfig;
 use n_vm_protocol::{ENV_IN_TEST_CONTAINER, ENV_IN_VM, ENV_MARKER_VALUE};
 
 /// Returns `true` when running inside the VM guest (Tier 3).
@@ -93,10 +99,9 @@ fn init_tracing() {
 /// default, or [`Qemu`](crate::qemu::Qemu) when `#[in_vm(qemu)]` is
 /// used.
 ///
-/// The `iommu` parameter controls whether the hypervisor backend
-/// presents a virtual IOMMU device to the guest.
-/// When `true`, devices are placed behind the vIOMMU, exercising the
-/// DMA remapping paths that DPDK/VFIO encounters in production.
+/// The `vm_config` parameter carries all VM options parsed from the
+/// `#[hypervisor(…)]` and `#[guest(…)]` attributes: host page size,
+/// guest hugepage reservation, vIOMMU, etc.
 ///
 /// The type parameter `F` is used only to derive the test name via
 /// [`std::any::type_name`]; the function value itself is never called in
@@ -108,7 +113,7 @@ fn init_tracing() {
 /// - The tokio runtime cannot be created.
 /// - The VM infrastructure returns an error.
 /// - The test running inside the VM reports failure.
-pub fn run_container_tier<B: HypervisorBackend, F: FnOnce()>(test_fn: F, iommu: bool) {
+pub fn run_container_tier<B: HypervisorBackend, F: FnOnce()>(test_fn: F, vm_config: VmConfig) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -123,7 +128,7 @@ pub fn run_container_tier<B: HypervisorBackend, F: FnOnce()>(test_fn: F, iommu: 
         let init_span = tracing::span!(tracing::Level::INFO, "hypervisor");
         let _guard = init_span.enter();
 
-        let output = crate::run_in_vm::<B, _>(test_fn, iommu)
+        let output = crate::run_in_vm::<B, _>(test_fn, vm_config)
             .await
             .unwrap_or_else(|err| panic!("VM infrastructure error: {err:#?}"));
 

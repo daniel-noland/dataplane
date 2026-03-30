@@ -201,14 +201,9 @@ impl tokio_util::codec::Decoder for AsyncJsonStreamDecoder {
     }
 }
 
-/// Duration to continue draining events after a guest panic is detected.
-///
-/// This gives the VMM time to emit subsequent lifecycle events (e.g.
-/// Shutdown, Deleted) that aid diagnosis.
-const POST_PANIC_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
-
 /// Drains remaining events from the stream for up to
-/// [`POST_PANIC_DRAIN_TIMEOUT`], appending them to `hlog`.
+/// [`config::POST_PANIC_DRAIN_TIMEOUT`](crate::config::POST_PANIC_DRAIN_TIMEOUT),
+/// appending them to `hlog`.
 ///
 /// Called after a guest panic is detected so that subsequent lifecycle
 /// events (e.g. VMM Shutdown, Deleted) are captured for diagnostics.
@@ -219,7 +214,7 @@ async fn drain_after_panic(
     >,
     hlog: &mut Vec<Event>,
 ) {
-    let drain_deadline = tokio::time::sleep(POST_PANIC_DRAIN_TIMEOUT);
+    let drain_deadline = tokio::time::sleep(crate::config::POST_PANIC_DRAIN_TIMEOUT);
     tokio::pin!(drain_deadline);
     loop {
         tokio::select! {

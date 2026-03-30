@@ -50,6 +50,7 @@ use tracing::{error, info, warn};
 
 use crate::abort_on_drop::AbortOnDrop;
 use crate::backend::{HypervisorBackend, HypervisorVerdict};
+use crate::config;
 use crate::error::VmError;
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -79,6 +80,16 @@ const VM_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Several sockets created by hypervisors and virtiofsd appear
 /// asynchronously after a process is spawned.  This helper encapsulates
 /// the retry loop.
+///
+/// The poll checks **file existence** only — it does not attempt a
+/// connection.  This is the correct choice for **single-client**
+/// servers such as virtiofsd's vhost-user socket, where a probe
+/// `connect()` would be accepted as the real client connection and
+/// break the server when the probe stream is immediately dropped.
+///
+/// For multi-client server sockets (e.g. QEMU QMP, cloud-hypervisor
+/// REST API) where a probe connection is harmless, use
+/// [`wait_for_socket_connectable`] instead.
 pub(crate) async fn wait_for_socket(path: impl AsRef<Path>) -> Result<(), VmError> {
     let path = path.as_ref();
     for _ in 0..SOCKET_POLL_MAX_ATTEMPTS {
@@ -92,6 +103,60 @@ pub(crate) async fn wait_for_socket(path: impl AsRef<Path>) -> Result<(), VmErro
                     path: path.to_path_buf(),
                     source: err,
                 });
+            }
+        }
+    }
+    Err(VmError::SocketTimeout {
+        path: path.to_path_buf(),
+        timeout: SOCKET_POLL_INTERVAL.saturating_mul(SOCKET_POLL_MAX_ATTEMPTS),
+    })
+}
+
+/// Like [`wait_for_socket`], but probes actual **connectivity** rather
+/// than just file existence.
+///
+/// A Unix socket file appears on the filesystem after `bind()` but
+/// before `listen()`.  If a caller immediately `connect()`s after the
+/// file appears, it may hit `ECONNREFUSED` in that window.  This
+/// variant retries through that gap by attempting a real connection on
+/// each poll iteration.
+///
+/// **WARNING**: Do not use this for **single-client** servers (e.g.
+/// virtiofsd's vhost-user socket).  The probe connection will be
+/// accepted as the real client; when the probe stream is dropped the
+/// server sees a client disconnect and may exit or stop accepting.
+/// Use [`wait_for_socket`] (file-existence) for those.
+#[allow(dead_code)]
+pub(crate) async fn wait_for_socket_connectable(
+    path: impl AsRef<Path>,
+) -> Result<(), VmError> {
+    let path = path.as_ref();
+    for _ in 0..SOCKET_POLL_MAX_ATTEMPTS {
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(_stream) => {
+                // Connection succeeded — the server is listening.
+                // We drop the stream immediately; we only needed to
+                // confirm the socket is ready.
+                return Ok(());
+            }
+            Err(err) => {
+                use std::io::ErrorKind;
+                match err.kind() {
+                    // Socket file does not exist yet (pre-bind).
+                    ErrorKind::NotFound |
+                    // Socket file exists but nobody is listening yet
+                    // (post-bind, pre-listen).
+                    ErrorKind::ConnectionRefused => {
+                        tokio::time::sleep(SOCKET_POLL_INTERVAL).await;
+                    }
+                    // Any other I/O error is unexpected — bail out.
+                    _ => {
+                        return Err(VmError::SocketPoll {
+                            path: path.to_path_buf(),
+                            source: err,
+                        });
+                    }
+                }
             }
         }
     }
@@ -141,11 +206,19 @@ pub(crate) async fn check_kvm_accessible() -> Result<(), VmError> {
 /// This pre-flight check runs before the hypervisor process is spawned
 /// so that the missing mount produces a clear, actionable message.
 ///
+/// When `host_page_size` is [`HostPageSize::Standard`], no hugepage
+/// mount is needed and this check succeeds immediately.
+///
 /// # Errors
 ///
 /// Returns [`VmError::HugepagesNotAccessible`] if `/dev/hugepages` does
-/// not exist or cannot be stat'd.
-pub(crate) async fn check_hugepages_accessible() -> Result<(), VmError> {
+/// not exist or cannot be stat'd and the host page size requires it.
+pub(crate) async fn check_hugepages_accessible(
+    host_page_size: config::HostPageSize,
+) -> Result<(), VmError> {
+    if !host_page_size.requires_hugepages() {
+        return Ok(());
+    }
     match tokio::fs::try_exists("/dev/hugepages").await {
         Ok(true) => Ok(()),
         Ok(false) => Err(VmError::HugepagesNotAccessible(std::io::Error::new(
@@ -591,7 +664,7 @@ impl ProcessOutput {
 /// # Usage
 ///
 /// ```ignore
-/// let params = TestVmParams { full_bin_path, bin_name, test_name };
+/// let params = TestVmParams { full_bin_path, bin_name, test_name, vm_config, .. };
 /// let vm = TestVm::<MyBackend>::launch(&params).await?;
 /// ```
 pub struct TestVmParams<'a> {
@@ -612,16 +685,14 @@ pub struct TestVmParams<'a> {
     pub bin_name: &'a str,
     /// Fully-qualified test name (e.g. `module::test_name`).
     pub test_name: &'a str,
-    /// Whether to present a virtual IOMMU device to the guest.
+    /// VM configuration controlling hypervisor memory backing, guest
+    /// hugepage reservation, and virtual IOMMU.
     ///
-    /// When `true`, the hypervisor backend will configure a virtual IOMMU
-    /// (virtio-iommu for cloud-hypervisor, Intel IOMMU for QEMU) and
-    /// place virtio devices behind it.  This exercises the same DMA
-    /// remapping paths that DPDK/VFIO encounters in production.
-    ///
-    /// When `false` (the default), no virtual IOMMU is configured and
-    /// devices use direct DMA.
-    pub iommu: bool,
+    /// All fields have [`Default`] values matching the pre-refactor
+    /// behaviour (1 GiB host hugepages, one 1 GiB guest hugepage, no
+    /// vIOMMU).  The `#[in_vm]` proc macro constructs this from
+    /// `#[hypervisor(…)]` and `#[guest(…)]` attributes.
+    pub vm_config: config::VmConfig,
     /// Dynamically-allocated vsock resources for this VM instance.
     ///
     /// Vsock CIDs and `AF_VSOCK` port bindings are **host-global** (not
@@ -817,6 +888,15 @@ impl<B: HypervisorBackend> TestVm<B> {
     /// automatically aborted when their handles drop.  Child processes use
     /// `kill_on_drop(true)` for the same guarantee.
     pub async fn launch(params: &TestVmParams<'_>) -> Result<Self, VmError> {
+        // Validate memory alignment before any process spawning so that
+        // misconfigurations (e.g. 1 GiB host page size with a non-GiB-
+        // aligned VM memory size) produce a clear message rather than an
+        // opaque hypervisor crash.
+        params
+            .vm_config
+            .validate_memory_alignment()
+            .unwrap_or_else(|msg| panic!("VM configuration error: {msg}"));
+
         // Run pre-flight diagnostics on the vmroot filesystem before
         // starting virtiofsd.  This catches common misconfigurations
         // (empty /nix/store bind mount, missing /dev directory, broken
@@ -824,7 +904,26 @@ impl<B: HypervisorBackend> TestVm<B> {
         // the VM kernel-panic with a cryptic ENOEXEC.
         diagnose_vmroot_share().await;
 
-        let virtiofsd = Self::launch_virtiofsd(VM_ROOT_SHARE_PATH).await?;
+        let mut virtiofsd = Self::launch_virtiofsd(VM_ROOT_SHARE_PATH).await?;
+
+        // virtiofsd creates its Unix socket asynchronously after the
+        // process starts.  Both hypervisor backends reference this socket
+        // at launch time -- QEMU connects to it via `-chardev socket,…`
+        // during process startup, and cloud-hypervisor connects during
+        // `boot_vm()` when it initialises the vhost-user-fs device.  If
+        // we proceed before the socket exists, the hypervisor fails with
+        // an opaque error (QEMU: SocketTimeout on the QMP socket because
+        // QEMU exits immediately; cloud-hypervisor: "Cannot create
+        // virtio-fs device" / "Connection to socket failed").
+        if let Err(err) = wait_for_socket(VIRTIOFSD_SOCKET_PATH).await {
+            // virtiofsd most likely exited before creating its socket.
+            // Capture its stderr to surface the actual failure reason
+            // (e.g. a missing capability, AppArmor denial, or permission
+            // error) instead of just reporting a socket timeout.
+            config::drain_child_stderr(&mut virtiofsd, "virtiofsd").await;
+            return Err(err);
+        }
+
         // All listeners must be bound *before* the VM boots so that the
         // guest-side vsock connections succeed immediately.  The listener
         // type is backend-specific: cloud-hypervisor uses Unix sockets,
@@ -1071,7 +1170,7 @@ fn allocate_vsock_resources() -> VsockAllocation {
 /// [`TestVm::collect`].
 pub async fn run_in_vm<B: HypervisorBackend, F: FnOnce()>(
     _: F,
-    iommu: bool,
+    vm_config: config::VmConfig,
 ) -> Result<VmTestOutput<B>, VmError> {
     let identity = crate::test_identity::TestIdentity::resolve::<F>();
     let test_name = identity.test_name;
@@ -1094,7 +1193,7 @@ pub async fn run_in_vm<B: HypervisorBackend, F: FnOnce()>(
         vm_bin_path,
         bin_name,
         test_name,
-        iommu,
+        vm_config,
         vsock,
     };
 

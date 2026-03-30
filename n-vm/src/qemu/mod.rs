@@ -55,98 +55,22 @@ pub use self::error::QemuError;
 
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
 
 use n_vm_protocol::{
-    HYPERVISOR_API_SOCKET_PATH, INIT_BINARY_PATH, KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH,
+    HYPERVISOR_API_SOCKET_PATH, KERNEL_CONSOLE_SOCKET_PATH, KERNEL_IMAGE_PATH,
     QEMU_BINARY_PATH, VIRTIOFS_ROOT_TAG, VIRTIOFSD_SOCKET_PATH, VsockAllocation, VsockChannel,
 };
-use tokio::io::AsyncReadExt;
 use tracing::{debug, error, warn};
 
 use crate::abort_on_drop::AbortOnDrop;
 use crate::backend::{HypervisorBackend, HypervisorVerdict, LaunchedHypervisor};
+use crate::config;
 use crate::error::VmError;
 use crate::vm::{TestVmParams, check_hugepages_accessible, check_kvm_accessible, wait_for_socket};
 
 use self::qmp::{EventDisplay, QmpCommandName, QmpConnection, QmpEventStream, QmpWriter};
 
-// ── Constants ────────────────────────────────────────────────────────
-//
-// These mirror the constants in the cloud_hypervisor module.  Both
-// backends run the same test environment, so the VM configuration must
-// match.  A shared configuration module would eliminate the duplication;
-// for now, keeping them backend-local avoids coupling the two modules.
 
-/// Total guest memory in MiB (1 GiB).
-///
-/// Must be a multiple of the host hugepage size.  The development
-/// machines use 1 GiB hugepages, so the minimum (and default) is 1 GiB.
-/// Matches the cloud-hypervisor backend's `VM_MEMORY_BYTES / 1 MiB`.
-const VM_MEMORY_MIB: u32 = 1024;
-
-/// Number of 1 GiB hugepages to reserve on the guest kernel command line.
-const VM_HUGEPAGE_COUNT: u32 = 1;
-
-/// Number of vCPUs.
-const VM_VCPUS: u32 = 6;
-
-/// Threads per core in the CPU topology.
-const VM_THREADS_PER_CORE: u32 = 2;
-
-/// Cores per die in the CPU topology.
-const VM_CORES_PER_DIE: u32 = 1;
-
-/// Dies per socket in the CPU topology.
-const VM_DIES_PER_SOCKET: u32 = 3;
-
-/// Sockets in the CPU topology.
-const VM_SOCKETS: u32 = 1;
-
-/// Virtio queue depth for the virtiofs filesystem device.
-const VIRTIOFS_QUEUE_SIZE: u32 = 1024;
-
-/// Initial buffer capacity for vsock reader tasks.
-const VSOCK_READER_CAPACITY: usize = 32_768;
-
-/// Duration to continue draining QMP events after a guest panic is
-/// detected.
-///
-/// This matches the cloud-hypervisor backend's `POST_PANIC_DRAIN_TIMEOUT`.
-const POST_PANIC_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
-
-// ── Network interface descriptors ────────────────────────────────────
-
-/// Describes a network interface for QEMU CLI argument generation.
-struct NetIface {
-    /// Unique identifier used in netdev and device arguments.
-    id: &'static str,
-    /// TAP device name on the host.
-    tap: &'static str,
-    /// MAC address in `XX:XX:XX:XX:XX:XX` format.
-    mac: &'static str,
-}
-
-/// The management network interface (standard Ethernet MTU).
-const IFACE_MGMT: NetIface = NetIface {
-    id: "mgmt",
-    tap: "mgmt",
-    mac: "02:DE:AD:BE:EF:01",
-};
-
-/// First fabric-facing network interface (jumbo MTU).
-const IFACE_FABRIC1: NetIface = NetIface {
-    id: "fabric1",
-    tap: "fabric1",
-    mac: "02:CA:FE:BA:BE:01",
-};
-
-/// Second fabric-facing network interface (jumbo MTU).
-const IFACE_FABRIC2: NetIface = NetIface {
-    id: "fabric2",
-    tap: "fabric2",
-    mac: "02:CA:FE:BA:BE:02",
-};
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -255,8 +179,7 @@ impl HypervisorBackend for Qemu {
             })?;
 
         Ok(AbortOnDrop::spawn(async move {
-            let mut buf = Vec::with_capacity(VSOCK_READER_CAPACITY);
-            let mut connection = match listener.accept().await {
+            let connection = match listener.accept().await {
                 Ok((stream, _)) => stream,
                 Err(e) => {
                     error!("failed to accept {label} vsock connection: {e}");
@@ -266,17 +189,7 @@ impl HypervisorBackend for Qemu {
                     );
                 }
             };
-            loop {
-                match connection.read_buf(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("error reading {label} vsock stream: {e}");
-                        break;
-                    }
-                }
-            }
-            String::from_utf8_lossy(&buf).into_owned()
+            config::read_vsock_stream(connection, label).await
         }))
     }
 }
@@ -333,7 +246,7 @@ async fn watch_events(mut stream: QmpEventStream) -> (Vec<qapi_qmp::Event>, Hype
 /// This gives QEMU time to emit subsequent events (e.g. `SHUTDOWN`) that
 /// aid diagnosis.
 async fn drain_after_panic(stream: &mut QmpEventStream, log: &mut Vec<qapi_qmp::Event>) {
-    let deadline = tokio::time::sleep(POST_PANIC_DRAIN_TIMEOUT);
+    let deadline = tokio::time::sleep(config::POST_PANIC_DRAIN_TIMEOUT);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
@@ -408,7 +321,7 @@ async fn spawn_qemu_process(
     params: &TestVmParams<'_>,
 ) -> Result<(tokio::process::Child, QmpConnection), VmError> {
     check_kvm_accessible().await?;
-    check_hugepages_accessible().await?;
+    check_hugepages_accessible(params.vm_config.host_page_size).await?;
 
     let args = build_qemu_args(params);
 
@@ -428,51 +341,20 @@ async fn spawn_qemu_process(
     // can see why QEMU crashed rather than just "Connection reset by peer".
     let socket_result = wait_for_socket(HYPERVISOR_API_SOCKET_PATH).await;
     if let Err(err) = socket_result {
-        drain_child_stderr(&mut child).await;
+        config::drain_child_stderr(&mut child, "QEMU").await;
         return Err(err);
     }
 
     match QmpConnection::connect(HYPERVISOR_API_SOCKET_PATH).await {
         Ok(qmp) => Ok((child, qmp)),
         Err(qmp_err) => {
-            drain_child_stderr(&mut child).await;
+            config::drain_child_stderr(&mut child, "QEMU").await;
             Err(qmp_err.into())
         }
     }
 }
 
-/// Best-effort drain of a QEMU child process's stderr, logged at `error`
-/// level.
-///
-/// Called when the QMP socket or connection phase fails so that the
-/// developer can see QEMU's actual error output (e.g. "can't open
-/// backing store /dev/hugepages for guest RAM: ...") instead of just a
-/// cryptic "Connection reset by peer" or socket timeout.
-async fn drain_child_stderr(child: &mut tokio::process::Child) {
-    // Give QEMU a moment to flush its output before we kill it.
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    if let Some(mut stderr) = child.stderr.take() {
-        let mut buf = String::with_capacity(4096);
-        match tokio::time::timeout(Duration::from_secs(2), stderr.read_to_string(&mut buf)).await {
-            Ok(Ok(_)) if !buf.is_empty() => {
-                error!("QEMU stderr (captured after launch failure):\n{buf}");
-            }
-            Ok(Ok(_)) => {
-                warn!("QEMU stderr was empty after launch failure");
-            }
-            Ok(Err(e)) => {
-                warn!("failed to read QEMU stderr: {e}");
-            }
-            Err(_) => {
-                warn!("timed out reading QEMU stderr");
-                if !buf.is_empty() {
-                    error!("QEMU stderr (partial, timed out):\n{buf}");
-                }
-            }
-        }
-    }
-}
 
 // ── CLI argument builders ────────────────────────────────────────────
 //
@@ -485,11 +367,11 @@ async fn drain_child_stderr(child: &mut tokio::process::Child) {
 
 /// Builds the complete QEMU argument vector for a test run.
 fn build_qemu_args(params: &TestVmParams<'_>) -> Vec<String> {
-    let iommu = params.iommu;
+    let iommu = params.vm_config.iommu;
     let mut args = Vec::with_capacity(64);
     push_machine_args(&mut args, iommu);
     push_cpu_args(&mut args);
-    push_memory_args(&mut args);
+    push_memory_args(&mut args, params.vm_config.host_page_size);
     push_iommu_args(&mut args, iommu);
     push_kernel_args(&mut args, params);
     push_fs_args(&mut args);
@@ -531,31 +413,51 @@ fn push_cpu_args(args: &mut Vec<String>) {
     args.extend([
         "-smp".into(),
         format!(
-            "{VM_VCPUS},sockets={VM_SOCKETS},dies={VM_DIES_PER_SOCKET},\
-             cores={VM_CORES_PER_DIE},threads={VM_THREADS_PER_CORE}"
+            "{vcpus},sockets={sockets},dies={dies},\
+             cores={cores},threads={threads}",
+            vcpus = config::VM_VCPUS,
+            sockets = config::VM_SOCKETS,
+            dies = config::VM_DIES_PER_PACKAGE,
+            cores = config::VM_CORES_PER_DIE,
+            threads = config::VM_THREADS_PER_CORE,
         ),
     ]);
 }
 
 /// Memory configuration with hugepage backing and sharing.
+/// Shared memory backend with optional hugepage backing.
 ///
-/// Uses a `memory-backend-file` object backed by `/dev/hugepages` with
-/// `share=on` (required for virtiofs / vhost-user-fs-pci) and
-/// `prealloc=on` (ensures hugepages are allocated at VM start rather
-/// than on first access).
+/// - [`Standard`](config::HostPageSize::Standard) -- uses
+///   `memory-backend-memfd` with `share=on`.  No hugetlbfs mount
+///   required.
+/// - [`Huge2M`](config::HostPageSize::Huge2M) /
+///   [`Huge1G`](config::HostPageSize::Huge1G) -- uses
+///   `memory-backend-file` backed by `/dev/hugepages` with `share=on`
+///   and `prealloc=on` (ensures hugepages are allocated at VM start
+///   rather than on first access).
+///
+/// `share=on` is always set because virtiofsd (vhost-user-fs-pci)
+/// requires `MAP_SHARED` memory to access the guest address space from
+/// a separate process.
 ///
 /// The `-numa node,memdev=mem0` argument assigns the memory backend to
 /// a NUMA node, which is how QEMU associates a memory backend with the
 /// guest's address space.
-fn push_memory_args(args: &mut Vec<String>) {
+fn push_memory_args(args: &mut Vec<String>, host_page_size: config::HostPageSize) {
+    let mib = config::VM_MEMORY_MIB;
+    let backend = if host_page_size.requires_hugepages() {
+        format!(
+            "memory-backend-file,id=mem0,size={mib}M,\
+             mem-path=/dev/hugepages,share=on,prealloc=on"
+        )
+    } else {
+        format!("memory-backend-memfd,id=mem0,size={mib}M,share=on")
+    };
     args.extend([
         "-m".into(),
-        format!("{VM_MEMORY_MIB}M"),
+        format!("{mib}M"),
         "-object".into(),
-        format!(
-            "memory-backend-file,id=mem0,size={VM_MEMORY_MIB}M,\
-             mem-path=/dev/hugepages,share=on,prealloc=on"
-        ),
+        backend,
         "-numa".into(),
         "node,memdev=mem0".into(),
     ]);
@@ -597,28 +499,21 @@ fn push_iommu_args(args: &mut Vec<String>, iommu: bool) {
 
 /// Kernel image and command line.
 ///
-/// The kernel command line passes the test binary path and name to the
-/// init system, matching the cloud-hypervisor backend exactly.
+/// The kernel command line is built by [`config::build_kernel_cmdline`],
+/// shared with the cloud-hypervisor backend to ensure both backends
+/// present an identical guest environment.
+///
+/// When `params.vm_config.iommu` is `true`, the VFIO no-IOMMU escape
+/// hatch is omitted so that VFIO is forced to use the virtual IOMMU
+/// for DMA remapping — which is the purpose of the vIOMMU test
+/// configuration.
 fn push_kernel_args(args: &mut Vec<String>, params: &TestVmParams<'_>) {
-    let vsock_cmdline = params.vsock.kernel_cmdline_fragment();
-    let cmdline = format!(
-        "iommu=on \
-         intel_iommu=on \
-         amd_iommu=on \
-         vfio.enable_unsafe_noiommu_mode=1 \
-         earlyprintk=ttyS0 \
-         console=ttyS0 \
-         ro \
-         rootfstype=virtiofs \
-         root=root \
-         default_hugepagesz=1G \
-         hugepagesz=1G \
-         hugepages={VM_HUGEPAGE_COUNT} \
-         {vsock_cmdline} \
-         init={INIT_BINARY_PATH} \
-         -- {vm_bin_path} {test_name} --exact --no-capture --format=terse",
-        vm_bin_path = params.vm_bin_path,
-        test_name = params.test_name,
+    let cmdline = config::build_kernel_cmdline(
+        &params.vm_bin_path,
+        params.test_name,
+        &params.vsock,
+        params.vm_config.iommu,
+        &params.vm_config.guest_hugepages,
     );
 
     args.extend([
@@ -646,21 +541,21 @@ fn push_fs_args(args: &mut Vec<String>) {
         format!("socket,id=virtiofs0,path={VIRTIOFSD_SOCKET_PATH}"),
         "-device".into(),
         format!(
-            "vhost-user-fs-pci,queue-size={VIRTIOFS_QUEUE_SIZE},\
-             chardev=virtiofs0,tag={VIRTIOFS_ROOT_TAG}"
+            "vhost-user-fs-pci,queue-size={qs},\
+             chardev=virtiofs0,tag={VIRTIOFS_ROOT_TAG}",
+            qs = config::VIRTIOFS_QUEUE_SIZE,
         ),
     ]);
 }
 
 /// Vsock device for guest-to-host communication.
 ///
-/// Uses `vhost-vsock-pci` with the kernel's vhost-vsock module.
+/// Always uses `vhost-vsock-pci-non-transitional` (virtio 1.0+ only)
+/// because the test environment targets modern kernels and there is no
+/// need to exercise the legacy virtio transport path.
 ///
-/// When `iommu` is `true`, uses `vhost-vsock-pci-non-transitional`
-/// (virtio 1.0+ only) with `iommu_platform=on,ats=on` so that vsock
-/// I/O is routed through the virtual IOMMU.  The transitional
-/// `vhost-vsock-pci` device does not support `VIRTIO_F_IOMMU_PLATFORM`,
-/// which is a modern-only feature.
+/// When `iommu` is `true`, adds `iommu_platform=on,ats=on` so that
+/// vsock I/O is routed through the virtual IOMMU.
 ///
 /// # Limitations
 ///
@@ -669,15 +564,15 @@ fn push_fs_args(args: &mut Vec<String>) {
 /// host), while the [`TestVm`](crate::vm::TestVm) infrastructure
 /// expects Unix sockets at `$VHOST_SOCKET_$PORT` paths.
 fn push_vsock_args(args: &mut Vec<String>, vsock: &VsockAllocation, iommu: bool) {
-    let (device, iommu_suffix) = if iommu {
-        ("vhost-vsock-pci-non-transitional", ",iommu_platform=on,ats=on")
+    let iommu_suffix = if iommu {
+        ",iommu_platform=on,ats=on"
     } else {
-        ("vhost-vsock-pci", "")
+        ""
     };
     args.extend([
         "-device".into(),
         format!(
-            "{device},guest-cid={}{iommu_suffix}",
+            "vhost-vsock-pci-non-transitional,guest-cid={}{iommu_suffix}",
             vsock.cid.as_raw()
         ),
     ]);
@@ -703,12 +598,12 @@ fn push_vsock_args(args: &mut Vec<String>, vsock: &VsockAllocation, iommu: bool)
 /// `virtio-net-pci` device does not support `VIRTIO_F_IOMMU_PLATFORM`,
 /// which is a modern-only feature.
 fn push_network_args(args: &mut Vec<String>, iommu: bool) {
-    let (device, iommu_suffix) = if iommu {
-        ("virtio-net-pci-non-transitional", ",iommu_platform=on,ats=on")
+    let iommu_suffix = if iommu {
+        ",iommu_platform=on,ats=on"
     } else {
-        ("virtio-net-pci", "")
+        ""
     };
-    for iface in [&IFACE_MGMT, &IFACE_FABRIC1, &IFACE_FABRIC2] {
+    for iface in config::ALL_IFACES {
         args.extend([
             "-netdev".into(),
             format!(
@@ -718,7 +613,7 @@ fn push_network_args(args: &mut Vec<String>, iommu: bool) {
             ),
             "-device".into(),
             format!(
-                "{device},netdev=nd-{id},mac={mac}{iommu_suffix}",
+                "virtio-net-pci-non-transitional,netdev=nd-{id},mac={mac}{iommu_suffix}",
                 id = iface.id,
                 mac = iface.mac,
             ),
@@ -801,6 +696,10 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::config::VM_MEMORY_MIB;
+    use n_vm_protocol::INIT_BINARY_PATH;
+
+    const VIRTIOFS_QUEUE_SIZE: u32 = crate::config::VIRTIOFS_QUEUE_SIZE;
 
     /// Builds a representative [`TestVmParams`] for use in CLI builder
     /// tests.  The values are arbitrary but realistic.
@@ -810,7 +709,7 @@ mod tests {
             vm_bin_path: format!("/{}/my_test-abc123", n_vm_protocol::VM_TEST_BIN_DIR),
             bin_name: "my_test-abc123",
             test_name: "module::test_name",
-            iommu: false,
+            vm_config: config::VmConfig::default(),
             vsock: n_vm_protocol::VsockAllocation::with_defaults(),
         }
     }
@@ -850,15 +749,15 @@ mod tests {
     #[test]
     fn memory_args_set_ram_size() {
         let mut args = Vec::new();
-        push_memory_args(&mut args);
+        push_memory_args(&mut args, config::HostPageSize::default());
         let idx = args.iter().position(|a| a == "-m").unwrap();
         assert_eq!(args[idx + 1], format!("{VM_MEMORY_MIB}M"));
     }
 
     #[test]
-    fn memory_args_use_hugepages_with_sharing() {
+    fn memory_args_use_hugepages_with_sharing_for_1g() {
         let mut args = Vec::new();
-        push_memory_args(&mut args);
+        push_memory_args(&mut args, config::HostPageSize::Huge1G);
         let obj = args
             .iter()
             .find(|a| a.starts_with("memory-backend-file"))
@@ -870,9 +769,37 @@ mod tests {
     }
 
     #[test]
+    fn memory_args_use_hugepages_with_sharing_for_2m() {
+        let mut args = Vec::new();
+        push_memory_args(&mut args, config::HostPageSize::Huge2M);
+        let obj = args
+            .iter()
+            .find(|a| a.starts_with("memory-backend-file"))
+            .unwrap();
+        assert!(obj.contains("mem-path=/dev/hugepages"), "{obj}");
+        assert!(obj.contains("share=on"), "{obj}");
+        assert!(obj.contains("prealloc=on"), "{obj}");
+    }
+
+    #[test]
+    fn memory_args_use_memfd_for_standard_pages() {
+        let mut args = Vec::new();
+        push_memory_args(&mut args, config::HostPageSize::Standard);
+        let obj = args
+            .iter()
+            .find(|a| a.starts_with("memory-backend-memfd"))
+            .expect("standard pages should use memory-backend-memfd");
+        assert!(obj.contains("share=on"), "{obj}");
+        assert!(
+            !obj.contains("hugepages"),
+            "standard pages should not reference hugepages: {obj}"
+        );
+    }
+
+    #[test]
     fn memory_args_include_numa_node() {
         let mut args = Vec::new();
-        push_memory_args(&mut args);
+        push_memory_args(&mut args, config::HostPageSize::default());
         assert!(args.contains(&"node,memdev=mem0".to_string()));
     }
 
@@ -921,7 +848,7 @@ mod tests {
         assert!(cmdline.contains("default_hugepagesz=1G"), "{cmdline}");
         assert!(cmdline.contains("hugepagesz=1G"), "{cmdline}");
         assert!(
-            cmdline.contains(&format!("hugepages={VM_HUGEPAGE_COUNT}")),
+            cmdline.contains("hugepages=1"),
             "{cmdline}"
         );
     }
@@ -999,7 +926,7 @@ mod tests {
         let netdev_count = args.iter().filter(|a| a.starts_with("tap,")).count();
         let device_count = args
             .iter()
-            .filter(|a| a.starts_with("virtio-net-pci,"))
+            .filter(|a| a.starts_with("virtio-net-pci-non-transitional,"))
             .count();
         assert_eq!(netdev_count, 3);
         assert_eq!(device_count, 3);
@@ -1127,10 +1054,9 @@ mod tests {
 
     /// Helper that returns [`TestVmParams`] with vIOMMU enabled.
     fn sample_params_iommu() -> TestVmParams<'static> {
-        TestVmParams {
-            iommu: true,
-            ..sample_params()
-        }
+        let mut params = sample_params();
+        params.vm_config.iommu = true;
+        params
     }
 
     #[test]
@@ -1243,7 +1169,7 @@ mod tests {
         push_vsock_args(&mut args, &vsock, false);
         let device = args
             .iter()
-            .find(|a| a.starts_with("vhost-vsock-pci,"))
+            .find(|a| a.starts_with("vhost-vsock-pci-non-transitional,"))
             .unwrap();
         assert!(
             !device.contains("iommu_platform"),

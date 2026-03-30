@@ -5,8 +5,10 @@
 
 //! Proc macro crate for the `n-vm` test infrastructure.
 //!
-//! This crate provides the [`in_vm`] attribute macro, which rewrites a test
-//! function so that it transparently runs inside an ephemeral virtual machine.
+//! This crate provides the [`in_vm`] attribute macro and its companion
+//! attributes [`hypervisor`] and [`guest`], which together rewrite a
+//! test function so that it transparently runs inside an ephemeral
+//! virtual machine.
 //!
 //! # Architecture
 //!
@@ -34,54 +36,66 @@
 //!
 //! # Backend selection
 //!
-//! The macro accepts optional arguments to select the hypervisor backend
-//! and VM options:
+//! The `#[in_vm]` attribute accepts an optional backend identifier:
 //!
-//! | Attribute | Backend | vIOMMU |
-//! |-----------|---------|--------|
-//! | `#[in_vm]` | [`CloudHypervisor`] (default) | off |
-//! | `#[in_vm(cloud_hypervisor)]` | [`CloudHypervisor`] (explicit) | off |
-//! | `#[in_vm(qemu)]` | [`Qemu`] | off |
-//! | `#[in_vm(iommu)]` | [`CloudHypervisor`] (default) | **on** |
-//! | `#[in_vm(qemu, iommu)]` | [`Qemu`] | **on** |
-//! | `#[in_vm(cloud_hypervisor, iommu)]` | [`CloudHypervisor`] | **on** |
+//! | Attribute | Backend |
+//! |-----------|---------|
+//! | `#[in_vm]` | [`CloudHypervisor`] (default) |
+//! | `#[in_vm(cloud_hypervisor)]` | [`CloudHypervisor`] (explicit) |
+//! | `#[in_vm(qemu)]` | [`Qemu`] |
 //!
-//! The backend and option identifiers are case-sensitive and must match
-//! one of the supported values exactly.
-//! Any other identifier produces a compile error listing the valid
-//! options.
+//! # VM configuration
+//!
+//! Two optional companion attributes configure the VM environment.
+//! They must appear **below** `#[in_vm]` on the same function so that
+//! the `#[in_vm]` proc macro can consume them before the compiler
+//! attempts to expand them independently.
+//!
+//! ## `#[hypervisor(…)]` -- hypervisor configuration
+//!
+//! | Option | Values | Default | Description |
+//! |--------|--------|---------|-------------|
+//! | `iommu` | *(flag)* | off | Present a virtual IOMMU device |
+//! | `host_pages` | `"4k"`, `"2m"`, `"1g"` | `"1g"` | Page size backing VM memory on the host |
+//!
+//! ## `#[guest(…)]` -- guest kernel configuration
+//!
+//! | Option | Values | Default | Description |
+//! |--------|--------|---------|-------------|
+//! | `hugepage_size` | `"none"`, `"2m"`, `"1g"` | `"1g"` | Guest hugepage reservation size |
+//! | `hugepage_count` | integer | `1` | Number of guest hugepages to reserve |
+//!
+//! When `hugepage_size = "none"`, guest hugepages are disabled entirely
+//! (DPDK must use `--no-huge`), and `hugepage_count` must not be
+//! specified.
 //!
 //! # Usage
 //!
 //! ```ignore
 //! use n_vm::in_vm;
 //!
+//! // All defaults: cloud-hypervisor, 1G host pages, 1G×1 guest hugepages
 //! #[test]
 //! #[in_vm]
-//! fn my_test_on_default_backend() {
-//!     // This body runs inside an ephemeral VM (cloud-hypervisor).
+//! fn test_defaults() {
 //!     assert!(std::path::Path::new("/proc").exists());
 //! }
 //!
+//! // QEMU backend, 4K host pages (no hugepages on host), 2M×512 guest
+//! // hugepages, virtual IOMMU enabled.
 //! #[test]
 //! #[in_vm(qemu)]
-//! fn my_test_on_qemu() {
-//!     // This body runs inside an ephemeral VM (QEMU).
+//! #[hypervisor(iommu, host_pages = "4k")]
+//! #[guest(hugepage_size = "2m", hugepage_count = 512)]
+//! fn test_dpdk_2m_on_qemu() {
 //!     assert!(std::path::Path::new("/proc").exists());
 //! }
 //!
+//! // Default backend, no guest hugepages (DPDK --no-huge mode)
 //! #[test]
-//! #[in_vm(iommu)]
-//! fn my_dpdk_test_with_viommu() {
-//!     // Runs on the default backend with a virtual IOMMU device
-//!     // presented to the guest, exercising DMA remapping paths.
-//!     assert!(std::path::Path::new("/proc").exists());
-//! }
-//!
-//! #[test]
-//! #[in_vm(qemu, iommu)]
-//! fn my_dpdk_test_on_qemu_with_viommu() {
-//!     // Runs on QEMU with Intel IOMMU emulation enabled.
+//! #[in_vm]
+//! #[guest(hugepage_size = "none")]
+//! fn test_dpdk_no_huge() {
 //!     assert!(std::path::Path::new("/proc").exists());
 //! }
 //! ```
@@ -95,6 +109,8 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{ReturnType, parse_macro_input};
 
+// ── Backend configuration ────────────────────────────────────────────
+
 /// Recognised backend identifiers and their corresponding type paths.
 ///
 /// Each entry maps a user-facing identifier (the string written inside
@@ -105,14 +121,17 @@ const KNOWN_BACKENDS: &[(&str, &str)] = &[
     ("qemu", "::n_vm::Qemu"),
 ];
 
-/// Recognised option identifiers that are not backend names.
-///
-/// These are parsed from the comma-separated attribute argument list
-/// alongside (or instead of) a backend identifier.
-const KNOWN_OPTIONS: &[&str] = &["iommu"];
-
 /// The type path used when no backend is specified (`#[in_vm]`).
 const DEFAULT_BACKEND_PATH: &str = "::n_vm::CloudHypervisor";
+
+/// Recognised option identifiers that have migrated from `#[in_vm]` to
+/// companion attributes.
+///
+/// When one of these appears inside `#[in_vm(…)]`, the macro emits a
+/// helpful compile error pointing the user to the new attribute syntax.
+const MIGRATED_OPTIONS: &[(&str, &str)] = &[
+    ("iommu", "#[hypervisor(iommu)]"),
+];
 
 /// Builds a human-readable list of valid backend identifiers for use in
 /// error messages.
@@ -120,16 +139,6 @@ fn known_backend_list() -> String {
     KNOWN_BACKENDS
         .iter()
         .map(|(name, _)| format!("`{name}`"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Builds a human-readable list of valid option identifiers for use in
-/// error messages.
-fn known_option_list() -> String {
-    KNOWN_OPTIONS
-        .iter()
-        .map(|name| format!("`{name}`"))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -144,47 +153,36 @@ fn resolve_backend(ident: &str) -> Option<&'static str> {
         .map(|(_, path)| *path)
 }
 
-/// Returns `true` if `ident` is a recognised option (not a backend).
-fn is_known_option(ident: &str) -> bool {
-    KNOWN_OPTIONS.contains(&ident)
+/// If `ident` is a migrated option, returns the migration hint.
+fn migration_hint(ident: &str) -> Option<&'static str> {
+    MIGRATED_OPTIONS
+        .iter()
+        .find(|(name, _)| *name == ident)
+        .map(|(_, hint)| *hint)
 }
 
-/// Parsed attribute arguments for `#[in_vm(...)]`.
-struct InVmArgs {
-    /// The resolved backend type path token stream.
-    backend_path: proc_macro2::TokenStream,
-    /// Whether the `iommu` option was specified.
-    iommu: bool,
-}
+// ── #[in_vm] argument parsing ────────────────────────────────────────
 
-/// Parses a comma-separated list of identifiers from the attribute
-/// arguments.
+/// Parses the `#[in_vm(…)]` attribute arguments, which now contain
+/// **only** the backend selector (zero or one identifier).
 ///
-/// Accepts zero or more identifiers separated by commas.
-/// At most one backend identifier is allowed (and it must appear first
-/// if present).
-/// The `iommu` option may appear in any position.
+/// Returns the resolved backend type path as a token stream.
 ///
 /// # Errors
 ///
 /// Returns a compile error if:
 /// - A non-identifier token is encountered.
-/// - An identifier is not a recognised backend or option.
-/// - A backend identifier appears after an option.
-/// - Multiple backend identifiers are specified.
-fn parse_in_vm_args(attr: TokenStream) -> Result<InVmArgs, TokenStream> {
+/// - The identifier is not a recognised backend.
+/// - More than one backend identifier is specified.
+/// - A migrated option (e.g. `iommu`) is used in `#[in_vm(…)]`.
+fn parse_in_vm_backend(attr: TokenStream) -> Result<proc_macro2::TokenStream, TokenStream> {
     if attr.is_empty() {
-        return Ok(InVmArgs {
-            backend_path: DEFAULT_BACKEND_PATH
-                .parse()
-                .expect("DEFAULT_BACKEND_PATH is a valid token stream"),
-            iommu: false,
-        });
+        return Ok(DEFAULT_BACKEND_PATH
+            .parse()
+            .expect("DEFAULT_BACKEND_PATH is a valid token stream"));
     }
 
     // Parse as a punctuated list of identifiers separated by commas.
-    // `Punctuated` does not implement `Parse` directly, so we use its
-    // `parse_terminated` method via the `Parser` trait.
     use syn::parse::Parser;
     let parser = syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated;
     let punctuated = match parser.parse(attr) {
@@ -193,10 +191,9 @@ fn parse_in_vm_args(attr: TokenStream) -> Result<InVmArgs, TokenStream> {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
                 format!(
-                    "#[in_vm] expects a comma-separated list of identifiers; \
-                     valid backends are: {}; valid options are: {}",
+                    "#[in_vm] expects an optional backend identifier; \
+                     valid backends are: {}",
                     known_backend_list(),
-                    known_option_list(),
                 ),
             )
             .to_compile_error()
@@ -206,116 +203,362 @@ fn parse_in_vm_args(attr: TokenStream) -> Result<InVmArgs, TokenStream> {
 
     let idents: Vec<syn::Ident> = punctuated.into_iter().collect();
 
-    let mut backend_path: Option<proc_macro2::TokenStream> = None;
-    let mut iommu = false;
-    let mut backend_seen = false;
-
-    for ident in &idents {
-        let ident_str = ident.to_string();
-
-        if let Some(path) = resolve_backend(&ident_str) {
-            if backend_seen {
-                return Err(syn::Error::new_spanned(
-                    ident,
-                    "only one backend identifier is allowed in #[in_vm]",
-                )
-                .to_compile_error()
-                .into());
-            }
-            // A backend identifier must appear before any options so that
-            // the attribute reads naturally as `#[in_vm(backend, opts...)]`.
-            if iommu {
-                return Err(syn::Error::new_spanned(
-                    ident,
-                    "the backend identifier must appear before options in #[in_vm]; \
-                     use e.g. #[in_vm(qemu, iommu)]",
-                )
-                .to_compile_error()
-                .into());
-            }
-            backend_path = Some(
-                path.parse()
-                    .expect("KNOWN_BACKENDS paths are valid token streams"),
-            );
-            backend_seen = true;
-        } else if ident_str == "iommu" {
-            if iommu {
-                return Err(
-                    syn::Error::new_spanned(ident, "duplicate `iommu` option in #[in_vm]")
-                        .to_compile_error()
-                        .into(),
-                );
-            }
-            iommu = true;
-        } else if is_known_option(&ident_str) {
-            // Future-proofing: if we add more options, handle them here.
-            // For now, `iommu` is the only option, so this branch is
-            // unreachable.
-            unreachable!("unhandled known option: {ident_str}");
-        } else {
-            return Err(syn::Error::new_spanned(
-                ident,
-                format!(
-                    "unknown #[in_vm] argument `{ident_str}`; \
-                     valid backends are: {}; valid options are: {}",
-                    known_backend_list(),
-                    known_option_list(),
-                ),
-            )
-            .to_compile_error()
-            .into());
-        }
+    if idents.len() > 1 {
+        return Err(syn::Error::new_spanned(
+            &idents[1],
+            "only one backend identifier is allowed in #[in_vm]; \
+             VM options have moved to companion attributes \
+             (#[hypervisor(…)], #[guest(…)])",
+        )
+        .to_compile_error()
+        .into());
     }
 
-    Ok(InVmArgs {
-        backend_path: backend_path.unwrap_or_else(|| {
-            DEFAULT_BACKEND_PATH
-                .parse()
-                .expect("DEFAULT_BACKEND_PATH is a valid token stream")
-        }),
-        iommu,
-    })
+    let ident = &idents[0];
+    let ident_str = ident.to_string();
+
+    // Check for migrated options with a helpful hint.
+    if let Some(hint) = migration_hint(&ident_str) {
+        return Err(syn::Error::new_spanned(
+            ident,
+            format!(
+                "`{ident_str}` has moved out of #[in_vm(…)] — \
+                 use {hint} instead",
+            ),
+        )
+        .to_compile_error()
+        .into());
+    }
+
+    if let Some(path) = resolve_backend(&ident_str) {
+        Ok(path
+            .parse()
+            .expect("KNOWN_BACKENDS paths are valid token streams"))
+    } else {
+        Err(syn::Error::new_spanned(
+            ident,
+            format!(
+                "unknown #[in_vm] backend `{ident_str}`; \
+                 valid backends are: {}",
+                known_backend_list(),
+            ),
+        )
+        .to_compile_error()
+        .into())
+    }
 }
 
-/// Attribute macro that rewrites a test function to run inside an ephemeral VM.
+// ── #[hypervisor] argument parsing ───────────────────────────────────
+
+/// Parsed arguments from a `#[hypervisor(…)]` companion attribute.
+struct HypervisorArgs {
+    /// Whether to present a virtual IOMMU device to the guest.
+    iommu: bool,
+    /// Host page size as a fully-qualified token stream
+    /// (e.g. `::n_vm::HostPageSize::Huge1G`).
+    host_page_size: proc_macro2::TokenStream,
+}
+
+impl Default for HypervisorArgs {
+    fn default() -> Self {
+        Self {
+            iommu: false,
+            host_page_size: quote! { ::n_vm::HostPageSize::Huge1G },
+        }
+    }
+}
+
+/// Parses the content of a `#[hypervisor(…)]` attribute.
 ///
-/// See the [crate-level documentation](crate) for a full description of the
-/// three-tier dispatch mechanism, backend selection, and usage examples.
+/// Accepts:
+/// - `iommu` -- boolean flag.
+/// - `host_pages = "4k" | "2m" | "1g"` -- host page size.
 ///
-/// # Backend selection and options
+/// `#[hypervisor]` (no parentheses) is treated as all-defaults.
+fn parse_hypervisor_attr(attr: &syn::Attribute) -> syn::Result<HypervisorArgs> {
+    let mut args = HypervisorArgs::default();
+
+    // #[hypervisor] without parentheses → all defaults.
+    if matches!(&attr.meta, syn::Meta::Path(_)) {
+        return Ok(args);
+    }
+
+    let mut iommu_seen = false;
+    let mut host_pages_seen = false;
+
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("iommu") {
+            if iommu_seen {
+                return Err(meta.error("duplicate `iommu` option in #[hypervisor]"));
+            }
+            iommu_seen = true;
+            args.iommu = true;
+            Ok(())
+        } else if meta.path.is_ident("host_pages") {
+            if host_pages_seen {
+                return Err(meta.error("duplicate `host_pages` option in #[hypervisor]"));
+            }
+            host_pages_seen = true;
+            let value: syn::LitStr = meta.value()?.parse()?;
+            args.host_page_size = match value.value().as_str() {
+                "4k" => quote! { ::n_vm::HostPageSize::Standard },
+                "2m" => quote! { ::n_vm::HostPageSize::Huge2M },
+                "1g" => quote! { ::n_vm::HostPageSize::Huge1G },
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        format!(
+                            "unknown host page size `{other}` in #[hypervisor]; \
+                             valid values are: \"4k\", \"2m\", \"1g\"",
+                        ),
+                    ));
+                }
+            };
+            Ok(())
+        } else {
+            let name = meta
+                .path
+                .get_ident()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "<path>".into());
+            Err(meta.error(format!(
+                "unknown #[hypervisor] option `{name}`; \
+                 valid options are: `iommu`, `host_pages`",
+            )))
+        }
+    })?;
+
+    Ok(args)
+}
+
+// ── #[guest] argument parsing ────────────────────────────────────────
+
+/// Parsed arguments from a `#[guest(…)]` companion attribute.
+struct GuestArgs {
+    /// Guest hugepage configuration as a fully-qualified token stream.
+    guest_hugepages: proc_macro2::TokenStream,
+}
+
+impl Default for GuestArgs {
+    fn default() -> Self {
+        Self {
+            guest_hugepages: quote! {
+                ::n_vm::GuestHugePageConfig::Allocate {
+                    size: ::n_vm::GuestHugePageSize::Huge1G,
+                    count: 1u32,
+                }
+            },
+        }
+    }
+}
+
+/// Parses the content of a `#[guest(…)]` attribute.
 ///
-/// Arguments are specified as a comma-separated list of identifiers:
+/// Accepts:
+/// - `hugepage_size = "none" | "2m" | "1g"` -- guest hugepage
+///   granularity.
+/// - `hugepage_count = N` -- number of hugepages to reserve (integer,
+///   defaults to 1, forbidden when `hugepage_size = "none"`).
+///
+/// `#[guest]` (no parentheses) is treated as all-defaults.
+fn parse_guest_attr(attr: &syn::Attribute) -> syn::Result<GuestArgs> {
+    // #[guest] without parentheses → all defaults.
+    if matches!(&attr.meta, syn::Meta::Path(_)) {
+        return Ok(GuestArgs::default());
+    }
+
+    let mut hugepage_size_seen = false;
+    let mut hugepage_count_seen = false;
+
+    // Intermediate storage: we need to see both options before
+    // constructing the final token stream.
+    let mut size_is_none = false;
+    let mut size_tokens: Option<proc_macro2::TokenStream> = None;
+    let mut count: u32 = 1;
+    let mut count_span: Option<proc_macro2::Span> = None;
+
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("hugepage_size") {
+            if hugepage_size_seen {
+                return Err(meta.error("duplicate `hugepage_size` option in #[guest]"));
+            }
+            hugepage_size_seen = true;
+            let value: syn::LitStr = meta.value()?.parse()?;
+            match value.value().as_str() {
+                "none" => {
+                    size_is_none = true;
+                }
+                "2m" => {
+                    size_tokens =
+                        Some(quote! { ::n_vm::GuestHugePageSize::Huge2M });
+                }
+                "1g" => {
+                    size_tokens =
+                        Some(quote! { ::n_vm::GuestHugePageSize::Huge1G });
+                }
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        format!(
+                            "unknown hugepage size `{other}` in #[guest]; \
+                             valid values are: \"none\", \"2m\", \"1g\"",
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        } else if meta.path.is_ident("hugepage_count") {
+            if hugepage_count_seen {
+                return Err(meta.error("duplicate `hugepage_count` option in #[guest]"));
+            }
+            hugepage_count_seen = true;
+            let lit: syn::LitInt = meta.value()?.parse()?;
+            count_span = Some(lit.span());
+            count = lit.base10_parse()?;
+            if count == 0 {
+                return Err(syn::Error::new(
+                    lit.span(),
+                    "hugepage_count must be at least 1; \
+                     use `hugepage_size = \"none\"` to disable guest hugepages entirely",
+                ));
+            }
+            Ok(())
+        } else {
+            let name = meta
+                .path
+                .get_ident()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "<path>".into());
+            Err(meta.error(format!(
+                "unknown #[guest] option `{name}`; \
+                 valid options are: `hugepage_size`, `hugepage_count`",
+            )))
+        }
+    })?;
+
+    // Validate cross-field constraints.
+    if size_is_none && hugepage_count_seen {
+        return Err(syn::Error::new(
+            count_span.unwrap_or_else(proc_macro2::Span::call_site),
+            "hugepage_count cannot be specified when \
+             hugepage_size = \"none\"; hugepages are disabled",
+        ));
+    }
+
+    // If #[guest(...)] was given but hugepage_size was not specified,
+    // that is an error: the attribute is meaningless without it.
+    if !hugepage_size_seen && !hugepage_count_seen {
+        // Empty #[guest()] — treat as all defaults.
+        return Ok(GuestArgs::default());
+    }
+    if !hugepage_size_seen {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "#[guest] requires `hugepage_size`; e.g. \
+             #[guest(hugepage_size = \"2m\", hugepage_count = 512)]",
+        ));
+    }
+
+    // Build the guest hugepage configuration token stream.
+    let guest_hugepages = if size_is_none {
+        quote! { ::n_vm::GuestHugePageConfig::None }
+    } else {
+        let sz = size_tokens.expect("size_tokens set when size_is_none is false");
+        quote! {
+            ::n_vm::GuestHugePageConfig::Allocate {
+                size: #sz,
+                count: #count,
+            }
+        }
+    };
+
+    Ok(GuestArgs { guest_hugepages })
+}
+
+// ── Companion attribute extraction ───────────────────────────────────
+
+/// Returns `true` if the attribute's path ends with the given
+/// identifier.
+///
+/// Handles both bare `#[name]` and qualified `#[n_vm::name]`
+/// forms.
+fn attr_has_name(attr: &syn::Attribute, name: &str) -> bool {
+    attr.path().is_ident(name)
+        || attr
+            .path()
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident == name)
+}
+
+/// Extracts at most one attribute with the given name from the list,
+/// removing it in place.
+///
+/// Returns an error if more than one attribute with the name is found.
+fn extract_unique_attr(
+    attrs: &mut Vec<syn::Attribute>,
+    name: &str,
+) -> syn::Result<Option<syn::Attribute>> {
+    // Find the first match.
+    let idx = match attrs.iter().position(|a| attr_has_name(a, name)) {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+    let attr = attrs.remove(idx);
+
+    // Check for duplicates.
+    if let Some(dup) = attrs.iter().find(|a| attr_has_name(a, name)) {
+        return Err(syn::Error::new_spanned(
+            dup,
+            format!("duplicate #[{name}] attribute"),
+        ));
+    }
+
+    Ok(Some(attr))
+}
+
+// ── Code generation ──────────────────────────────────────────────────
+
+/// Attribute macro that rewrites a test function to run inside an
+/// ephemeral VM.
+///
+/// See the [crate-level documentation](crate) for a full description of
+/// the three-tier dispatch mechanism, backend selection, companion
+/// attributes, and usage examples.
+///
+/// # Backend selection
+///
+/// `#[in_vm]` accepts an optional backend identifier:
 ///
 /// - `#[in_vm]` -- uses [`CloudHypervisor`](::n_vm::CloudHypervisor)
-///   (the default), no vIOMMU.
+///   (the default).
 /// - `#[in_vm(cloud_hypervisor)]` -- same as above, explicitly.
 /// - `#[in_vm(qemu)]` -- uses [`Qemu`](::n_vm::Qemu).
-/// - `#[in_vm(iommu)]` -- default backend with a virtual IOMMU device.
-/// - `#[in_vm(qemu, iommu)]` -- QEMU with a virtual IOMMU device.
-/// - `#[in_vm(cloud_hypervisor, iommu)]` -- cloud-hypervisor with a
-///   virtual IOMMU device.
 ///
-/// When `iommu` is specified, the backend presents a virtual IOMMU to
-/// the guest and places virtio devices behind it.
-/// This exercises the same DMA remapping code paths that DPDK/VFIO
-/// encounters in production.
+/// # Companion attributes
+///
+/// Place `#[hypervisor(…)]` and/or `#[guest(…)]` **below** `#[in_vm]`
+/// on the same function to configure the VM.
+/// See the [crate-level documentation](crate) for the full option
+/// reference.
 ///
 /// # Compile-time validation
 ///
 /// The macro rejects functions that are:
-/// - **`async`** -- the generated code creates its own tokio runtime at the
-///   container tier, so the decorated function must be synchronous.
-/// - **Parameterised** -- the function is re-invoked by name as `fn()` inside
-///   the VM guest, so it cannot accept arguments.
-/// - **Non-unit return type** -- the generated dispatch branches use bare
-///   `return;` statements, so the function must return `()`.
+/// - **`async`** -- the generated code creates its own tokio runtime at
+///   the container tier, so the decorated function must be synchronous.
+/// - **Parameterised** -- the function is re-invoked by name as `fn()`
+///   inside the VM guest, so it cannot accept arguments.
+/// - **Non-unit return type** -- the generated dispatch branches use
+///   bare `return;` statements, so the function must return `()`.
 ///
 /// The macro also rejects:
-/// - **Unrecognised identifiers** -- backend and option names must be one
-///   of the supported values.
-/// - **Backend after options** -- the backend identifier (if any) must
-///   appear before option identifiers.
-/// - **Duplicate options** -- each option may appear at most once.
+/// - **Unrecognised identifiers** in any of the three attributes.
+/// - **Duplicate options** within a single attribute.
+/// - **Duplicate companion attributes** (e.g. two `#[hypervisor]`
+///   blocks).
+/// - **Contradictory options** (e.g. `hugepage_count` with
+///   `hugepage_size = "none"`).
 ///
 /// # Panics
 ///
@@ -325,19 +568,16 @@ fn parse_in_vm_args(attr: TokenStream) -> Result<InVmArgs, TokenStream> {
 /// - The tokio runtime cannot be created.
 #[proc_macro_attribute]
 pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
-    // ── Parse backend selection and options ───────────────────────────
+    // ── Parse backend selection ──────────────────────────────────────
 
-    let InVmArgs {
-        backend_path,
-        iommu,
-    } = match parse_in_vm_args(attr) {
-        Ok(args) => args,
+    let backend_path = match parse_in_vm_backend(attr) {
+        Ok(path) => path,
         Err(err) => return err,
     };
 
     // ── Parse and validate the function ──────────────────────────────
 
-    let func = parse_macro_input!(input as syn::ItemFn);
+    let mut func = parse_macro_input!(input as syn::ItemFn);
 
     if func.sig.asyncness.is_some() {
         return syn::Error::new_spanned(
@@ -369,15 +609,39 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
         .into();
     }
 
+    // ── Extract and parse companion attributes ───────────────────────
+
+    let hypervisor_args = match extract_unique_attr(&mut func.attrs, "hypervisor") {
+        Ok(Some(attr)) => match parse_hypervisor_attr(&attr) {
+            Ok(args) => args,
+            Err(err) => return err.to_compile_error().into(),
+        },
+        Ok(None) => HypervisorArgs::default(),
+        Err(err) => return err.to_compile_error().into(),
+    };
+
+    let guest_args = match extract_unique_attr(&mut func.attrs, "guest") {
+        Ok(Some(attr)) => match parse_guest_attr(&attr) {
+            Ok(args) => args,
+            Err(err) => return err.to_compile_error().into(),
+        },
+        Ok(None) => GuestArgs::default(),
+        Err(err) => return err.to_compile_error().into(),
+    };
+
     // ── Code generation ──────────────────────────────────────────────
 
     let block = &func.block;
     let vis = &func.vis;
     let sig = &func.sig;
-    let attrs = &func.attrs;
+    let attrs = &func.attrs; // remaining attrs after companion extraction
     let ident = &func.sig.ident;
 
-    // The three tiers are dispatched as a flat if chain.
+    let iommu = hypervisor_args.iommu;
+    let host_page_size = &hypervisor_args.host_page_size;
+    let guest_hugepages = &guest_args.guest_hugepages;
+
+    // The three tiers are dispatched as a flat if-chain.
     // Each tier is identified by an environment variable set by the
     // enclosing layer before re-executing the test binary.
     //
@@ -396,13 +660,82 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
 
             // Tier 2: Docker container -> VM
             if ::n_vm::is_in_test_container() {
-                ::n_vm::run_container_tier::<#backend_path, _>(#ident, #iommu);
+                ::n_vm::run_container_tier::<#backend_path, _>(
+                    #ident,
+                    ::n_vm::VmConfig {
+                        iommu: #iommu,
+                        host_page_size: #host_page_size,
+                        guest_hugepages: #guest_hugepages,
+                    },
+                );
                 return;
             }
 
             // Tier 1: Host -> Docker container
             ::n_vm::run_host_tier(#ident);
         }
+    }
+    .into()
+}
+
+/// Companion attribute for [`in_vm`] -- hypervisor configuration.
+///
+/// This attribute is consumed by the `#[in_vm]` proc macro and must
+/// appear **below** it on the same function.
+/// If it is expanded independently (wrong order or missing `#[in_vm]`),
+/// it emits a compile error with a migration hint.
+///
+/// See the [crate-level documentation](crate) for the option reference
+/// and usage examples.
+#[proc_macro_attribute]
+pub fn hypervisor(_attr: TokenStream, input: TokenStream) -> TokenStream {
+    let error = syn::Error::new(
+        proc_macro2::Span::call_site(),
+        "#[hypervisor] must be used together with #[in_vm] and must \
+         appear below it on the same function; e.g.\n\n\
+         #[in_vm]\n\
+         #[hypervisor(iommu, host_pages = \"4k\")]\n\
+         fn my_test() { ... }",
+    )
+    .to_compile_error();
+
+    // Re-emit the original item so that downstream code does not see
+    // cascading "not found" errors from the missing function.
+    let input2: proc_macro2::TokenStream = input.into();
+    quote! {
+        #error
+        #input2
+    }
+    .into()
+}
+
+/// Companion attribute for [`in_vm`] -- guest kernel configuration.
+///
+/// This attribute is consumed by the `#[in_vm]` proc macro and must
+/// appear **below** it on the same function.
+/// If it is expanded independently (wrong order or missing `#[in_vm]`),
+/// it emits a compile error with a migration hint.
+///
+/// See the [crate-level documentation](crate) for the option reference
+/// and usage examples.
+#[proc_macro_attribute]
+pub fn guest(_attr: TokenStream, input: TokenStream) -> TokenStream {
+    let error = syn::Error::new(
+        proc_macro2::Span::call_site(),
+        "#[guest] must be used together with #[in_vm] and must \
+         appear below it on the same function; e.g.\n\n\
+         #[in_vm]\n\
+         #[guest(hugepage_size = \"2m\", hugepage_count = 512)]\n\
+         fn my_test() { ... }",
+    )
+    .to_compile_error();
+
+    // Re-emit the original item so that downstream code does not see
+    // cascading "not found" errors from the missing function.
+    let input2: proc_macro2::TokenStream = input.into();
+    quote! {
+        #error
+        #input2
     }
     .into()
 }
