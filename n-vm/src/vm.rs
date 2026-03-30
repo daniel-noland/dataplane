@@ -85,10 +85,6 @@ const VM_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// servers such as virtiofsd's vhost-user socket, where a probe
 /// `connect()` would be accepted as the real client connection and
 /// break the server when the probe stream is immediately dropped.
-///
-/// For multi-client server sockets (e.g. QEMU QMP, cloud-hypervisor
-/// REST API) where a probe connection is harmless, use
-/// [`wait_for_socket_connectable`] instead.
 pub(crate) async fn wait_for_socket(path: impl AsRef<Path>) -> Result<(), VmError> {
     let path = path.as_ref();
     for _ in 0..SOCKET_POLL_MAX_ATTEMPTS {
@@ -102,60 +98,6 @@ pub(crate) async fn wait_for_socket(path: impl AsRef<Path>) -> Result<(), VmErro
                     path: path.to_path_buf(),
                     source: err,
                 });
-            }
-        }
-    }
-    Err(VmError::SocketTimeout {
-        path: path.to_path_buf(),
-        timeout: SOCKET_POLL_INTERVAL.saturating_mul(SOCKET_POLL_MAX_ATTEMPTS),
-    })
-}
-
-/// Like [`wait_for_socket`], but probes actual **connectivity** rather
-/// than just file existence.
-///
-/// A Unix socket file appears on the filesystem after `bind()` but
-/// before `listen()`.  If a caller immediately `connect()`s after the
-/// file appears, it may hit `ECONNREFUSED` in that window.  This
-/// variant retries through that gap by attempting a real connection on
-/// each poll iteration.
-///
-/// **WARNING**: Do not use this for **single-client** servers (e.g.
-/// virtiofsd's vhost-user socket).  The probe connection will be
-/// accepted as the real client; when the probe stream is dropped the
-/// server sees a client disconnect and may exit or stop accepting.
-/// Use [`wait_for_socket`] (file-existence) for those.
-#[allow(dead_code)]
-pub(crate) async fn wait_for_socket_connectable(
-    path: impl AsRef<Path>,
-) -> Result<(), VmError> {
-    let path = path.as_ref();
-    for _ in 0..SOCKET_POLL_MAX_ATTEMPTS {
-        match tokio::net::UnixStream::connect(path).await {
-            Ok(_stream) => {
-                // Connection succeeded — the server is listening.
-                // We drop the stream immediately; we only needed to
-                // confirm the socket is ready.
-                return Ok(());
-            }
-            Err(err) => {
-                use std::io::ErrorKind;
-                match err.kind() {
-                    // Socket file does not exist yet (pre-bind).
-                    ErrorKind::NotFound |
-                    // Socket file exists but nobody is listening yet
-                    // (post-bind, pre-listen).
-                    ErrorKind::ConnectionRefused => {
-                        tokio::time::sleep(SOCKET_POLL_INTERVAL).await;
-                    }
-                    // Any other I/O error is unexpected — bail out.
-                    _ => {
-                        return Err(VmError::SocketPoll {
-                            path: path.to_path_buf(),
-                            source: err,
-                        });
-                    }
-                }
             }
         }
     }
