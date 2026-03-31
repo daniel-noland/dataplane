@@ -130,6 +130,12 @@ impl HypervisorBackend for Qemu {
     async fn launch(params: &TestVmParams<'_>) -> Result<LaunchedHypervisor<Self>, VmError> {
         let (child, qmp_conn) = spawn_qemu_process(params).await?;
 
+        // QEMU's `-netdev tap,script=no` creates the TAPs but leaves them
+        // DOWN with no addresses.  Bring them UP and assign IPv6 link-local
+        // addresses so that NDP traffic flows and rx tests have something
+        // to receive.
+        configure_host_taps().await?;
+
         let (writer, event_stream) = qmp_conn.into_split();
 
         let event_watcher = AbortOnDrop::spawn(async {
@@ -298,6 +304,106 @@ pub fn compute_verdict(events: &[qapi_qmp::Event], had_stream_errors: bool) -> H
 
     // Stream ended without a SHUTDOWN event.
     HypervisorVerdict::Failure
+}
+
+// ── Host-side TAP configuration ───────────────────────────────────────
+
+/// Prefix length for the IPv6 link-local addresses assigned to TAPs.
+const TAP_IPV6_PREFIX_LEN: u8 = config::TAP_IPV6_PREFIX_LEN;
+
+/// Configures host-side TAP interfaces after QEMU creates them.
+///
+/// Cloud-hypervisor performs this automatically via `NetConfig.ip` /
+/// `NetConfig.mask`, but QEMU's `-netdev tap` only creates the TAP
+/// device — it does not assign addresses or bring the link up.
+///
+/// This function uses rtnetlink to:
+///
+/// 1. Look up each TAP by name to obtain its interface index.
+/// 2. Bring the link administratively UP.
+/// 3. Assign the configured IPv6 link-local address with a /64 prefix.
+///
+/// These addresses generate NDP traffic (Neighbor Solicitation /
+/// Neighbor Advertisement) on the TAPs, which is essential for Phase 1
+/// rx validation tests — without traffic on the host side, the DPDK
+/// guest has nothing to receive.
+async fn configure_host_taps() -> Result<(), QemuError> {
+    let (connection, handle, _) = rtnetlink::new_connection()
+        .map_err(|e| QemuError::TapSetup {
+            tap: "<connection>".into(),
+            reason: format!("failed to open netlink connection: {e}"),
+        })?;
+
+    // Spawn the netlink connection handler as a background task.
+    // It runs until all Handle clones are dropped.
+    tokio::spawn(connection);
+
+    for iface in config::ALL_IFACES {
+        let tap_name = iface.tap;
+
+        // Look up the TAP by name to get its interface index.
+        let mut links = handle
+            .link()
+            .get()
+            .match_name(tap_name.to_string())
+            .execute();
+
+        use futures::TryStreamExt;
+        let link = links.try_next().await.map_err(|e| QemuError::TapSetup {
+            tap: tap_name.into(),
+            reason: format!("failed to look up TAP device: {e}"),
+        })?;
+
+        let link = link.ok_or_else(|| QemuError::TapSetup {
+            tap: tap_name.into(),
+            reason: "TAP device not found (QEMU may not have created it yet)".into(),
+        })?;
+
+        let index = link.header.index;
+
+        // Bring the TAP up.
+        handle
+            .link()
+            .set(
+                rtnetlink::LinkUnspec::new_with_index(index)
+                    .up()
+                    .build(),
+            )
+            .execute()
+            .await
+            .map_err(|e| QemuError::TapSetup {
+                tap: tap_name.into(),
+                reason: format!("failed to bring TAP up: {e}"),
+            })?;
+
+        // Assign the IPv6 link-local address.
+        handle
+            .address()
+            .add(
+                index,
+                std::net::IpAddr::V6(iface.host_ipv6),
+                TAP_IPV6_PREFIX_LEN,
+            )
+            .execute()
+            .await
+            .map_err(|e| QemuError::TapSetup {
+                tap: tap_name.into(),
+                reason: format!(
+                    "failed to add IPv6 address {}/{}: {e}",
+                    iface.host_ipv6, TAP_IPV6_PREFIX_LEN,
+                ),
+            })?;
+
+        debug!(
+            tap = tap_name,
+            index,
+            ipv6 = %iface.host_ipv6,
+            prefix_len = TAP_IPV6_PREFIX_LEN,
+            "configured host-side TAP",
+        );
+    }
+
+    Ok(())
 }
 
 // ── Process spawning ─────────────────────────────────────────────────

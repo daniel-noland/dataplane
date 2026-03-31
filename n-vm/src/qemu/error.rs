@@ -122,4 +122,25 @@ pub enum QemuError {
               a QEMU version mismatch or an unexpected async event format")
     )]
     QmpDeserialize(#[source] serde_json::Error),
+
+    /// Host-side TAP configuration failed.
+    ///
+    /// After QEMU creates TAP devices via `-netdev tap`, the QEMU backend
+    /// uses rtnetlink to bring them UP and assign IPv6 link-local
+    /// addresses.  This error indicates one of those netlink operations
+    /// failed.
+    #[error("failed to configure host TAP `{tap}`: {reason}")]
+    #[diagnostic(
+        code(n_vm::qemu::tap_setup),
+        help("QEMU creates TAPs with `-netdev tap,script=no`, leaving them \
+              DOWN and address-less.  The QEMU backend configures them via \
+              rtnetlink after QEMU starts.  Check that the container has \
+              NET_ADMIN capability and that the TAP devices exist.")
+    )]
+    TapSetup {
+        /// The TAP device name that could not be configured.
+        tap: String,
+        /// Description of what went wrong.
+        reason: String,
+    },
 }

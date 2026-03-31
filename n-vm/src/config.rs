@@ -25,6 +25,7 @@
 //!   reading and child-process stderr capture.
 
 use std::time::Duration;
+use std::net::Ipv6Addr;
 
 use n_vm_protocol::{INIT_BINARY_PATH, VsockAllocation};
 use tokio::io::AsyncReadExt;
@@ -390,6 +391,12 @@ pub(crate) struct NetIface {
     pub tap: &'static str,
     /// MAC address in `XX:XX:XX:XX:XX:XX` format.
     pub mac: &'static str,
+    /// IPv6 link-local address assigned to the host-side TAP device.
+    ///
+    /// Cloud-hypervisor applies this via its `NetConfig.ip` field.
+    /// QEMU does not configure TAP addresses, so the QEMU backend
+    /// applies this via rtnetlink after the TAPs are created.
+    pub host_ipv6: Ipv6Addr,
 }
 
 /// The management network interface (standard Ethernet).
@@ -397,6 +404,7 @@ pub(crate) const IFACE_MGMT: NetIface = NetIface {
     id: "mgmt",
     tap: "mgmt",
     mac: "02:DE:AD:BE:EF:01",
+    host_ipv6: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0xffff, 1),
 };
 
 /// First fabric-facing network interface (jumbo frames).
@@ -404,6 +412,7 @@ pub(crate) const IFACE_FABRIC1: NetIface = NetIface {
     id: "fabric1",
     tap: "fabric1",
     mac: "02:CA:FE:BA:BE:01",
+    host_ipv6: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
 };
 
 /// Second fabric-facing network interface (jumbo frames).
@@ -411,6 +420,7 @@ pub(crate) const IFACE_FABRIC2: NetIface = NetIface {
     id: "fabric2",
     tap: "fabric2",
     mac: "02:CA:FE:BA:BE:02",
+    host_ipv6: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
 };
 
 /// All network interfaces in the order they are presented to the VM.
@@ -418,6 +428,9 @@ pub(crate) const IFACE_FABRIC2: NetIface = NetIface {
 /// Used by backends to iterate over the interface set, and by tests to
 /// verify uniqueness constraints on MACs, taps, and IDs.
 pub(crate) const ALL_IFACES: [&NetIface; 3] = [&IFACE_MGMT, &IFACE_FABRIC1, &IFACE_FABRIC2];
+
+/// IPv6 prefix length for host-side TAP addresses (link-local /64).
+pub(crate) const TAP_IPV6_PREFIX_LEN: u8 = 64;
 
 // ── Cloud-hypervisor network tuning ──────────────────────────────────
 //

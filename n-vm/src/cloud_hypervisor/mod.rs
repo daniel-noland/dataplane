@@ -388,7 +388,7 @@ fn build_network_configs(iommu: bool) -> Vec<NetConfig> {
     vec![
         NetConfig {
             tap: Some(config::IFACE_MGMT.tap.into()),
-            ip: Some("fe80::ffff:1".into()),
+            ip: Some(config::IFACE_MGMT.host_ipv6.to_string()),
             mask: Some("ffff:ffff:ffff:ffff::".into()),
             mac: Some(config::IFACE_MGMT.mac.into()),
             mtu: Some(config::MGMT_MTU),
@@ -399,7 +399,7 @@ fn build_network_configs(iommu: bool) -> Vec<NetConfig> {
         },
         NetConfig {
             tap: Some(config::IFACE_FABRIC1.tap.into()),
-            ip: Some("fe80::1".into()),
+            ip: Some(config::IFACE_FABRIC1.host_ipv6.to_string()),
             mask: Some("ffff:ffff:ffff:ffff::".into()),
             mac: Some(config::IFACE_FABRIC1.mac.into()),
             mtu: Some(config::FABRIC_MTU),
@@ -411,7 +411,7 @@ fn build_network_configs(iommu: bool) -> Vec<NetConfig> {
         },
         NetConfig {
             tap: Some(config::IFACE_FABRIC2.tap.into()),
-            ip: Some("fe80::2".into()),
+            ip: Some(config::IFACE_FABRIC2.host_ipv6.to_string()),
             mask: Some("ffff:ffff:ffff:ffff::".into()),
             mac: Some(config::IFACE_FABRIC2.mac.into()),
             mtu: Some(config::FABRIC_MTU),
