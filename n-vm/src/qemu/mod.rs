@@ -372,7 +372,7 @@ fn build_qemu_args(params: &TestVmParams<'_>) -> Vec<String> {
     push_kernel_args(&mut args, params);
     push_fs_args(&mut args);
     push_vsock_args(&mut args, &params.vsock, iommu);
-    push_network_args(&mut args, iommu);
+    push_network_args(&mut args, iommu, params.vm_config.nic_model);
     push_serial_args(&mut args);
     push_qmp_args(&mut args);
     push_platform_args(&mut args, params);
@@ -588,18 +588,24 @@ fn push_vsock_args(args: &mut Vec<String>, vsock: &VsockAllocation, iommu: bool)
 /// backend sets MTU in the device configuration, which cloud-hypervisor
 /// applies to the TAP devices automatically.
 ///
-/// When `iommu` is `true`, uses `virtio-net-pci-non-transitional`
-/// (virtio 1.0+ only) with `iommu_platform=on,ats=on` so that network
-/// I/O is routed through the virtual IOMMU.  The transitional
-/// `virtio-net-pci` device does not support `VIRTIO_F_IOMMU_PLATFORM`,
-/// which is a modern-only feature.
-fn push_network_args(args: &mut Vec<String>, iommu: bool) {
-    let iommu_suffix = if iommu {
-        ",iommu_platform=on,ats=on"
-    } else {
-        ""
-    };
+/// # NIC model selection
+///
+/// The `nic_model` parameter selects the QEMU device type:
+///
+/// - [`VirtioNet`](config::NicModel::VirtioNet) --
+///   `virtio-net-pci-non-transitional` (virtio 1.0+ only).  When
+///   `iommu` is `true`, adds `iommu_platform=on,ats=on` so that
+///   network I/O is routed through the virtual IOMMU.
+///
+/// - [`E1000`](config::NicModel::E1000) -- Intel 82540EM (`e1000`).
+///   This is a fully emulated legacy NIC.  It does not support
+///   `iommu_platform` or ATS (not a virtio device), but DMA is still
+///   remapped by the Intel IOMMU when present because the IOMMU covers
+///   the entire PCI topology.
+fn push_network_args(args: &mut Vec<String>, iommu: bool, nic_model: config::NicModel) {
     for iface in config::ALL_IFACES {
+        // The TAP netdev is the same regardless of the front-end device
+        // model -- it just bridges a host TAP interface into the guest.
         args.extend([
             "-netdev".into(),
             format!(
@@ -607,13 +613,35 @@ fn push_network_args(args: &mut Vec<String>, iommu: bool) {
                 id = iface.id,
                 tap = iface.tap,
             ),
-            "-device".into(),
-            format!(
-                "virtio-net-pci-non-transitional,netdev=nd-{id},mac={mac}{iommu_suffix}",
-                id = iface.id,
-                mac = iface.mac,
-            ),
         ]);
+
+        // The front-end device string depends on the NIC model.
+        let device_str = match nic_model {
+            config::NicModel::VirtioNet => {
+                let iommu_suffix = if iommu {
+                    ",iommu_platform=on,ats=on"
+                } else {
+                    ""
+                };
+                format!(
+                    "virtio-net-pci-non-transitional,netdev=nd-{id},mac={mac}{iommu_suffix}",
+                    id = iface.id,
+                    mac = iface.mac,
+                )
+            }
+            config::NicModel::E1000 => {
+                // e1000 is a legacy emulated NIC -- no iommu_platform or
+                // ATS support.  The Intel IOMMU still intercepts DMA from
+                // this device when present on the PCI bus.
+                format!(
+                    "e1000,netdev=nd-{id},mac={mac}",
+                    id = iface.id,
+                    mac = iface.mac,
+                )
+            }
+        };
+
+        args.extend(["-device".into(), device_str]);
     }
 }
 

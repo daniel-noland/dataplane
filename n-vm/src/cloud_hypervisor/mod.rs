@@ -257,6 +257,17 @@ async fn spawn_hypervisor_process(
 /// stdout/stderr are forwarded via dedicated
 /// [`VsockChannel`](n_vm_protocol::VsockChannel)s instead.
 fn build_vm_config(params: &TestVmParams<'_>) -> VmConfig {
+    // Cloud-hypervisor only supports virtio-net -- it has no emulated NIC
+    // models.  The proc macro prevents incompatible combinations at compile
+    // time, so this is a belt-and-suspenders check for callers that bypass
+    // the macro (e.g. direct `TestVm::<CloudHypervisor>::launch()` calls).
+    debug_assert!(
+        !params.vm_config.nic_model.requires_qemu(),
+        "cloud-hypervisor does not support NIC model {:?}; \
+         use #[in_vm(qemu)] for emulated NIC models",
+        params.vm_config.nic_model,
+    );
+
     VmConfig {
         payload: build_payload_config(params),
         vsock: Some(VsockConfig {

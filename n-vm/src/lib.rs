@@ -73,7 +73,7 @@ mod vm;
 pub use abort_on_drop::AbortOnDrop;
 pub use backend::{HypervisorBackend, HypervisorVerdict, LaunchedHypervisor};
 pub use cloud_hypervisor::CloudHypervisor;
-pub use config::{GuestHugePageConfig, GuestHugePageSize, HostPageSize, VmConfig};
+pub use config::{GuestHugePageConfig, GuestHugePageSize, HostPageSize, NicModel, VmConfig};
 pub use container::{ContainerTestResult, run_test_in_vm};
 pub use dispatch::{is_in_test_container, is_in_vm, run_container_tier, run_host_tier};
 pub use error::{ContainerError, VmError};

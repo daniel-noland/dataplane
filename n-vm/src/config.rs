@@ -13,6 +13,8 @@
 //!
 //! - **VM sizing** -- memory, hugepage, and vCPU constants.
 //! - **CPU topology** -- socket / die / core / thread layout.
+//! - **NIC model** -- the emulated network card type presented to the
+//!   guest ([`NicModel`]).
 //! - **Network interfaces** -- identifiers, tap device names, MAC
 //!   addresses.
 //! - **Device tuning** -- virtio queue depths, buffer capacities.
@@ -27,6 +29,87 @@ use std::time::Duration;
 use n_vm_protocol::{INIT_BINARY_PATH, VsockAllocation};
 use tokio::io::AsyncReadExt;
 use tracing::{error, warn};
+
+// ── NIC model ────────────────────────────────────────────────────────
+
+/// Network interface card model presented to the VM guest.
+///
+/// This controls the emulated (or paravirtualised) NIC type for **all**
+/// network interfaces in the VM.  The choice affects both the QEMU
+/// device string and the guest driver that claims the device:
+///
+/// - [`VirtioNet`](Self::VirtioNet) -- paravirtualised `virtio-net-pci`.
+///   Supported by **both** cloud-hypervisor and QEMU.  This is the
+///   default and should be used unless the test specifically needs a
+///   legacy NIC model.
+///
+/// - [`E1000`](Self::E1000) -- Intel 82540EM Gigabit Ethernet
+///   (`e1000` device).  Supported by **QEMU only**.  Cloud-hypervisor
+///   does not implement hardware-emulated NIC models, so using this
+///   variant with the cloud-hypervisor backend is a compile-time error
+///   (enforced by the `#[in_vm]` proc macro).
+///
+/// # Backend compatibility
+///
+/// | Model | cloud-hypervisor | QEMU |
+/// |-------|-----------------|------|
+/// | `VirtioNet` | ✅ | ✅ |
+/// | `E1000` | ❌ | ✅ |
+///
+/// The `#[network(nic_model = "e1000")]` attribute is only accepted
+/// when used with `#[in_vm(qemu)]`.  The proc macro emits a
+/// compile-time error for incompatible combinations.
+///
+/// # IOMMU interaction
+///
+/// When the virtual IOMMU is enabled (`#[hypervisor(iommu)]`):
+///
+/// - **VirtioNet** devices use `iommu_platform=on,ats=on` (QEMU) or
+///   per-device IOMMU flags (cloud-hypervisor) for full DMA remapping
+///   with address translation services.
+/// - **E1000** devices sit behind the Intel IOMMU on QEMU's PCI bus
+///   (DMA is remapped) but do not support `iommu_platform` or ATS
+///   because the e1000 is not a virtio device.  DPDK's VFIO driver
+///   will use the IOMMU for these devices automatically.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NicModel {
+    /// Paravirtualised virtio-net (default).
+    ///
+    /// Uses `virtio-net-pci-non-transitional` on QEMU and the native
+    /// virtio-net implementation on cloud-hypervisor.
+    #[default]
+    VirtioNet,
+
+    /// Intel 82540EM Gigabit Ethernet (QEMU `e1000` device).
+    ///
+    /// This is a fully emulated legacy NIC.  It is significantly slower
+    /// than virtio-net but useful for testing guest drivers that must
+    /// interact with hardware-like register interfaces.
+    ///
+    /// **QEMU only** -- cloud-hypervisor does not support emulated NIC
+    /// models.
+    E1000,
+}
+
+impl NicModel {
+    /// Returns `true` if this NIC model is virtio-based.
+    ///
+    /// Virtio NICs support `iommu_platform` and `ats` flags when the
+    /// virtual IOMMU is enabled; non-virtio models do not.
+    #[must_use]
+    pub const fn is_virtio(self) -> bool {
+        matches!(self, Self::VirtioNet)
+    }
+
+    /// Returns `true` if this NIC model requires QEMU.
+    ///
+    /// Cloud-hypervisor only supports virtio devices; emulated hardware
+    /// models like e1000 are QEMU-specific.
+    #[must_use]
+    pub const fn requires_qemu(self) -> bool {
+        matches!(self, Self::E1000)
+    }
+}
 
 // ── Page-size configuration ──────────────────────────────────────────
 
@@ -166,14 +249,14 @@ impl GuestHugePageConfig {
 /// Complete VM configuration passed through the dispatch chain.
 ///
 /// Constructed by the `#[in_vm]` proc macro from `#[in_vm(…)]`,
-/// `#[hypervisor(…)]`, and `#[guest(…)]` attributes, then carried
-/// through [`run_container_tier`] →
+/// `#[hypervisor(…)]`, `#[guest(…)]`, and `#[network(…)]` attributes,
+/// then carried through [`run_container_tier`] →
 /// [`run_in_vm`] →
 /// [`TestVmParams`].
 ///
 /// All fields have [`Default`] values matching the pre-refactor
 /// behaviour: 1 GiB host hugepages, one 1 GiB guest hugepage,
-/// no vIOMMU.
+/// no vIOMMU, virtio-net NICs.
 ///
 /// [`run_container_tier`]: crate::dispatch::run_container_tier
 /// [`run_in_vm`]: crate::vm::run_in_vm
@@ -186,6 +269,13 @@ pub struct VmConfig {
     pub host_page_size: HostPageSize,
     /// Guest hugepage reservation for the kernel command line.
     pub guest_hugepages: GuestHugePageConfig,
+    /// NIC model for all network interfaces in the VM.
+    ///
+    /// Defaults to [`VirtioNet`](NicModel::VirtioNet).  The
+    /// [`E1000`](NicModel::E1000) variant is only valid with the QEMU
+    /// backend; the `#[in_vm]` proc macro enforces this at compile
+    /// time.
+    pub nic_model: NicModel,
 }
 
 impl VmConfig {
