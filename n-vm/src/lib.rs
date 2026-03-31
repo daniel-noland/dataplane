@@ -35,15 +35,21 @@
 //! - `#[in_vm(cloud_hypervisor)]` -- same as above, explicitly.
 //! - `#[in_vm(qemu)]` -- uses [`Qemu`].
 //!
-//! `#[in_vm]` must appear **above** `#[test]` so that it can strip the
-//! `async` keyword (for async tests) before the test harness validates
-//! the function signature.  This ordering is recommended for sync tests
-//! as well for consistency:
+//! `#[in_vm]` must appear **above** `#[test]` or `#[tokio::test]` so
+//! that it can strip the `async` keyword (for async tests) before the
+//! test harness validates the function signature.  This ordering is
+//! recommended for sync tests as well for consistency:
 //!
 //! ```ignore
 //! #[in_vm]
 //! #[test]
 //! async fn my_async_test() { /* … */ }
+//!
+//! // #[tokio::test] is also accepted -- rewritten to #[test] with
+//! // runtime config gleaned from its arguments.
+//! #[in_vm]
+//! #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+//! async fn my_multi_threaded_test() { /* … */ }
 //! ```
 //!
 //! Optional companion attributes configure the VM (below `#[in_vm]`):

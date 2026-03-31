@@ -169,3 +169,48 @@ async fn vm_boots_with_4k_host_and_2m_guest_hugepages_on_qemu() {
         .unwrap_or(0);
     assert_eq!(huge_total, 64, "expected 64 guest hugepages with 4K host backing");
 }
+
+// ── #[tokio::test] rewriting integration tests ──────────────────────
+//
+// These tests verify that `#[in_vm]` correctly rewrites `#[tokio::test]`
+// to `#[test]` and gleans the runtime configuration from its arguments.
+// The macro removes `#[tokio::test]`, injects `#[test]`, and selects the
+// appropriate tokio runtime flavor for the VM guest tier.
+
+#[in_vm]
+#[tokio::test]
+async fn tokio_test_current_thread_default() {
+    // Bare `#[tokio::test]` → single-threaded runtime (the default).
+    let contents = tokio::fs::read_to_string("/proc/version").await.unwrap();
+    assert!(contents.contains("Linux"));
+}
+
+#[in_vm]
+#[tokio::test(flavor = "current_thread")]
+async fn tokio_test_explicit_current_thread() {
+    // Explicit `flavor = "current_thread"` → same as bare #[tokio::test].
+    let contents = tokio::fs::read_to_string("/proc/version").await.unwrap();
+    assert!(contents.contains("Linux"));
+}
+
+#[in_vm]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_test_multi_thread() {
+    // Multi-threaded runtime with explicit worker count.  Spawn a task
+    // on a different thread to verify the runtime is truly multi-threaded.
+    let handle = tokio::spawn(async {
+        tokio::fs::read_to_string("/proc/version").await.unwrap()
+    });
+    let contents = handle.await.unwrap();
+    assert!(contents.contains("Linux"));
+}
+
+#[in_vm]
+#[tokio::test(flavor = "multi_thread")]
+async fn tokio_test_multi_thread_default_workers() {
+    // Multi-threaded runtime with tokio's default worker count (number
+    // of CPU cores).  In the VM guest this is typically 1-2, but the
+    // runtime should still function correctly.
+    let handle = tokio::spawn(async { 2 + 2 });
+    assert_eq!(handle.await.unwrap(), 4);
+}

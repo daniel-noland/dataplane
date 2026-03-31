@@ -82,17 +82,27 @@
 //!
 //! # Attribute ordering
 //!
-//! `#[in_vm]` must appear **above** `#[test]` (and any other
-//! non-companion attributes like `#[should_panic]`).  This is required
-//! for `async fn` tests -- the macro must strip the `async` keyword
-//! before the test harness sees the function -- and is the recommended
-//! ordering for sync tests as well for consistency:
+//! `#[in_vm]` must appear **above** `#[test]` or `#[tokio::test]` (and
+//! any other non-companion attributes like `#[should_panic]`).  This is
+//! required for `async fn` tests -- the macro must strip the `async`
+//! keyword before the test harness sees the function -- and is the
+//! recommended ordering for sync tests as well for consistency:
 //!
 //! ```ignore
 //! // ✅ correct -- #[in_vm] is outermost
 //! #[in_vm]
 //! #[test]
 //! async fn works() { /* … */ }
+//!
+//! // ✅ also correct -- #[tokio::test] is rewritten to #[test]
+//! #[in_vm]
+//! #[tokio::test]
+//! async fn also_works() { /* … */ }
+//!
+//! // ✅ multi-threaded runtime gleaned from #[tokio::test] args
+//! #[in_vm]
+//! #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+//! async fn multi_threaded() { /* … */ }
 //!
 //! // ❌ compile error -- test harness sees `async fn` before #[in_vm] can strip it
 //! #[test]
@@ -154,11 +164,37 @@
 //!     let contents = tokio::fs::read_to_string("/proc/version").await.unwrap();
 //!     assert!(contents.contains("Linux"));
 //! }
+//!
+//! // `#[tokio::test]` is also accepted -- the macro rewrites it to
+//! // `#[test]` and gleans the runtime flavor from its arguments.
+//! #[in_vm]
+//! #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+//! async fn test_async_multi_thread() {
+//!     let contents = tokio::fs::read_to_string("/proc/version").await.unwrap();
+//!     assert!(contents.contains("Linux"));
+//! }
 //! ```
 //!
 //! The decorated function must be `fn()` or `async fn()` with no parameters
-//! and no return value.  Do **not** use `#[tokio::test]` -- `#[in_vm]` manages
-//! its own runtime; use `#[test]` instead.
+//! and no return value.
+//!
+//! ## `#[tokio::test]` support
+//!
+//! `#[tokio::test]` is accepted as an alternative to `#[test]` for
+//! async functions.  When detected, the macro:
+//!
+//! 1. Removes `#[tokio::test]` and injects `#[test]` (if not already
+//!    present).
+//! 2. Parses `flavor` and `worker_threads` to select the VM guest
+//!    tier's tokio runtime:
+//!    - `#[tokio::test]` or `flavor = "current_thread"` →
+//!      single-threaded (default).
+//!    - `flavor = "multi_thread"` → multi-threaded runtime.
+//!    - `worker_threads = N` → explicit worker thread count.
+//!
+//! Other `#[tokio::test]` options (`start_paused`, `crate`, etc.) are
+//! silently accepted but do not affect runtime construction in the
+//! guest.
 
 extern crate proc_macro;
 
@@ -631,6 +667,102 @@ fn parse_network_attr(attr: &syn::Attribute) -> syn::Result<NetworkArgs> {
     Ok(args)
 }
 
+// ── #[tokio::test] rewriting ─────────────────────────────────────────
+
+/// Parsed runtime configuration gleaned from a `#[tokio::test(…)]`
+/// attribute.
+///
+/// When `#[in_vm]` detects `#[tokio::test]` among the decorated
+/// function's attributes, it removes that attribute, injects `#[test]`
+/// if absent, and uses this configuration to select the appropriate
+/// tokio runtime flavor for the VM guest tier (Tier 3).
+struct TokioTestConfig {
+    /// Use a multi-threaded runtime (`true`) or current-thread
+    /// (`false`, the default -- matching `#[tokio::test]`'s own
+    /// default).
+    multi_thread: bool,
+    /// Explicit worker thread count for the multi-threaded flavor.
+    /// `None` uses tokio's default (number of available CPU cores).
+    worker_threads: Option<usize>,
+}
+
+impl Default for TokioTestConfig {
+    fn default() -> Self {
+        Self {
+            multi_thread: false,
+            worker_threads: None,
+        }
+    }
+}
+
+/// Parses the arguments of a `#[tokio::test(…)]` attribute into a
+/// [`TokioTestConfig`].
+///
+/// Recognised options:
+/// - `flavor = "current_thread" | "multi_thread"` -- runtime flavour.
+/// - `worker_threads = N` -- worker count (multi-thread only).
+///
+/// Other `#[tokio::test]` options (`start_paused`, `crate`, etc.) are
+/// silently ignored -- they don't affect how we construct the runtime.
+///
+/// `#[tokio::test]` without parentheses is treated as
+/// `flavor = "current_thread"` (tokio's own default).
+fn parse_tokio_test_attr(attr: &syn::Attribute) -> syn::Result<TokioTestConfig> {
+    let mut config = TokioTestConfig::default();
+
+    // #[tokio::test] without parentheses → current_thread.
+    if matches!(&attr.meta, syn::Meta::Path(_)) {
+        return Ok(config);
+    }
+
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("flavor") {
+            let value: syn::LitStr = meta.value()?.parse()?;
+            match value.value().as_str() {
+                "current_thread" => {
+                    config.multi_thread = false;
+                }
+                "multi_thread" => {
+                    config.multi_thread = true;
+                }
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        format!(
+                            "unknown tokio runtime flavor `{other}`; \
+                             expected \"current_thread\" or \"multi_thread\"",
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        } else if meta.path.is_ident("worker_threads") {
+            let lit: syn::LitInt = meta.value()?.parse()?;
+            config.worker_threads = Some(lit.base10_parse()?);
+            Ok(())
+        } else {
+            // Silently ignore other tokio::test options (start_paused,
+            // crate, etc.) that don't affect runtime selection.
+            // Consume the `= value` if present to keep the parser in
+            // sync; flag-style options (no `=`) need no consumption.
+            if meta.input.peek(syn::Token![=]) {
+                let _: syn::Expr = meta.value()?.parse()?;
+            }
+            Ok(())
+        }
+    })?;
+
+    Ok(config)
+}
+
+/// Returns `true` if `attr` is `#[tokio::test]` (possibly with
+/// arguments).
+fn is_tokio_test_attr(attr: &syn::Attribute) -> bool {
+    let path = attr.path();
+    let segs: Vec<_> = path.segments.iter().collect();
+    segs.len() == 2 && segs[0].ident == "tokio" && segs[1].ident == "test"
+}
+
 // ── Companion attribute extraction ───────────────────────────────────
 
 /// Crate path prefixes that may qualify companion attribute paths.
@@ -726,21 +858,44 @@ fn extract_and_parse<T: Default>(
 ///
 /// 1. Strips the `async` keyword from the emitted signature (so the
 ///    function satisfies `#[test]`'s `fn()` requirement).
-/// 2. Wraps the original body in a single-threaded tokio runtime
-///    ([`block_on_in_guest`](::n_vm::block_on_in_guest)) for the VM
-///    guest tier only.
+/// 2. Wraps the original body in a tokio runtime
+///    ([`block_on_in_guest`](::n_vm::block_on_in_guest) or
+///    [`block_on_in_guest_multi_thread`](::n_vm::block_on_in_guest_multi_thread))
+///    for the VM guest tier only.
 ///
 /// Tiers 1 (host) and 2 (container) are unaffected -- they never
 /// execute the user's test body.
 ///
-/// **Do not combine with `#[tokio::test]`.**  The `#[in_vm]` macro
-/// manages its own runtime; `#[tokio::test]` would conflict.  Use
-/// `#[test]` instead.
+/// ## `#[tokio::test]` support
 ///
-/// **Attribute ordering:** `#[in_vm]` must appear **above** `#[test]`
-/// so that it can strip `async` before the test harness validates the
-/// function signature.  See the [Attribute ordering](crate#attribute-ordering)
-/// section for details.
+/// `#[tokio::test]` is accepted as an alternative to `#[test]` for
+/// async functions.  When detected, the macro:
+///
+/// 1. Removes `#[tokio::test]` and injects `#[test]` (if not already
+///    present).
+/// 2. Parses the `flavor` and `worker_threads` arguments to select the
+///    runtime for the VM guest tier:
+///    - `#[tokio::test]` or `flavor = "current_thread"` →
+///      single-threaded (default).
+///    - `flavor = "multi_thread"` → multi-threaded runtime.
+///    - `worker_threads = N` → explicit worker thread count.
+///
+/// This allows idiomatic tokio usage:
+///
+/// ```ignore
+/// #[in_vm]
+/// #[tokio::test]
+/// async fn single_threaded() { /* … */ }
+///
+/// #[in_vm]
+/// #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// async fn multi_threaded() { /* … */ }
+/// ```
+///
+/// **Attribute ordering:** `#[in_vm]` must appear **above**
+/// `#[test]`/`#[tokio::test]` so that it can strip `async` before the
+/// test harness validates the function signature.  See the
+/// [Attribute ordering](crate#attribute-ordering) section for details.
 ///
 /// # Companion attributes
 ///
@@ -795,8 +950,8 @@ fn extract_and_parse<T: Default>(
 /// - **Incompatible backend/NIC combinations** -- emulated NIC models
 ///   (`e1000`, `e1000e`) require `#[in_vm(qemu)]`; using them with the
 ///   cloud-hypervisor backend is a compile-time error.
-/// - **`#[tokio::test]`** -- `#[in_vm]` creates its own runtime, so
-///   `#[tokio::test]` is rejected with a hint to use `#[test]` instead.
+/// - **`#[tokio::test]` with unrecognised flavor** -- only
+///   `"current_thread"` and `"multi_thread"` are accepted.
 ///
 /// # Panics
 ///
@@ -819,26 +974,30 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
 
     let is_async = func.sig.asyncness.is_some();
 
-    // Reject #[tokio::test] -- it conflicts with our runtime management.
-    // Best-effort detection: check for `tokio::test` in the remaining
-    // attributes.  This catches the common case; exotic re-exports will
-    // fail with a less helpful error at link time.
-    if let Some(tokio_attr) = func.attrs.iter().find(|a| {
-        let path = a.path();
-        let segs: Vec<_> = path.segments.iter().collect();
-        segs.len() == 2 && segs[0].ident == "tokio" && segs[1].ident == "test"
-    }) {
-        return syn::Error::new_spanned(
-            tokio_attr,
-            "#[in_vm] manages its own tokio runtime and is incompatible \
-             with #[tokio::test]; use #[test] instead\n\n\
-             #[in_vm]\n\
-             #[test]\n\
-             async fn my_test() { /* async code works here */ }",
-        )
-        .to_compile_error()
-        .into();
-    }
+    // ── Detect and rewrite #[tokio::test] ────────────────────────────
+    //
+    // When `#[in_vm]` is the outermost attribute it processes first and
+    // receives `#[tokio::test]` as a plain attribute on the function.
+    // Rather than rejecting it, we extract the runtime configuration
+    // (flavor, worker_threads), remove the attribute, and inject
+    // `#[test]` so the test harness is happy.
+    let tokio_config = if let Some(idx) = func.attrs.iter().position(is_tokio_test_attr) {
+        let tokio_attr = func.attrs.remove(idx);
+        let config = match parse_tokio_test_attr(&tokio_attr) {
+            Ok(c) => c,
+            Err(err) => return err.to_compile_error().into(),
+        };
+
+        // Inject `#[test]` if the user didn't also write it explicitly.
+        let has_test_attr = func.attrs.iter().any(|a| a.path().is_ident("test"));
+        if !has_test_attr {
+            func.attrs.push(syn::parse_quote!(#[test]));
+        }
+
+        Some(config)
+    } else {
+        None
+    };
 
     if !func.sig.inputs.is_empty() {
         return syn::Error::new_spanned(
@@ -917,10 +1076,30 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
     let nic_model = &network_args.nic_model;
 
     // Tier 3 body: for sync functions, inline the block directly.
-    // For async functions, wrap in a single-threaded tokio runtime via
-    // `block_on_in_guest` so that `.await` works inside the VM guest.
+    // For async functions, wrap in a tokio runtime via `block_on_in_guest`
+    // (or its multi-threaded variant) so that `.await` works inside the
+    // VM guest.  When `#[tokio::test]` was present, its parsed
+    // flavor/worker_threads determine which runtime to use.
     let tier3_body = if is_async {
-        quote! { ::n_vm::block_on_in_guest(async { #block }); }
+        match tokio_config {
+            Some(TokioTestConfig { multi_thread: true, worker_threads }) => {
+                let workers = match worker_threads {
+                    Some(n) => quote! { ::core::option::Option::Some(#n) },
+                    None => quote! { ::core::option::Option::None },
+                };
+                quote! {
+                    ::n_vm::block_on_in_guest_multi_thread(
+                        #workers,
+                        async { #block },
+                    );
+                }
+            }
+            // Default: current-thread (bare #[test], #[tokio::test], or
+            // #[tokio::test(flavor = "current_thread")]).
+            _ => {
+                quote! { ::n_vm::block_on_in_guest(async { #block }); }
+            }
+        }
     } else {
         quote! { #block }
     };
