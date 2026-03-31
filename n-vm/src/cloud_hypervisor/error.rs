@@ -27,7 +27,7 @@
 /// preserving the full error chain for diagnostics while keeping the
 /// generic [`VmError`](crate::error::VmError) enum free of
 /// cloud-hypervisor-specific variants.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum CloudHypervisorError {
     /// The event-monitor pipe between the container tier and
     /// cloud-hypervisor could not be created.
@@ -36,6 +36,11 @@ pub enum CloudHypervisorError {
     /// events (boot, shutdown, panic, etc.) over a Unix pipe.  This
     /// error indicates the initial `pipe()` call failed.
     #[error("failed to create event monitor pipe")]
+    #[diagnostic(
+        code(n_vm::cloud_hypervisor::event_pipe),
+        help("the initial pipe() syscall for cloud-hypervisor's --event-monitor \
+              fd=N failed -- check system resource limits (ulimit -n)")
+    )]
     EventPipe(#[source] std::io::Error),
 
     /// The event-monitor pipe sender could not be converted to a blocking
@@ -45,6 +50,7 @@ pub enum CloudHypervisorError {
     /// must be a regular blocking fd so that cloud-hypervisor (which does
     /// its own I/O) can write to it directly.
     #[error("failed to convert event monitor sender to blocking fd")]
+    #[diagnostic(code(n_vm::cloud_hypervisor::event_sender_fd))]
     EventSenderFd(#[source] std::io::Error),
 
     /// File-descriptor mapping for the cloud-hypervisor child process
@@ -53,6 +59,11 @@ pub enum CloudHypervisorError {
     /// The inner value is a stringified `command_fds::FdMappingCollision`
     /// because that type does not implement [`std::error::Error`].
     #[error("failed to set up fd mappings for cloud-hypervisor: {0}")]
+    #[diagnostic(
+        code(n_vm::cloud_hypervisor::fd_mapping),
+        help("this usually means an fd collision in the command-fds mapping; \
+              check that no other code has claimed the target fd")
+    )]
     FdMapping(String),
 
     /// The event-monitor pipe was not readable after the hypervisor
@@ -63,6 +74,11 @@ pub enum CloudHypervisorError {
     /// signal that the VMM has initialised.  This error means the pipe
     /// never became readable.
     #[error("event monitor pipe not readable after hypervisor start")]
+    #[diagnostic(
+        code(n_vm::cloud_hypervisor::event_monitor_not_readable),
+        help("cloud-hypervisor may have crashed before emitting its first \
+              lifecycle event -- check the hypervisor stderr for details")
+    )]
     EventMonitorNotReadable(#[source] std::io::Error),
 
     /// The cloud-hypervisor REST API rejected the `create_vm` request.
@@ -74,6 +90,11 @@ pub enum CloudHypervisorError {
     ///
     /// [`VmConfig`]: cloud_hypervisor_client::models::VmConfig
     #[error("cloud-hypervisor API rejected create_vm: {reason}")]
+    #[diagnostic(
+        code(n_vm::cloud_hypervisor::vm_create),
+        help("the cloud-hypervisor REST API refused the VM configuration -- \
+              check the `reason` field and cloud-hypervisor logs for details")
+    )]
     VmCreate {
         /// Stringified error from the cloud-hypervisor API client.
         ///
@@ -89,6 +110,12 @@ pub enum CloudHypervisorError {
     /// to begin guest execution.  This error indicates that request was
     /// rejected.
     #[error("cloud-hypervisor API rejected boot_vm: {reason}")]
+    #[diagnostic(
+        code(n_vm::cloud_hypervisor::vm_boot),
+        help("create_vm succeeded but boot_vm was rejected -- this can happen \
+              if the kernel image is missing, the virtio devices failed to \
+              initialise, or the VM configuration is internally inconsistent")
+    )]
     VmBoot {
         /// Stringified error from the cloud-hypervisor API client.
         ///

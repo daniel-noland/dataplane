@@ -27,7 +27,7 @@
 /// by the [`Qemu`](super::Qemu) launch and shutdown sequences, preserving
 /// the full error chain for diagnostics while keeping the generic
 /// [`VmError`](crate::error::VmError) enum free of QEMU-specific variants.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum QemuError {
     /// Failed to connect to the QMP Unix socket.
     ///
@@ -37,6 +37,11 @@ pub enum QemuError {
     /// async events.  This error means the connection attempt failed
     /// after the socket appeared on the filesystem.
     #[error("failed to connect to QMP socket")]
+    #[diagnostic(
+        code(n_vm::qemu::qmp_connect),
+        help("QEMU may have exited before creating the QMP socket -- \
+              check the hypervisor stderr for early startup failures")
+    )]
     QmpConnect(#[source] std::io::Error),
 
     /// The QMP greeting was not received or could not be parsed.
@@ -46,6 +51,12 @@ pub enum QemuError {
     /// indicates the greeting was absent, malformed, or could not be
     /// deserialized into that type.
     #[error("QMP greeting not received or malformed: {reason}")]
+    #[diagnostic(
+        code(n_vm::qemu::qmp_greeting),
+        help("QEMU should send a QapiCapabilities JSON greeting immediately \
+              on connection -- a malformed or missing greeting usually means \
+              the QEMU version is incompatible or the socket is not a QMP socket")
+    )]
     QmpGreeting {
         /// Description of what went wrong with the greeting.
         reason: String,
@@ -57,6 +68,11 @@ pub enum QemuError {
     /// `{"execute": "qmp_capabilities"}` to enter command mode.  This
     /// error indicates QEMU rejected the negotiation request.
     #[error("QMP capabilities negotiation failed: {reason}")]
+    #[diagnostic(
+        code(n_vm::qemu::qmp_negotiate),
+        help("the qmp_capabilities handshake was rejected -- this can \
+              indicate a QEMU version mismatch or a protocol error")
+    )]
     QmpNegotiate {
         /// The error message or description from the QMP response.
         reason: String,
@@ -68,6 +84,12 @@ pub enum QemuError {
     /// `query-status`, `system_powerdown`, `quit`) that QEMU rejected
     /// with an error response.
     #[error("QMP command `{command}` failed: {reason}")]
+    #[diagnostic(
+        code(n_vm::qemu::qmp_command),
+        help("a QMP command was rejected by QEMU -- check the `reason` \
+              field for details; common causes include invalid arguments \
+              or issuing commands in an unexpected VM state")
+    )]
     QmpCommand {
         /// The QMP command that was sent (e.g. `"system_powerdown"`).
         command: String,
@@ -81,6 +103,11 @@ pub enum QemuError {
     /// successful connection, such as unexpected disconnection or pipe
     /// errors mid-conversation.
     #[error("QMP I/O error")]
+    #[diagnostic(
+        code(n_vm::qemu::qmp_io),
+        help("the QMP socket connection was lost mid-conversation -- \
+              QEMU may have crashed or been killed externally")
+    )]
     QmpIo(#[source] std::io::Error),
 
     /// A QMP response could not be deserialized from JSON.
@@ -89,5 +116,10 @@ pub enum QemuError {
     /// This error indicates a response was received but could not be
     /// parsed into the expected structure.
     #[error("failed to deserialize QMP response")]
+    #[diagnostic(
+        code(n_vm::qemu::qmp_deserialize),
+        help("a QMP JSON response could not be parsed -- this may indicate \
+              a QEMU version mismatch or an unexpected async event format")
+    )]
     QmpDeserialize(#[source] serde_json::Error),
 }
