@@ -91,7 +91,8 @@ pub use cloud_hypervisor::CloudHypervisor;
 pub use config::{GuestHugePageConfig, GuestHugePageSize, HostPageSize, NicModel, VmConfig};
 pub use container::{ContainerTestResult, run_test_in_vm};
 pub use dispatch::{
-    block_on_in_guest, is_in_test_container, is_in_vm, run_container_tier, run_host_tier,
+    block_on_in_guest, block_on_in_guest_multi_thread, is_in_test_container, is_in_vm,
+    run_container_tier, run_host_tier,
 };
 pub use error::{ContainerError, VmError};
 pub use n_vm_macros::{guest, hypervisor, in_vm, network};
