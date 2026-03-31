@@ -6,7 +6,8 @@
 //! Proc macro crate for the `n-vm` test infrastructure.
 //!
 //! This crate provides the [`in_vm`] attribute macro and its companion
-//! attributes [`hypervisor`] and [`guest`], which together rewrite a
+//! attributes [`hypervisor`], [`guest`], and [`network`], which together
+//! rewrite a
 //! test function so that it transparently runs inside an ephemeral
 //! virtual machine.
 //!
@@ -46,7 +47,7 @@
 //!
 //! # VM configuration
 //!
-//! Two optional companion attributes configure the VM environment.
+//! Three optional companion attributes configure the VM environment.
 //! They must appear **below** `#[in_vm]` on the same function so that
 //! the `#[in_vm]` proc macro can consume them before the compiler
 //! attempts to expand them independently.
@@ -68,6 +69,16 @@
 //! When `hugepage_size = "none"`, guest hugepages are disabled entirely
 //! (DPDK must use `--no-huge`), and `hugepage_count` must not be
 //! specified.
+//!
+//! ## `#[network(…)]` -- network interface configuration
+//!
+//! | Option | Values | Default | Description |
+//! |--------|--------|---------|-------------|
+//! | `nic_model` | `"virtio_net"`, `"e1000"` | `"virtio_net"` | NIC model for all interfaces |
+//!
+//! The `e1000` NIC model is only supported with the QEMU backend
+//! (`#[in_vm(qemu)]`).  Using it with cloud-hypervisor is a
+//! compile-time error.
 //!
 //! # Usage
 //!
@@ -98,6 +109,14 @@
 //! fn test_dpdk_no_huge() {
 //!     assert!(std::path::Path::new("/proc").exists());
 //! }
+//!
+//! // QEMU backend with e1000 NICs (emulated Intel 82540EM)
+//! #[test]
+//! #[in_vm(qemu)]
+//! #[network(nic_model = "e1000")]
+//! fn test_e1000_nics() {
+//!     assert!(std::path::Path::new("/proc").exists());
+//! }
 //! ```
 //!
 //! The decorated function must be a synchronous `fn()` with no parameters and
@@ -124,6 +143,9 @@ const KNOWN_BACKENDS: &[(&str, &str)] = &[
 /// The type path used when no backend is specified (`#[in_vm]`).
 const DEFAULT_BACKEND_PATH: &str = "::n_vm::CloudHypervisor";
 
+/// The backend identifier used when no backend is specified (`#[in_vm]`).
+const DEFAULT_BACKEND_NAME: &str = "cloud_hypervisor";
+
 /// Recognised option identifiers that have migrated from `#[in_vm]` to
 /// companion attributes.
 ///
@@ -144,15 +166,15 @@ fn known_backend_list() -> String {
         .join(", ")
 }
 
-/// Resolves a backend identifier to the corresponding type path.
+/// Resolves a backend identifier to its name and type path.
 ///
 /// Returns `None` if the identifier is not recognised as a backend.
 #[must_use]
-fn resolve_backend(ident: &str) -> Option<&'static str> {
+fn resolve_backend(ident: &str) -> Option<(&'static str, &'static str)> {
     KNOWN_BACKENDS
         .iter()
         .find(|(name, _)| *name == ident)
-        .map(|(_, path)| *path)
+        .copied()
 }
 
 /// If `ident` is a migrated option, returns the migration hint.
@@ -166,10 +188,20 @@ fn migration_hint(ident: &str) -> Option<&'static str> {
 
 // ── #[in_vm] argument parsing ────────────────────────────────────────
 
+/// Resolved backend from `#[in_vm(…)]` parsing.
+struct BackendInfo {
+    /// Token stream for the backend type path (e.g. `::n_vm::Qemu`).
+    path: proc_macro2::TokenStream,
+    /// The backend identifier string (e.g. `"qemu"`, `"cloud_hypervisor"`).
+    name: &'static str,
+}
+
 /// Parses the `#[in_vm(…)]` attribute arguments, which now contain
 /// **only** the backend selector (zero or one identifier).
 ///
-/// Returns the resolved backend type path as a token stream.
+/// Returns a [`BackendInfo`] with the resolved type path and identifier
+/// name (used for cross-attribute validation, e.g. rejecting e1000 on
+/// cloud-hypervisor).
 ///
 /// # Errors
 ///
@@ -178,11 +210,14 @@ fn migration_hint(ident: &str) -> Option<&'static str> {
 /// - The identifier is not a recognised backend.
 /// - More than one backend identifier is specified.
 /// - A migrated option (e.g. `iommu`) is used in `#[in_vm(…)]`.
-fn parse_in_vm_backend(attr: TokenStream) -> syn::Result<proc_macro2::TokenStream> {
+fn parse_in_vm_backend(attr: TokenStream) -> syn::Result<BackendInfo> {
     if attr.is_empty() {
-        return Ok(DEFAULT_BACKEND_PATH
-            .parse()
-            .expect("DEFAULT_BACKEND_PATH is a valid token stream"));
+        return Ok(BackendInfo {
+            path: DEFAULT_BACKEND_PATH
+                .parse()
+                .expect("DEFAULT_BACKEND_PATH is a valid token stream"),
+            name: DEFAULT_BACKEND_NAME,
+        });
     }
 
     // Parse as a punctuated list of identifiers separated by commas.
@@ -206,7 +241,7 @@ fn parse_in_vm_backend(attr: TokenStream) -> syn::Result<proc_macro2::TokenStrea
             &idents[1],
             "only one backend identifier is allowed in #[in_vm]; \
              VM options have moved to companion attributes \
-             (#[hypervisor(…)], #[guest(…)])",
+             (#[hypervisor(…)], #[guest(…)], #[network(…)])",
         ));
     }
 
@@ -224,10 +259,13 @@ fn parse_in_vm_backend(attr: TokenStream) -> syn::Result<proc_macro2::TokenStrea
         ));
     }
 
-    if let Some(path) = resolve_backend(&ident_str) {
-        Ok(path
-            .parse()
-            .expect("KNOWN_BACKENDS paths are valid token streams"))
+    if let Some((name, path)) = resolve_backend(&ident_str) {
+        Ok(BackendInfo {
+            path: path
+                .parse()
+                .expect("KNOWN_BACKENDS paths are valid token streams"),
+            name,
+        })
     } else {
         Err(syn::Error::new_spanned(
             ident,
@@ -467,6 +505,90 @@ fn parse_guest_attr(attr: &syn::Attribute) -> syn::Result<GuestArgs> {
     Ok(GuestArgs { guest_hugepages })
 }
 
+// ── #[network] argument parsing ──────────────────────────────────────
+
+/// Parsed arguments from a `#[network(…)]` companion attribute.
+struct NetworkArgs {
+    /// NIC model as a fully-qualified token stream
+    /// (e.g. `::n_vm::NicModel::VirtioNet`).
+    nic_model: proc_macro2::TokenStream,
+    /// Whether this NIC model requires the QEMU backend.
+    ///
+    /// Set to `true` for models that cloud-hypervisor does not support
+    /// (e.g. `e1000`).  Used for cross-attribute validation in
+    /// [`in_vm`].
+    requires_qemu: bool,
+}
+
+impl Default for NetworkArgs {
+    fn default() -> Self {
+        Self {
+            nic_model: quote! { ::n_vm::NicModel::VirtioNet },
+            requires_qemu: false,
+        }
+    }
+}
+
+/// Parses the content of a `#[network(…)]` attribute.
+///
+/// Accepts:
+/// - `nic_model = "virtio_net" | "e1000"` -- NIC model for all
+///   interfaces.
+///
+/// `#[network]` (no parentheses) is treated as all-defaults.
+fn parse_network_attr(attr: &syn::Attribute) -> syn::Result<NetworkArgs> {
+    let mut args = NetworkArgs::default();
+
+    // #[network] without parentheses → all defaults.
+    if matches!(&attr.meta, syn::Meta::Path(_)) {
+        return Ok(args);
+    }
+
+    let mut nic_model_seen = false;
+
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("nic_model") {
+            if nic_model_seen {
+                return Err(meta.error("duplicate `nic_model` option in #[network]"));
+            }
+            nic_model_seen = true;
+            let value: syn::LitStr = meta.value()?.parse()?;
+            match value.value().as_str() {
+                "virtio_net" => {
+                    args.nic_model = quote! { ::n_vm::NicModel::VirtioNet };
+                    args.requires_qemu = false;
+                }
+                "e1000" => {
+                    args.nic_model = quote! { ::n_vm::NicModel::E1000 };
+                    args.requires_qemu = true;
+                }
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        format!(
+                            "unknown NIC model `{other}` in #[network]; \
+                             valid values are: \"virtio_net\", \"e1000\"",
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        } else {
+            let name = meta
+                .path
+                .get_ident()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "<path>".into());
+            Err(meta.error(format!(
+                "unknown #[network] option `{name}`; \
+                 valid options are: `nic_model`",
+            )))
+        }
+    })?;
+
+    Ok(args)
+}
+
 // ── Companion attribute extraction ───────────────────────────────────
 
 /// Crate path prefixes that may qualify companion attribute paths.
@@ -590,8 +712,8 @@ fn extract_and_parse<T: Default>(
 pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
     // ── Parse backend selection ──────────────────────────────────────
 
-    let backend_path = match parse_in_vm_backend(attr) {
-        Ok(path) => path,
+    let backend = match parse_in_vm_backend(attr) {
+        Ok(info) => info,
         Err(err) => return err.to_compile_error().into(),
     };
 
@@ -642,6 +764,30 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error().into(),
     };
 
+    let network_args = match extract_and_parse(&mut func.attrs, "network", parse_network_attr) {
+        Ok(args) => args,
+        Err(err) => return err.to_compile_error().into(),
+    };
+
+    // ── Cross-attribute validation ───────────────────────────────────
+
+    // e1000 (and future emulated NIC models) require QEMU -- cloud-
+    // hypervisor only supports virtio devices.  Reject the combination
+    // at compile time rather than deferring to a runtime panic.
+    if network_args.requires_qemu && backend.name != "qemu" {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "the selected NIC model requires the QEMU backend, but the \
+                 current backend is `{backend}`; use #[in_vm(qemu)] with \
+                 emulated NIC models like e1000",
+                backend = backend.name,
+            ),
+        )
+        .to_compile_error()
+        .into();
+    }
+
     // ── Code generation ──────────────────────────────────────────────
 
     let block = &func.block;
@@ -650,9 +796,11 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
     let attrs = &func.attrs; // remaining attrs after companion extraction
     let ident = &func.sig.ident;
 
+    let backend_path = &backend.path;
     let iommu = hypervisor_args.iommu;
     let host_page_size = &hypervisor_args.host_page_size;
     let guest_hugepages = &guest_args.guest_hugepages;
+    let nic_model = &network_args.nic_model;
 
     // The three tiers are dispatched as a flat if-chain.
     // Each tier is identified by an environment variable set by the
@@ -679,6 +827,7 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
                         iommu: #iommu,
                         host_page_size: #host_page_size,
                         guest_hugepages: #guest_hugepages,
+                        nic_model: #nic_model,
                     },
                 );
                 return;
@@ -739,6 +888,37 @@ pub fn guest(_attr: TokenStream, input: TokenStream) -> TokenStream {
          appear below it on the same function; e.g.\n\n\
          #[in_vm]\n\
          #[guest(hugepage_size = \"2m\", hugepage_count = 512)]\n\
+         fn my_test() { ... }",
+    )
+    .to_compile_error();
+
+    // Re-emit the original item so that downstream code does not see
+    // cascading "not found" errors from the missing function.
+    let input2: proc_macro2::TokenStream = input.into();
+    quote! {
+        #error
+        #input2
+    }
+    .into()
+}
+
+/// Companion attribute for [`in_vm`] -- network interface configuration.
+///
+/// This attribute is consumed by the `#[in_vm]` proc macro and must
+/// appear **below** it on the same function.
+/// If it is expanded independently (wrong order or missing `#[in_vm]`),
+/// it emits a compile error with a usage hint.
+///
+/// See the [crate-level documentation](crate) for the option reference
+/// and usage examples.
+#[proc_macro_attribute]
+pub fn network(_attr: TokenStream, input: TokenStream) -> TokenStream {
+    let error = syn::Error::new(
+        proc_macro2::Span::call_site(),
+        "#[network] must be used together with #[in_vm] and must \
+         appear below it on the same function; e.g.\n\n\
+         #[in_vm(qemu)]\n\
+         #[network(nic_model = \"e1000\")]\n\
          fn my_test() { ... }",
     )
     .to_compile_error();
