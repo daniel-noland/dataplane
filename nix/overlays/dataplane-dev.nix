@@ -70,6 +70,7 @@ in
         "net-core.config"
         "net-tc-qos.config"
         "net-virt-devices.config"
+        "intel-e1000.config"
         "mlx5-sriov.config"
         # "debug-fuzz.config"
         "disable.config"
