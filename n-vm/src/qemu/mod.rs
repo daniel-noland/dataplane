@@ -946,7 +946,7 @@ mod tests {
     #[test]
     fn network_args_have_three_interfaces() {
         let mut args = Vec::new();
-        push_network_args(&mut args, false);
+        push_network_args(&mut args, false, config::NicModel::VirtioNet);
         let netdev_count = args.iter().filter(|a| a.starts_with("tap,")).count();
         let device_count = args
             .iter()
@@ -959,7 +959,7 @@ mod tests {
     #[test]
     fn all_interfaces_have_unique_mac_addresses() {
         let mut args = Vec::new();
-        push_network_args(&mut args, false);
+        push_network_args(&mut args, false, config::NicModel::VirtioNet);
         let macs: Vec<&str> = args
             .iter()
             .filter_map(|a| {
@@ -978,7 +978,7 @@ mod tests {
     #[test]
     fn all_interfaces_have_unique_tap_names() {
         let mut args = Vec::new();
-        push_network_args(&mut args, false);
+        push_network_args(&mut args, false, config::NicModel::VirtioNet);
         let taps: Vec<&str> = args
             .iter()
             .filter_map(|a| {
@@ -1130,7 +1130,7 @@ mod tests {
     #[test]
     fn network_devices_have_iommu_platform_when_enabled() {
         let mut args = Vec::new();
-        push_network_args(&mut args, true);
+        push_network_args(&mut args, true, config::NicModel::VirtioNet);
         let devices: Vec<&String> = args
             .iter()
             .filter(|a| a.starts_with("virtio-net-pci-non-transitional,"))
@@ -1148,13 +1148,89 @@ mod tests {
     #[test]
     fn network_devices_omit_iommu_platform_when_disabled() {
         let mut args = Vec::new();
-        push_network_args(&mut args, false);
+        push_network_args(&mut args, false, config::NicModel::VirtioNet);
         for arg in &args {
             assert!(
                 !arg.contains("iommu_platform"),
                 "should not contain iommu_platform when disabled: {arg}",
             );
         }
+    }
+
+    // ── e1000 NIC model ──────────────────────────────────────────────
+
+    #[test]
+    fn e1000_network_args_have_three_interfaces() {
+        let mut args = Vec::new();
+        push_network_args(&mut args, false, config::NicModel::E1000);
+        let netdev_count = args.iter().filter(|a| a.starts_with("tap,")).count();
+        let device_count = args
+            .iter()
+            .filter(|a| a.starts_with("e1000,"))
+            .count();
+        assert_eq!(netdev_count, 3);
+        assert_eq!(device_count, 3);
+    }
+
+    #[test]
+    fn e1000_devices_have_no_iommu_platform_even_when_enabled() {
+        let mut args = Vec::new();
+        push_network_args(&mut args, true, config::NicModel::E1000);
+        let devices: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("e1000,"))
+            .collect();
+        assert_eq!(devices.len(), 3);
+        for dev in &devices {
+            assert!(
+                !dev.contains("iommu_platform"),
+                "e1000 should not have iommu_platform: {dev}",
+            );
+            assert!(
+                !dev.contains("ats="),
+                "e1000 should not have ats: {dev}",
+            );
+        }
+    }
+
+    #[test]
+    fn e1000_devices_have_correct_mac_addresses() {
+        let mut args = Vec::new();
+        push_network_args(&mut args, false, config::NicModel::E1000);
+        let macs: Vec<&str> = args
+            .iter()
+            .filter_map(|a| {
+                a.split(',')
+                    .find(|part| part.starts_with("mac="))
+                    .map(|p| &p[4..])
+            })
+            .collect();
+        assert_eq!(macs.len(), 3);
+        let mut unique = macs.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "e1000 MAC addresses must be unique: {macs:?}");
+    }
+
+    #[test]
+    fn e1000_network_args_use_same_tap_devices_as_virtio() {
+        let mut virtio_args = Vec::new();
+        push_network_args(&mut virtio_args, false, config::NicModel::VirtioNet);
+        let mut e1000_args = Vec::new();
+        push_network_args(&mut e1000_args, false, config::NicModel::E1000);
+
+        let virtio_taps: Vec<&String> = virtio_args
+            .iter()
+            .filter(|a| a.starts_with("tap,"))
+            .collect();
+        let e1000_taps: Vec<&String> = e1000_args
+            .iter()
+            .filter(|a| a.starts_with("tap,"))
+            .collect();
+        assert_eq!(
+            virtio_taps, e1000_taps,
+            "TAP netdevs should be identical regardless of NIC model",
+        );
     }
 
     #[test]
