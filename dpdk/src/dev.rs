@@ -17,7 +17,7 @@ use crate::queue::hairpin::{HairpinConfigFailure, HairpinQueue};
 use crate::queue::rx::{RxQueue, RxQueueConfig, RxQueueIndex};
 use crate::queue::tx::{TxQueue, TxQueueConfig, TxQueueIndex};
 use crate::socket::SocketId;
-use dpdk_sys::rte_eth_rx_mq_mode::RTE_ETH_MQ_RX_RSS;
+use dpdk_sys::rte_eth_rx_mq_mode::RTE_ETH_MQ_RX_NONE;
 use dpdk_sys::rte_eth_rx_offload;
 use dpdk_sys::rte_eth_tx_mq_mode::RTE_ETH_MQ_TX_NONE;
 use dpdk_sys::*;
@@ -26,10 +26,18 @@ use queue::{rx, tx};
 
 /// Defaults for the RX queue
 pub(crate) mod rx_queue_defaults {
-    /// Default MTU of an RX queue
-    pub(crate) const RX_MTU: u32 = 1514;
-    /// Default max LRO packet size for RX queue
-    pub(crate) const MAX_LRO: u32 = 8192;
+    /// Default payload MTU of an RX queue (standard Ethernet).
+    ///
+    /// This is the payload MTU (1500), **not** the frame size (1514).
+    /// `rte_eth_rxmode.mtu` expects the payload MTU.
+    pub(crate) const RX_MTU: u32 = 1500;
+    /// Default max LRO packet size for RX queue.
+    ///
+    /// `0` means "use the device's own default", which is the only safe
+    /// choice — the required value varies per device (e.g. virtio
+    /// reports 9728) and a mismatch causes `rte_eth_dev_configure` to
+    /// reject the configuration.
+    pub(crate) const MAX_LRO: u32 = 0;
 }
 
 /// A DPDK Ethernet port index.
@@ -252,7 +260,7 @@ impl DevConfig {
             },
             rxmode: rte_eth_rxmode {
                 mtu: rx_queue_defaults::RX_MTU,
-                mq_mode: RTE_ETH_MQ_RX_RSS,
+                mq_mode: RTE_ETH_MQ_RX_NONE,
                 max_lro_pkt_size: rx_queue_defaults::MAX_LRO,
                 offloads: {
                     let requested = self
