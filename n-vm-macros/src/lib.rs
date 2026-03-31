@@ -135,6 +135,7 @@ const MIGRATED_OPTIONS: &[(&str, &str)] = &[
 
 /// Builds a human-readable list of valid backend identifiers for use in
 /// error messages.
+#[must_use]
 fn known_backend_list() -> String {
     KNOWN_BACKENDS
         .iter()
@@ -146,6 +147,7 @@ fn known_backend_list() -> String {
 /// Resolves a backend identifier to the corresponding type path.
 ///
 /// Returns `None` if the identifier is not recognised as a backend.
+#[must_use]
 fn resolve_backend(ident: &str) -> Option<&'static str> {
     KNOWN_BACKENDS
         .iter()
@@ -154,6 +156,7 @@ fn resolve_backend(ident: &str) -> Option<&'static str> {
 }
 
 /// If `ident` is a migrated option, returns the migration hint.
+#[must_use]
 fn migration_hint(ident: &str) -> Option<&'static str> {
     MIGRATED_OPTIONS
         .iter()
@@ -175,7 +178,7 @@ fn migration_hint(ident: &str) -> Option<&'static str> {
 /// - The identifier is not a recognised backend.
 /// - More than one backend identifier is specified.
 /// - A migrated option (e.g. `iommu`) is used in `#[in_vm(…)]`.
-fn parse_in_vm_backend(attr: TokenStream) -> Result<proc_macro2::TokenStream, TokenStream> {
+fn parse_in_vm_backend(attr: TokenStream) -> syn::Result<proc_macro2::TokenStream> {
     if attr.is_empty() {
         return Ok(DEFAULT_BACKEND_PATH
             .parse()
@@ -185,21 +188,16 @@ fn parse_in_vm_backend(attr: TokenStream) -> Result<proc_macro2::TokenStream, To
     // Parse as a punctuated list of identifiers separated by commas.
     use syn::parse::Parser;
     let parser = syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated;
-    let punctuated = match parser.parse(attr) {
-        Ok(p) => p,
-        Err(_) => {
-            return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
-                format!(
-                    "#[in_vm] expects an optional backend identifier; \
-                     valid backends are: {}",
-                    known_backend_list(),
-                ),
-            )
-            .to_compile_error()
-            .into());
-        }
-    };
+    let punctuated = parser.parse(attr).map_err(|_| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "#[in_vm] expects an optional backend identifier; \
+                 valid backends are: {}",
+                known_backend_list(),
+            ),
+        )
+    })?;
 
     let idents: Vec<syn::Ident> = punctuated.into_iter().collect();
 
@@ -209,9 +207,7 @@ fn parse_in_vm_backend(attr: TokenStream) -> Result<proc_macro2::TokenStream, To
             "only one backend identifier is allowed in #[in_vm]; \
              VM options have moved to companion attributes \
              (#[hypervisor(…)], #[guest(…)])",
-        )
-        .to_compile_error()
-        .into());
+        ));
     }
 
     let ident = &idents[0];
@@ -225,9 +221,7 @@ fn parse_in_vm_backend(attr: TokenStream) -> Result<proc_macro2::TokenStream, To
                 "`{ident_str}` has moved out of #[in_vm(…)] — \
                  use {hint} instead",
             ),
-        )
-        .to_compile_error()
-        .into());
+        ));
     }
 
     if let Some(path) = resolve_backend(&ident_str) {
@@ -242,9 +236,7 @@ fn parse_in_vm_backend(attr: TokenStream) -> Result<proc_macro2::TokenStream, To
                  valid backends are: {}",
                 known_backend_list(),
             ),
-        )
-        .to_compile_error()
-        .into())
+        ))
     }
 }
 
@@ -477,18 +469,30 @@ fn parse_guest_attr(attr: &syn::Attribute) -> syn::Result<GuestArgs> {
 
 // ── Companion attribute extraction ───────────────────────────────────
 
-/// Returns `true` if the attribute's path ends with the given
+/// Crate path prefixes that may qualify companion attribute paths.
+///
+/// Users may write `#[n_vm::hypervisor(…)]` (via the re-export in
+/// `n_vm`) or `#[n_vm_macros::hypervisor(…)]` (the defining crate).
+/// Any other prefix is not ours and should not be consumed.
+const KNOWN_ATTR_PREFIXES: &[&str] = &["n_vm", "n_vm_macros"];
+
+/// Returns `true` if the attribute's path matches the given
 /// identifier.
 ///
-/// Handles both bare `#[name]` and qualified `#[n_vm::name]`
-/// forms.
+/// Matches bare `#[name]` and qualified `#[n_vm::name]` /
+/// `#[n_vm_macros::name]` forms.
+/// Other qualified paths (e.g. `#[other_crate::name]`) do not match.
 fn attr_has_name(attr: &syn::Attribute, name: &str) -> bool {
-    attr.path().is_ident(name)
-        || attr
-            .path()
-            .segments
-            .last()
-            .is_some_and(|seg| seg.ident == name)
+    let path = attr.path();
+    if path.is_ident(name) {
+        return true;
+    }
+    let segments: Vec<_> = path.segments.iter().collect();
+    segments.len() == 2
+        && KNOWN_ATTR_PREFIXES
+            .iter()
+            .any(|prefix| segments[0].ident == prefix)
+        && segments[1].ident == name
 }
 
 /// Extracts at most one attribute with the given name from the list,
@@ -515,6 +519,22 @@ fn extract_unique_attr(
     }
 
     Ok(Some(attr))
+}
+
+/// Extracts an optional unique companion attribute by `name`, parses it
+/// with `parse`, and falls back to `T::default()` when absent.
+///
+/// This combines [`extract_unique_attr`] and a parser function into a
+/// single step, eliminating nested `match` arms at the call site.
+fn extract_and_parse<T: Default>(
+    attrs: &mut Vec<syn::Attribute>,
+    name: &str,
+    parse: impl FnOnce(&syn::Attribute) -> syn::Result<T>,
+) -> syn::Result<T> {
+    match extract_unique_attr(attrs, name)? {
+        Some(attr) => parse(&attr),
+        None => Ok(T::default()),
+    }
 }
 
 // ── Code generation ──────────────────────────────────────────────────
@@ -572,7 +592,7 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
 
     let backend_path = match parse_in_vm_backend(attr) {
         Ok(path) => path,
-        Err(err) => return err,
+        Err(err) => return err.to_compile_error().into(),
     };
 
     // ── Parse and validate the function ──────────────────────────────
@@ -611,21 +631,14 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
 
     // ── Extract and parse companion attributes ───────────────────────
 
-    let hypervisor_args = match extract_unique_attr(&mut func.attrs, "hypervisor") {
-        Ok(Some(attr)) => match parse_hypervisor_attr(&attr) {
+    let hypervisor_args =
+        match extract_and_parse(&mut func.attrs, "hypervisor", parse_hypervisor_attr) {
             Ok(args) => args,
             Err(err) => return err.to_compile_error().into(),
-        },
-        Ok(None) => HypervisorArgs::default(),
-        Err(err) => return err.to_compile_error().into(),
-    };
+        };
 
-    let guest_args = match extract_unique_attr(&mut func.attrs, "guest") {
-        Ok(Some(attr)) => match parse_guest_attr(&attr) {
-            Ok(args) => args,
-            Err(err) => return err.to_compile_error().into(),
-        },
-        Ok(None) => GuestArgs::default(),
+    let guest_args = match extract_and_parse(&mut func.attrs, "guest", parse_guest_attr) {
+        Ok(args) => args,
         Err(err) => return err.to_compile_error().into(),
     };
 
