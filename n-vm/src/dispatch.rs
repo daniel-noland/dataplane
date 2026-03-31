@@ -8,7 +8,8 @@
 //! proc macro can select the backend at code-generation time.
 //!
 //! The `#[in_vm]` macro selects the backend, and optional companion
-//! attributes (`#[hypervisor(…)]`, `#[guest(…)]`) configure the VM:
+//! attributes (`#[hypervisor(…)]`, `#[guest(…)]`, `#[network(…)]`)
+//! configure the VM:
 //!
 //! - `#[in_vm]` -- uses
 //!   [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor)
@@ -18,6 +19,8 @@
 //! - `#[hypervisor(host_pages = "4k")]` -- 4 KiB host memory backing.
 //! - `#[guest(hugepage_size = "2m", hugepage_count = 512)]` -- guest
 //!   hugepage reservation.
+//! - `#[network(nic_model = "e1000")]` -- NIC model selection (QEMU
+//!   only for emulated models).
 //!
 //! All parsed attribute values are collected into a [`VmConfig`] that
 //! flows through the dispatch chain.

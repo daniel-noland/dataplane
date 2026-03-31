@@ -41,6 +41,10 @@
 //! - `#[hypervisor(host_pages = "4k")]` -- 4 KiB host memory backing.
 //! - `#[guest(hugepage_size = "2m", hugepage_count = 512)]` -- guest
 //!   hugepage reservation.
+//! - `#[network(nic_model = "e1000")]` -- emulated Intel 82540EM NIC
+//!   (QEMU only).
+//! - `#[network(nic_model = "e1000e")]` -- emulated Intel 82574L NIC
+//!   (QEMU only).
 //!
 //! Callers can also substitute any backend that implements
 //! [`HypervisorBackend`] by invoking the generic functions directly.

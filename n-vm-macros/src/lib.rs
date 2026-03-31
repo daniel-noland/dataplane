@@ -676,25 +676,53 @@ fn extract_and_parse<T: Default>(
 /// Attribute macro that rewrites a test function to run inside an
 /// ephemeral VM.
 ///
-/// See the [crate-level documentation](crate) for a full description of
-/// the three-tier dispatch mechanism, backend selection, companion
-/// attributes, and usage examples.
+/// See the [crate-level documentation](crate) for the three-tier
+/// dispatch mechanism and additional examples.
 ///
 /// # Backend selection
 ///
 /// `#[in_vm]` accepts an optional backend identifier:
 ///
-/// - `#[in_vm]` -- uses [`CloudHypervisor`](::n_vm::CloudHypervisor)
-///   (the default).
-/// - `#[in_vm(cloud_hypervisor)]` -- same as above, explicitly.
-/// - `#[in_vm(qemu)]` -- uses [`Qemu`](::n_vm::Qemu).
+/// | Attribute | Backend |
+/// |-----------|---------|
+/// | `#[in_vm]` | [`CloudHypervisor`](::n_vm::CloudHypervisor) (default) |
+/// | `#[in_vm(cloud_hypervisor)]` | [`CloudHypervisor`](::n_vm::CloudHypervisor) (explicit) |
+/// | `#[in_vm(qemu)]` | [`Qemu`](::n_vm::Qemu) |
 ///
 /// # Companion attributes
 ///
-/// Place `#[hypervisor(…)]` and/or `#[guest(…)]` **below** `#[in_vm]`
-/// on the same function to configure the VM.
-/// See the [crate-level documentation](crate) for the full option
-/// reference.
+/// Three optional companion attributes configure the VM environment.
+/// They must appear **below** `#[in_vm]` on the same function so that
+/// the `#[in_vm]` proc macro can consume them before the compiler
+/// attempts to expand them independently.
+///
+/// ## `#[hypervisor(…)]`
+///
+/// | Option | Values | Default | Description |
+/// |--------|--------|---------|-------------|
+/// | `iommu` | *(flag)* | off | Present a virtual IOMMU device |
+/// | `host_pages` | `"4k"`, `"2m"`, `"1g"` | `"1g"` | Page size backing VM memory on the host |
+///
+/// ## `#[guest(…)]`
+///
+/// | Option | Values | Default | Description |
+/// |--------|--------|---------|-------------|
+/// | `hugepage_size` | `"none"`, `"2m"`, `"1g"` | `"1g"` | Guest hugepage reservation size |
+/// | `hugepage_count` | integer | `1` | Number of guest hugepages to reserve |
+///
+/// When `hugepage_size = "none"`, guest hugepages are disabled entirely
+/// (DPDK must use `--no-huge`), and `hugepage_count` must not be
+/// specified.
+///
+/// ## `#[network(…)]`
+///
+/// | Option | Values | Default | Description |
+/// |--------|--------|---------|-------------|
+/// | `nic_model` | `"virtio_net"`, `"e1000"`, `"e1000e"` | `"virtio_net"` | NIC model for all interfaces |
+///
+/// The `e1000` and `e1000e` NIC models are only supported with the
+/// QEMU backend (`#[in_vm(qemu)]`).  Using them with cloud-hypervisor
+/// is a compile-time error.
 ///
 /// # Compile-time validation
 ///
@@ -707,12 +735,15 @@ fn extract_and_parse<T: Default>(
 ///   bare `return;` statements, so the function must return `()`.
 ///
 /// The macro also rejects:
-/// - **Unrecognised identifiers** in any of the three attributes.
+/// - **Unrecognised identifiers** in any of the four attributes.
 /// - **Duplicate options** within a single attribute.
 /// - **Duplicate companion attributes** (e.g. two `#[hypervisor]`
 ///   blocks).
 /// - **Contradictory options** (e.g. `hugepage_count` with
 ///   `hugepage_size = "none"`).
+/// - **Incompatible backend/NIC combinations** -- emulated NIC models
+///   (`e1000`, `e1000e`) require `#[in_vm(qemu)]`; using them with the
+///   cloud-hypervisor backend is a compile-time error.
 ///
 /// # Panics
 ///
@@ -857,10 +888,26 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
 /// This attribute is consumed by the `#[in_vm]` proc macro and must
 /// appear **below** it on the same function.
 /// If it is expanded independently (wrong order or missing `#[in_vm]`),
-/// it emits a compile error with a migration hint.
+/// it emits a compile error with a usage hint.
 ///
-/// See the [crate-level documentation](crate) for the option reference
-/// and usage examples.
+/// # Options
+///
+/// | Option | Values | Default | Description |
+/// |--------|--------|---------|-------------|
+/// | `iommu` | *(flag)* | off | Present a virtual IOMMU device to the guest |
+/// | `host_pages` | `"4k"`, `"2m"`, `"1g"` | `"1g"` | Page size backing VM memory on the host |
+///
+/// `#[hypervisor]` with no parentheses is accepted and uses all
+/// defaults.
+///
+/// # Example
+///
+/// ```ignore
+/// #[test]
+/// #[in_vm(qemu)]
+/// #[hypervisor(iommu, host_pages = "4k")]
+/// fn my_test() { /* … */ }
+/// ```
 #[proc_macro_attribute]
 pub fn hypervisor(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let error = syn::Error::new(
@@ -888,10 +935,29 @@ pub fn hypervisor(_attr: TokenStream, input: TokenStream) -> TokenStream {
 /// This attribute is consumed by the `#[in_vm]` proc macro and must
 /// appear **below** it on the same function.
 /// If it is expanded independently (wrong order or missing `#[in_vm]`),
-/// it emits a compile error with a migration hint.
+/// it emits a compile error with a usage hint.
 ///
-/// See the [crate-level documentation](crate) for the option reference
-/// and usage examples.
+/// # Options
+///
+/// | Option | Values | Default | Description |
+/// |--------|--------|---------|-------------|
+/// | `hugepage_size` | `"none"`, `"2m"`, `"1g"` | `"1g"` | Guest hugepage reservation size |
+/// | `hugepage_count` | integer | `1` | Number of guest hugepages to reserve |
+///
+/// When `hugepage_size = "none"`, guest hugepages are disabled entirely
+/// (DPDK must use `--no-huge`), and `hugepage_count` must not be
+/// specified.
+///
+/// `#[guest]` with no parentheses is accepted and uses all defaults.
+///
+/// # Example
+///
+/// ```ignore
+/// #[test]
+/// #[in_vm]
+/// #[guest(hugepage_size = "2m", hugepage_count = 512)]
+/// fn my_test() { /* … */ }
+/// ```
 #[proc_macro_attribute]
 pub fn guest(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let error = syn::Error::new(
@@ -921,8 +987,27 @@ pub fn guest(_attr: TokenStream, input: TokenStream) -> TokenStream {
 /// If it is expanded independently (wrong order or missing `#[in_vm]`),
 /// it emits a compile error with a usage hint.
 ///
-/// See the [crate-level documentation](crate) for the option reference
-/// and usage examples.
+/// # Options
+///
+/// | Option | Values | Default | Description |
+/// |--------|--------|---------|-------------|
+/// | `nic_model` | `"virtio_net"`, `"e1000"`, `"e1000e"` | `"virtio_net"` | NIC model for all interfaces |
+///
+/// The `e1000` (Intel 82540EM) and `e1000e` (Intel 82574L) models are
+/// fully emulated legacy NICs supported by **QEMU only**.  Using them
+/// with the cloud-hypervisor backend is a compile-time error.
+///
+/// `#[network]` with no parentheses is accepted and defaults to
+/// `virtio_net`.
+///
+/// # Example
+///
+/// ```ignore
+/// #[test]
+/// #[in_vm(qemu)]
+/// #[network(nic_model = "e1000e")]
+/// fn my_test() { /* … */ }
+/// ```
 #[proc_macro_attribute]
 pub fn network(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let error = syn::Error::new(
