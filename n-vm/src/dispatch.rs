@@ -130,7 +130,12 @@ pub fn run_container_tier<B: HypervisorBackend, F: FnOnce()>(test_fn: F, vm_conf
 
         let output = crate::run_in_vm::<B, _>(test_fn, vm_config)
             .await
-            .unwrap_or_else(|err| panic!("VM infrastructure error: {err:#?}"));
+            .unwrap_or_else(|err| {
+                panic!(
+                    "VM infrastructure error:\n{:?}",
+                    miette::Report::new(err)
+                )
+            });
 
         eprintln!("{output}");
         assert!(output.success, "VM test failed (see output above)");
@@ -162,8 +167,12 @@ pub fn run_container_tier<B: HypervisorBackend, F: FnOnce()>(test_fn: F, vm_conf
 pub fn run_host_tier<F: FnOnce()>(test_fn: F) {
     eprintln!("===== BEGIN NESTED TEST ENVIRONMENT =====");
 
-    let container_state = crate::run_test_in_vm(test_fn)
-        .unwrap_or_else(|err| panic!("test container infrastructure error: {err:#?}"));
+    let container_state = crate::run_test_in_vm(test_fn).unwrap_or_else(|err| {
+        panic!(
+            "test container infrastructure error:\n{:?}",
+            miette::Report::new(err)
+        )
+    });
 
     eprintln!("=====  END NESTED TEST ENVIRONMENT  =====");
 
