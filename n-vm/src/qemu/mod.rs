@@ -602,6 +602,12 @@ fn push_vsock_args(args: &mut Vec<String>, vsock: &VsockAllocation, iommu: bool)
 ///   `iommu_platform` or ATS (not a virtio device), but DMA is still
 ///   remapped by the Intel IOMMU when present because the IOMMU covers
 ///   the entire PCI topology.
+///
+/// - [`E1000E`](config::NicModel::E1000E) -- Intel 82574L (`e1000e`).
+///   A newer emulated Intel GbE NIC with improved feature support
+///   (MSI-X, hardware offloads).  Like `e1000`, it does not support
+///   `iommu_platform` or ATS but sits behind the Intel IOMMU on the
+///   PCI bus.
 fn push_network_args(args: &mut Vec<String>, iommu: bool, nic_model: config::NicModel) {
     for iface in config::ALL_IFACES {
         // The TAP netdev is the same regardless of the front-end device
@@ -635,6 +641,17 @@ fn push_network_args(args: &mut Vec<String>, iommu: bool, nic_model: config::Nic
                 // this device when present on the PCI bus.
                 format!(
                     "e1000,netdev=nd-{id},mac={mac}",
+                    id = iface.id,
+                    mac = iface.mac,
+                )
+            }
+            config::NicModel::E1000E => {
+                // e1000e (Intel 82574L) is a newer emulated NIC with
+                // MSI-X and hardware offloads.  Same IOMMU story as
+                // e1000: no iommu_platform/ATS, but DMA is remapped
+                // by the Intel IOMMU when present.
+                format!(
+                    "e1000e,netdev=nd-{id},mac={mac}",
                     id = iface.id,
                     mac = iface.mac,
                 )
@@ -1160,6 +1177,13 @@ mod tests {
     // ── e1000 NIC model ──────────────────────────────────────────────
 
     #[test]
+    fn e1000_default_devices_as_virtio() {
+        // e1000 requires_qemu but is not virtio -- sanity check.
+        assert!(!config::NicModel::E1000.is_virtio());
+        assert!(config::NicModel::E1000.requires_qemu());
+    }
+
+    #[test]
     fn e1000_network_args_have_three_interfaces() {
         let mut args = Vec::new();
         push_network_args(&mut args, false, config::NicModel::E1000);
@@ -1229,6 +1253,89 @@ mod tests {
             .collect();
         assert_eq!(
             virtio_taps, e1000_taps,
+            "TAP netdevs should be identical regardless of NIC model",
+        );
+    }
+
+    // ── e1000e NIC model ─────────────────────────────────────────────
+
+    #[test]
+    fn e1000e_default_devices_as_virtio() {
+        // e1000e requires_qemu but is not virtio -- sanity check.
+        assert!(!config::NicModel::E1000E.is_virtio());
+        assert!(config::NicModel::E1000E.requires_qemu());
+    }
+
+    #[test]
+    fn e1000e_network_args_have_three_interfaces() {
+        let mut args = Vec::new();
+        push_network_args(&mut args, false, config::NicModel::E1000E);
+        let netdev_count = args.iter().filter(|a| a.starts_with("tap,")).count();
+        let device_count = args
+            .iter()
+            .filter(|a| a.starts_with("e1000e,"))
+            .count();
+        assert_eq!(netdev_count, 3);
+        assert_eq!(device_count, 3);
+    }
+
+    #[test]
+    fn e1000e_devices_have_no_iommu_platform_even_when_enabled() {
+        let mut args = Vec::new();
+        push_network_args(&mut args, true, config::NicModel::E1000E);
+        let devices: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("e1000e,"))
+            .collect();
+        assert_eq!(devices.len(), 3);
+        for dev in &devices {
+            assert!(
+                !dev.contains("iommu_platform"),
+                "e1000e should not have iommu_platform: {dev}",
+            );
+            assert!(
+                !dev.contains("ats="),
+                "e1000e should not have ats: {dev}",
+            );
+        }
+    }
+
+    #[test]
+    fn e1000e_devices_have_correct_mac_addresses() {
+        let mut args = Vec::new();
+        push_network_args(&mut args, false, config::NicModel::E1000E);
+        let macs: Vec<&str> = args
+            .iter()
+            .filter_map(|a| {
+                a.split(',')
+                    .find(|part| part.starts_with("mac="))
+                    .map(|p| &p[4..])
+            })
+            .collect();
+        assert_eq!(macs.len(), 3);
+        let mut unique = macs.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "e1000e MAC addresses must be unique: {macs:?}");
+    }
+
+    #[test]
+    fn e1000e_network_args_use_same_tap_devices_as_virtio() {
+        let mut virtio_args = Vec::new();
+        push_network_args(&mut virtio_args, false, config::NicModel::VirtioNet);
+        let mut e1000e_args = Vec::new();
+        push_network_args(&mut e1000e_args, false, config::NicModel::E1000E);
+
+        let virtio_taps: Vec<&String> = virtio_args
+            .iter()
+            .filter(|a| a.starts_with("tap,"))
+            .collect();
+        let e1000e_taps: Vec<&String> = e1000e_args
+            .iter()
+            .filter(|a| a.starts_with("tap,"))
+            .collect();
+        assert_eq!(
+            virtio_taps, e1000e_taps,
             "TAP netdevs should be identical regardless of NIC model",
         );
     }

@@ -49,14 +49,22 @@ use tracing::{error, warn};
 ///   variant with the cloud-hypervisor backend is a compile-time error
 ///   (enforced by the `#[in_vm]` proc macro).
 ///
+/// - [`E1000E`](Self::E1000E) -- Intel 82574L Gigabit Ethernet
+///   (`e1000e` device).  Supported by **QEMU only**.  This is a newer
+///   emulated Intel NIC with improved features over the 82540EM
+///   (interrupt throttling, MSI-X, hardware offloads).  Useful for
+///   testing DPDK drivers against the `e1000e` PMD.
+///
 /// # Backend compatibility
 ///
 /// | Model | cloud-hypervisor | QEMU |
 /// |-------|-----------------|------|
 /// | `VirtioNet` | ✅ | ✅ |
 /// | `E1000` | ❌ | ✅ |
+/// | `E1000E` | ❌ | ✅ |
 ///
-/// The `#[network(nic_model = "e1000")]` attribute is only accepted
+/// The `#[network(nic_model = "e1000")]` and
+/// `#[network(nic_model = "e1000e")]` attributes are only accepted
 /// when used with `#[in_vm(qemu)]`.  The proc macro emits a
 /// compile-time error for incompatible combinations.
 ///
@@ -67,10 +75,11 @@ use tracing::{error, warn};
 /// - **VirtioNet** devices use `iommu_platform=on,ats=on` (QEMU) or
 ///   per-device IOMMU flags (cloud-hypervisor) for full DMA remapping
 ///   with address translation services.
-/// - **E1000** devices sit behind the Intel IOMMU on QEMU's PCI bus
-///   (DMA is remapped) but do not support `iommu_platform` or ATS
-///   because the e1000 is not a virtio device.  DPDK's VFIO driver
-///   will use the IOMMU for these devices automatically.
+/// - **E1000** and **E1000E** devices sit behind the Intel IOMMU on
+///   QEMU's PCI bus (DMA is remapped) but do not support
+///   `iommu_platform` or ATS because they are not virtio devices.
+///   DPDK's VFIO driver will use the IOMMU for these devices
+///   automatically.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum NicModel {
     /// Paravirtualised virtio-net (default).
@@ -89,6 +98,17 @@ pub enum NicModel {
     /// **QEMU only** -- cloud-hypervisor does not support emulated NIC
     /// models.
     E1000,
+
+    /// Intel 82574L Gigabit Ethernet (QEMU `e1000e` device).
+    ///
+    /// This is a newer emulated Intel NIC than [`E1000`](Self::E1000),
+    /// providing MSI-X support, interrupt throttling, and hardware
+    /// offloads that more closely match modern Intel GbE controllers.
+    /// Useful for testing the DPDK `e1000e` (igb) PMD path.
+    ///
+    /// **QEMU only** -- cloud-hypervisor does not support emulated NIC
+    /// models.
+    E1000E,
 }
 
 impl NicModel {
@@ -107,7 +127,7 @@ impl NicModel {
     /// models like e1000 are QEMU-specific.
     #[must_use]
     pub const fn requires_qemu(self) -> bool {
-        matches!(self, Self::E1000)
+        matches!(self, Self::E1000 | Self::E1000E)
     }
 }
 
@@ -272,9 +292,9 @@ pub struct VmConfig {
     /// NIC model for all network interfaces in the VM.
     ///
     /// Defaults to [`VirtioNet`](NicModel::VirtioNet).  The
-    /// [`E1000`](NicModel::E1000) variant is only valid with the QEMU
-    /// backend; the `#[in_vm]` proc macro enforces this at compile
-    /// time.
+    /// [`E1000`](NicModel::E1000) and [`E1000E`](NicModel::E1000E)
+    /// variants are only valid with the QEMU backend; the `#[in_vm]`
+    /// proc macro enforces this at compile time.
     pub nic_model: NicModel,
 }
 

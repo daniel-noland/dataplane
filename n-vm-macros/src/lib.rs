@@ -74,10 +74,10 @@
 //!
 //! | Option | Values | Default | Description |
 //! |--------|--------|---------|-------------|
-//! | `nic_model` | `"virtio_net"`, `"e1000"` | `"virtio_net"` | NIC model for all interfaces |
+//! | `nic_model` | `"virtio_net"`, `"e1000"`, `"e1000e"` | `"virtio_net"` | NIC model for all interfaces |
 //!
-//! The `e1000` NIC model is only supported with the QEMU backend
-//! (`#[in_vm(qemu)]`).  Using it with cloud-hypervisor is a
+//! The `e1000` and `e1000e` NIC models are only supported with the QEMU
+//! backend (`#[in_vm(qemu)]`).  Using them with cloud-hypervisor is a
 //! compile-time error.
 //!
 //! # Usage
@@ -115,6 +115,14 @@
 //! #[in_vm(qemu)]
 //! #[network(nic_model = "e1000")]
 //! fn test_e1000_nics() {
+//!     assert!(std::path::Path::new("/proc").exists());
+//! }
+//!
+//! // QEMU backend with e1000e NICs (emulated Intel 82574L)
+//! #[test]
+//! #[in_vm(qemu)]
+//! #[network(nic_model = "e1000e")]
+//! fn test_e1000e_nics() {
 //!     assert!(std::path::Path::new("/proc").exists());
 //! }
 //! ```
@@ -532,8 +540,8 @@ impl Default for NetworkArgs {
 /// Parses the content of a `#[network(…)]` attribute.
 ///
 /// Accepts:
-/// - `nic_model = "virtio_net" | "e1000"` -- NIC model for all
-///   interfaces.
+/// - `nic_model = "virtio_net" | "e1000" | "e1000e"` -- NIC model for
+///   all interfaces.
 ///
 /// `#[network]` (no parentheses) is treated as all-defaults.
 fn parse_network_attr(attr: &syn::Attribute) -> syn::Result<NetworkArgs> {
@@ -562,12 +570,16 @@ fn parse_network_attr(attr: &syn::Attribute) -> syn::Result<NetworkArgs> {
                     args.nic_model = quote! { ::n_vm::NicModel::E1000 };
                     args.requires_qemu = true;
                 }
+                "e1000e" => {
+                    args.nic_model = quote! { ::n_vm::NicModel::E1000E };
+                    args.requires_qemu = true;
+                }
                 other => {
                     return Err(syn::Error::new_spanned(
                         &value,
                         format!(
                             "unknown NIC model `{other}` in #[network]; \
-                             valid values are: \"virtio_net\", \"e1000\"",
+                             valid values are: \"virtio_net\", \"e1000\", \"e1000e\"",
                         ),
                     ));
                 }
@@ -780,7 +792,7 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
             format!(
                 "the selected NIC model requires the QEMU backend, but the \
                  current backend is `{backend}`; use #[in_vm(qemu)] with \
-                 emulated NIC models like e1000",
+                 emulated NIC models like e1000 or e1000e",
                 backend = backend.name,
             ),
         )
