@@ -37,6 +37,9 @@ sysfs = { workspace = true }
 
 [dev-dependencies]
 # internal
+net = { workspace = true }
+dpdk = { workspace = true }
+dpdk-sys = { workspace = true }
 fixin = { workspace = true, features = [] }
 id = { workspace = true, features = ["serde", "rkyv"] }
 n-vm = { workspace = true }

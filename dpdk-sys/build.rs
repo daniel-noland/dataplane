@@ -76,6 +76,7 @@ fn main() {
         "rte_net_virtio",
         "rte_net_vhost",
         "rte_net_i40e",
+        "rte_net_e1000",
         "rte_vhost",
         "rte_net_mlx5",
         "rte_common_mlx5",
@@ -93,11 +94,12 @@ fn main() {
         "rte_hash",
         "rte_rcu",
         "rte_ring",
+        "rte_acl",
         "rte_eal",
         "rte_argparse",
         "rte_kvargs",
-        "rte_telemetry",
-        "rte_log",
+        "rte_telemetry", // todo: see if you can't remove telemetry
+        "rte_log",       // todo: see if you can't remove log
         "ibverbs",
         "mlx5",
         "mlx4",

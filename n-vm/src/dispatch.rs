@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Open Network Fabric Authors
+
+//! Tier dispatch helpers for the `#[in_vm]` proc macro.
+//!
+//! Both [`run_container_tier`] and [`run_host_tier`] are generic over a
+//! [`HypervisorBackend`](crate::backend::HypervisorBackend) so that the
+//! proc macro can select the backend at code-generation time.
+//!
+//! The `#[in_vm]` macro selects the backend, and optional companion
+//! attributes (`#[hypervisor(…)]`, `#[guest(…)]`, `#[network(…)]`)
+//! configure the VM:
+//!
+//! - `#[in_vm]` -- uses
+//!   [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor)
+//!   (the default).
+//! - `#[in_vm(qemu)]` -- uses [`Qemu`](crate::qemu::Qemu).
+//! - `#[hypervisor(iommu)]` -- enable virtual IOMMU.
+//! - `#[hypervisor(host_pages = "4k")]` -- 4 KiB host memory backing.
+//! - `#[guest(hugepage_size = "2m", hugepage_count = 512)]` -- guest
+//!   hugepage reservation.
+//! - `#[network(nic_model = "e1000")]` -- NIC model selection (QEMU
+//!   only for emulated models).
+//!
+//! All parsed attribute values are collected into a [`VmConfig`] that
+//! flows through the dispatch chain.
+//!
+//! The [`in_vm`](crate::in_vm) attribute macro rewrites a test function into a
+//! three-tier dispatch (host -> container -> VM guest).  Rather than generating
+//! all of that runtime logic inline -- which makes changes require proc-macro
+//! recompilation and produces hard-to-debug codegen -- this module provides
+//! thin, callable helpers for the two outer tiers.
+//!
+//! The macro itself only needs to:
+//!
+//! 1. Check [`is_in_vm`] and, if true, run the original test body (Tier 3).
+//! 2. Check [`is_in_test_container`] and, if true, call
+//!    [`run_container_tier`] (Tier 2).
+//! 3. Otherwise call [`run_host_tier`] (Tier 1).
+//!
+//! All runtime policy (tracing configuration, tokio runtime construction,
+//! error formatting, exit-code interpretation) lives here in normal,
+//! testable Rust rather than inside `quote!` blocks.
+//!
+//! [`VmConfig`]: crate::config::VmConfig
+
+use std::future::Future;
+
+use crate::backend::HypervisorBackend;
+use crate::config::VmConfig;
+use n_vm_protocol::{ENV_IN_TEST_CONTAINER, ENV_IN_VM, ENV_MARKER_VALUE};
+
+/// Returns `true` when running inside the VM guest (Tier 3).
+///
+/// The init system (`n-it`) sets `IN_VM=YES` before spawning the test
+/// binary.  When this returns `true`, the `#[in_vm]` macro should execute
+/// the original test body directly.
+#[inline]
+pub fn is_in_vm() -> bool {
+    std::env::var(ENV_IN_VM).as_deref() == Ok(ENV_MARKER_VALUE)
+}
+
+/// Returns `true` when running inside the Docker container (Tier 2).
+///
+/// [`run_test_in_vm`](crate::run_test_in_vm) sets `IN_TEST_CONTAINER=YES`
+/// before starting the container.  When this returns `true`, the
+/// `#[in_vm]` macro should delegate to [`run_container_tier`].
+#[inline]
+pub fn is_in_test_container() -> bool {
+    std::env::var(ENV_IN_TEST_CONTAINER).as_deref() == Ok(ENV_MARKER_VALUE)
+}
+
+/// Initialises a tracing subscriber suitable for the container tier.
+///
+/// Uses [`try_init`](tracing_subscriber::fmt::SubscriberBuilder::try_init)
+/// to avoid panicking when multiple `#[in_vm]` tests run in the same
+/// binary and a subscriber is already registered.
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_thread_names(true)
+        .without_time()
+        .with_test_writer()
+        .with_line_number(true)
+        .with_target(true)
+        .with_file(true)
+        .try_init();
+}
+
+/// Runs an async test body inside the VM guest (Tier 3).
+///
+/// When the `#[in_vm]` macro decorates an `async fn`, it strips the
+/// `async` keyword from the emitted signature (so the function satisfies
+/// `#[test]`'s `fn()` requirement) and wraps the original body in a call
+/// to this helper for the Tier 3 branch.
+///
+/// A single-threaded tokio runtime is created on the spot -- the VM
+/// guest has no pre-existing runtime, and using a current-thread
+/// scheduler avoids unnecessary complexity inside the lightweight guest
+/// environment.
+///
+/// # Panics
+///
+/// Panics if the tokio runtime cannot be created.
+pub fn block_on_in_guest<F: Future<Output = ()>>(f: F) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime for async #[in_vm] test body")
+        .block_on(f);
+}
+
+/// Runs an async test body on a **multi-threaded** tokio runtime inside
+/// the VM guest (Tier 3).
+///
+/// This is the multi-threaded counterpart of [`block_on_in_guest`],
+/// used when `#[in_vm]` detects a `#[tokio::test(flavor = "multi_thread")]`
+/// attribute.
+///
+/// When `worker_threads` is `None`, tokio's default (number of CPU
+/// cores) is used.  When `Some(n)`, exactly `n` worker threads are
+/// spawned.
+///
+/// # Panics
+///
+/// Panics if the tokio runtime cannot be created.
+pub fn block_on_in_guest_multi_thread<F: Future<Output = ()>>(
+    worker_threads: Option<usize>,
+    f: F,
+) {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if let Some(n) = worker_threads {
+        builder.worker_threads(n);
+    }
+    builder
+        .build()
+        .expect(
+            "failed to build multi-threaded tokio runtime for async #[in_vm] test body",
+        )
+        .block_on(f);
+}
+
+/// Container-tier dispatch: boot a VM and re-execute the test inside it.
+///
+/// This function is called by the code generated by `#[in_vm]` when
+/// [`is_in_test_container`] returns `true`.  It:
+///
+/// 1. Builds a single-threaded tokio runtime.
+/// 2. Initialises a tracing subscriber (best-effort, idempotent).
+/// 3. Calls [`run_in_vm`](crate::run_in_vm) to launch the VM using
+///    backend `B` and collect the test output.
+/// 4. Prints the collected output and asserts success.
+///
+/// The type parameter `B` selects the hypervisor backend.  The `#[in_vm]`
+/// proc macro passes
+/// [`CloudHypervisor`](crate::cloud_hypervisor::CloudHypervisor) by
+/// default, or [`Qemu`](crate::qemu::Qemu) when `#[in_vm(qemu)]` is
+/// used.
+///
+/// The `vm_config` parameter carries all VM options parsed from the
+/// `#[hypervisor(…)]` and `#[guest(…)]` attributes: host page size,
+/// guest hugepage reservation, vIOMMU, etc.
+///
+/// The type parameter `F` is used only to derive the test name via
+/// [`std::any::type_name`]; the function value itself is never called in
+/// this tier.
+///
+/// # Panics
+///
+/// Panics if:
+/// - The tokio runtime cannot be created.
+/// - The VM infrastructure returns an error.
+/// - The test running inside the VM reports failure.
+pub fn run_container_tier<B: HypervisorBackend, F: FnOnce()>(test_fn: F, vm_config: VmConfig) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("failed to build tokio runtime for #[in_vm] container tier");
+
+    let _guard = runtime.enter();
+
+    runtime.block_on(async {
+        init_tracing();
+
+        let init_span = tracing::span!(tracing::Level::INFO, "hypervisor");
+        let _guard = init_span.enter();
+
+        let output = crate::run_in_vm::<B, _>(test_fn, vm_config)
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "VM infrastructure error:\n{:?}",
+                    miette::Report::new(err)
+                )
+            });
+
+        eprintln!("{output}");
+        assert!(output.success, "VM test failed (see output above)");
+    });
+}
+
+/// Host-tier dispatch: launch a Docker container and re-run the test
+/// inside it.
+///
+/// This function is called by the code generated by `#[in_vm]` when
+/// neither [`is_in_vm`] nor [`is_in_test_container`] returns `true`
+/// (i.e. a normal `cargo test` invocation).  It:
+///
+/// 1. Prints a banner to visually delimit nested-environment output.
+/// 2. Calls [`run_test_in_vm`](crate::run_test_in_vm) to launch a Docker
+///    container that will enter the container tier.
+/// 3. Asserts that the container exited successfully.
+///
+/// The type parameter `F` is used only to derive the test name via
+/// [`std::any::type_name`]; the function value itself is never called in
+/// this tier.
+///
+/// # Panics
+///
+/// Panics if:
+/// - The Docker container infrastructure returns an error.
+/// - The container exits with a non-zero code.
+/// - The container does not report an exit code at all.
+pub fn run_host_tier<F: FnOnce()>(test_fn: F) {
+    eprintln!("===== BEGIN NESTED TEST ENVIRONMENT =====");
+
+    let container_state = crate::run_test_in_vm(test_fn).unwrap_or_else(|err| {
+        panic!(
+            "test container infrastructure error:\n{:?}",
+            miette::Report::new(err)
+        )
+    });
+
+    eprintln!("=====  END NESTED TEST ENVIRONMENT  =====");
+
+    match container_state.exit_code {
+        Some(0) => {}
+        Some(code) => {
+            panic!("test container exited with code {code}");
+        }
+        None => {
+            panic!("test container did not return an exit code");
+        }
+    }
+}
