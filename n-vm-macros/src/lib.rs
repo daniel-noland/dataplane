@@ -80,22 +80,42 @@
 //! backend (`#[in_vm(qemu)]`).  Using them with cloud-hypervisor is a
 //! compile-time error.
 //!
+//! # Attribute ordering
+//!
+//! `#[in_vm]` must appear **above** `#[test]` (and any other
+//! non-companion attributes like `#[should_panic]`).  This is required
+//! for `async fn` tests -- the macro must strip the `async` keyword
+//! before the test harness sees the function -- and is the recommended
+//! ordering for sync tests as well for consistency:
+//!
+//! ```ignore
+//! // ✅ correct -- #[in_vm] is outermost
+//! #[in_vm]
+//! #[test]
+//! async fn works() { /* … */ }
+//!
+//! // ❌ compile error -- test harness sees `async fn` before #[in_vm] can strip it
+//! #[test]
+//! #[in_vm]
+//! async fn broken() { /* … */ }
+//! ```
+//!
 //! # Usage
 //!
 //! ```ignore
 //! use n_vm::in_vm;
 //!
 //! // All defaults: cloud-hypervisor, 1G host pages, 1G×1 guest hugepages
-//! #[test]
 //! #[in_vm]
+//! #[test]
 //! fn test_defaults() {
 //!     assert!(std::path::Path::new("/proc").exists());
 //! }
 //!
 //! // QEMU backend, 4K host pages (no hugepages on host), 2M×512 guest
 //! // hugepages, virtual IOMMU enabled.
-//! #[test]
 //! #[in_vm(qemu)]
+//! #[test]
 //! #[hypervisor(iommu, host_pages = "4k")]
 //! #[guest(hugepage_size = "2m", hugepage_count = 512)]
 //! fn test_dpdk_2m_on_qemu() {
@@ -103,32 +123,42 @@
 //! }
 //!
 //! // Default backend, no guest hugepages (DPDK --no-huge mode)
-//! #[test]
 //! #[in_vm]
+//! #[test]
 //! #[guest(hugepage_size = "none")]
 //! fn test_dpdk_no_huge() {
 //!     assert!(std::path::Path::new("/proc").exists());
 //! }
 //!
 //! // QEMU backend with e1000 NICs (emulated Intel 82540EM)
-//! #[test]
 //! #[in_vm(qemu)]
+//! #[test]
 //! #[network(nic_model = "e1000")]
 //! fn test_e1000_nics() {
 //!     assert!(std::path::Path::new("/proc").exists());
 //! }
 //!
 //! // QEMU backend with e1000e NICs (emulated Intel 82574L)
-//! #[test]
 //! #[in_vm(qemu)]
+//! #[test]
 //! #[network(nic_model = "e1000e")]
 //! fn test_e1000e_nics() {
 //!     assert!(std::path::Path::new("/proc").exists());
 //! }
+//!
+//! // Async test body -- #[in_vm] creates a single-threaded tokio
+//! // runtime in the VM guest tier and block_on's the body.
+//! #[in_vm]
+//! #[test]
+//! async fn test_async() {
+//!     let contents = tokio::fs::read_to_string("/proc/version").await.unwrap();
+//!     assert!(contents.contains("Linux"));
+//! }
 //! ```
 //!
-//! The decorated function must be a synchronous `fn()` with no parameters and
-//! no return value.
+//! The decorated function must be `fn()` or `async fn()` with no parameters
+//! and no return value.  Do **not** use `#[tokio::test]` -- `#[in_vm]` manages
+//! its own runtime; use `#[test]` instead.
 
 extern crate proc_macro;
 
@@ -689,6 +719,29 @@ fn extract_and_parse<T: Default>(
 /// | `#[in_vm(cloud_hypervisor)]` | [`CloudHypervisor`](::n_vm::CloudHypervisor) (explicit) |
 /// | `#[in_vm(qemu)]` | [`Qemu`](::n_vm::Qemu) |
 ///
+/// # Async support
+///
+/// Both `fn` and `async fn` are accepted.  When the decorated function
+/// is `async`, the macro:
+///
+/// 1. Strips the `async` keyword from the emitted signature (so the
+///    function satisfies `#[test]`'s `fn()` requirement).
+/// 2. Wraps the original body in a single-threaded tokio runtime
+///    ([`block_on_in_guest`](::n_vm::block_on_in_guest)) for the VM
+///    guest tier only.
+///
+/// Tiers 1 (host) and 2 (container) are unaffected -- they never
+/// execute the user's test body.
+///
+/// **Do not combine with `#[tokio::test]`.**  The `#[in_vm]` macro
+/// manages its own runtime; `#[tokio::test]` would conflict.  Use
+/// `#[test]` instead.
+///
+/// **Attribute ordering:** `#[in_vm]` must appear **above** `#[test]`
+/// so that it can strip `async` before the test harness validates the
+/// function signature.  See the [Attribute ordering](crate#attribute-ordering)
+/// section for details.
+///
 /// # Companion attributes
 ///
 /// Three optional companion attributes configure the VM environment.
@@ -727,8 +780,6 @@ fn extract_and_parse<T: Default>(
 /// # Compile-time validation
 ///
 /// The macro rejects functions that are:
-/// - **`async`** -- the generated code creates its own tokio runtime at
-///   the container tier, so the decorated function must be synchronous.
 /// - **Parameterised** -- the function is re-invoked by name as `fn()`
 ///   inside the VM guest, so it cannot accept arguments.
 /// - **Non-unit return type** -- the generated dispatch branches use
@@ -744,6 +795,8 @@ fn extract_and_parse<T: Default>(
 /// - **Incompatible backend/NIC combinations** -- emulated NIC models
 ///   (`e1000`, `e1000e`) require `#[in_vm(qemu)]`; using them with the
 ///   cloud-hypervisor backend is a compile-time error.
+/// - **`#[tokio::test]`** -- `#[in_vm]` creates its own runtime, so
+///   `#[tokio::test]` is rejected with a hint to use `#[test]` instead.
 ///
 /// # Panics
 ///
@@ -764,11 +817,24 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
 
     let mut func = parse_macro_input!(input as syn::ItemFn);
 
-    if func.sig.asyncness.is_some() {
+    let is_async = func.sig.asyncness.is_some();
+
+    // Reject #[tokio::test] -- it conflicts with our runtime management.
+    // Best-effort detection: check for `tokio::test` in the remaining
+    // attributes.  This catches the common case; exotic re-exports will
+    // fail with a less helpful error at link time.
+    if let Some(tokio_attr) = func.attrs.iter().find(|a| {
+        let path = a.path();
+        let segs: Vec<_> = path.segments.iter().collect();
+        segs.len() == 2 && segs[0].ident == "tokio" && segs[1].ident == "test"
+    }) {
         return syn::Error::new_spanned(
-            func.sig.asyncness,
-            "#[in_vm] cannot be applied to async functions; \
-             the generated code creates its own tokio runtime at the container tier",
+            tokio_attr,
+            "#[in_vm] manages its own tokio runtime and is incompatible \
+             with #[tokio::test]; use #[test] instead\n\n\
+             #[in_vm]\n\
+             #[test]\n\
+             async fn my_test() { /* async code works here */ }",
         )
         .to_compile_error()
         .into();
@@ -835,15 +901,29 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
 
     let block = &func.block;
     let vis = &func.vis;
-    let sig = &func.sig;
     let attrs = &func.attrs; // remaining attrs after companion extraction
     let ident = &func.sig.ident;
+
+    // Strip `async` from the emitted signature.  The function must
+    // appear as `fn()` to satisfy `#[test]`.  For async functions, the
+    // body is wrapped in `block_on_in_guest` (Tier 3 only).
+    let mut sig = func.sig.clone();
+    sig.asyncness = None;
 
     let backend_path = &backend.path;
     let iommu = hypervisor_args.iommu;
     let host_page_size = &hypervisor_args.host_page_size;
     let guest_hugepages = &guest_args.guest_hugepages;
     let nic_model = &network_args.nic_model;
+
+    // Tier 3 body: for sync functions, inline the block directly.
+    // For async functions, wrap in a single-threaded tokio runtime via
+    // `block_on_in_guest` so that `.await` works inside the VM guest.
+    let tier3_body = if is_async {
+        quote! { ::n_vm::block_on_in_guest(async { #block }); }
+    } else {
+        quote! { #block }
+    };
 
     // The three tiers are dispatched as a flat if-chain.
     // Each tier is identified by an environment variable set by the
@@ -858,7 +938,7 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
         #vis #sig {
             // Tier 3: VM guest
             if ::n_vm::is_in_vm() {
-                { #block }
+                { #tier3_body }
                 return;
             }
 
@@ -903,8 +983,8 @@ pub fn in_vm(attr: TokenStream, input: TokenStream) -> TokenStream {
 /// # Example
 ///
 /// ```ignore
-/// #[test]
 /// #[in_vm(qemu)]
+/// #[test]
 /// #[hypervisor(iommu, host_pages = "4k")]
 /// fn my_test() { /* … */ }
 /// ```
@@ -953,8 +1033,8 @@ pub fn hypervisor(_attr: TokenStream, input: TokenStream) -> TokenStream {
 /// # Example
 ///
 /// ```ignore
-/// #[test]
 /// #[in_vm]
+/// #[test]
 /// #[guest(hugepage_size = "2m", hugepage_count = 512)]
 /// fn my_test() { /* … */ }
 /// ```
@@ -1003,8 +1083,8 @@ pub fn guest(_attr: TokenStream, input: TokenStream) -> TokenStream {
 /// # Example
 ///
 /// ```ignore
-/// #[test]
 /// #[in_vm(qemu)]
+/// #[test]
 /// #[network(nic_model = "e1000e")]
 /// fn my_test() { /* … */ }
 /// ```

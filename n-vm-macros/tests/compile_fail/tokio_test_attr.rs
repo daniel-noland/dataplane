@@ -2,6 +2,7 @@
 // Copyright Open Network Fabric Authors
 
 #[n_vm::in_vm]
-async fn async_fn() {}
+#[tokio::test]
+async fn tokio_test_attr() {}
 
 fn main() {}

@@ -35,7 +35,18 @@
 //! - `#[in_vm(cloud_hypervisor)]` -- same as above, explicitly.
 //! - `#[in_vm(qemu)]` -- uses [`Qemu`].
 //!
-//! Optional companion attributes configure the VM:
+//! `#[in_vm]` must appear **above** `#[test]` so that it can strip the
+//! `async` keyword (for async tests) before the test harness validates
+//! the function signature.  This ordering is recommended for sync tests
+//! as well for consistency:
+//!
+//! ```ignore
+//! #[in_vm]
+//! #[test]
+//! async fn my_async_test() { /* … */ }
+//! ```
+//!
+//! Optional companion attributes configure the VM (below `#[in_vm]`):
 //!
 //! - `#[hypervisor(iommu)]` -- enable virtual IOMMU.
 //! - `#[hypervisor(host_pages = "4k")]` -- 4 KiB host memory backing.
@@ -79,7 +90,9 @@ pub use backend::{HypervisorBackend, HypervisorVerdict, LaunchedHypervisor};
 pub use cloud_hypervisor::CloudHypervisor;
 pub use config::{GuestHugePageConfig, GuestHugePageSize, HostPageSize, NicModel, VmConfig};
 pub use container::{ContainerTestResult, run_test_in_vm};
-pub use dispatch::{is_in_test_container, is_in_vm, run_container_tier, run_host_tier};
+pub use dispatch::{
+    block_on_in_guest, is_in_test_container, is_in_vm, run_container_tier, run_host_tier,
+};
 pub use error::{ContainerError, VmError};
 pub use n_vm_macros::{guest, hypervisor, in_vm, network};
 pub use n_vm_protocol::{

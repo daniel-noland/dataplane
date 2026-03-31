@@ -1,15 +1,15 @@
 use n_vm::in_vm;
 
-#[test]
 #[in_vm]
+#[test]
 fn test_which_runs_in_vm() {
     assert_eq!(2 + 2, 4);
 }
 
+#[in_vm]
 #[should_panic]
 #[test]
 #[allow(unreachable_code)]
-#[in_vm]
 fn test_which_runs_in_vm_control() {
     assert_eq!(2 + 2, 4);
     panic!("deliberate panic");
@@ -28,21 +28,21 @@ fn test_which_does_not_run_in_vm_control() {
     panic!("deliberate panic");
 }
 
-#[test]
 #[in_vm]
+#[test]
 fn root_filesystem_in_vm_is_read_only() {
     let error = std::fs::File::create_new("/some.file").unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::ReadOnlyFilesystem);
 }
 
-#[test]
 #[in_vm]
+#[test]
 fn run_filesystem_in_vm_is_read_write() {
     std::fs::File::create_new("/run/some.file").unwrap();
 }
 
-#[test]
 #[in_vm]
+#[test]
 fn tmp_filesystem_in_vm_is_read_write() {
     std::fs::File::create_new("/tmp/some.file").unwrap();
 }
@@ -53,22 +53,22 @@ fn tmp_filesystem_in_vm_is_read_write() {
 // virtual IOMMU enabled, verifying that the VM boots and operates
 // correctly when devices are behind DMA remapping.
 
-#[test]
 #[in_vm]
+#[test]
 #[hypervisor(iommu)]
 fn test_which_runs_in_vm_with_iommu() {
     assert_eq!(2 + 2, 4);
 }
 
-#[test]
 #[in_vm(qemu)]
+#[test]
 #[hypervisor(iommu)]
 fn test_which_runs_in_vm_with_qemu_iommu() {
     assert_eq!(2 + 2, 4);
 }
 
-#[test]
 #[in_vm(cloud_hypervisor)]
+#[test]
 #[hypervisor(iommu)]
 fn test_which_runs_in_vm_with_cloud_hypervisor_iommu() {
     assert_eq!(2 + 2, 4);
@@ -81,15 +81,15 @@ fn test_which_runs_in_vm_with_cloud_hypervisor_iommu() {
 // important because it requires no physical hugepages on the host,
 // making it viable for CI environments.
 
-#[test]
 #[in_vm]
+#[test]
 #[hypervisor(host_pages = "4k")]
 fn vm_boots_with_standard_host_pages() {
     assert!(std::path::Path::new("/proc/meminfo").exists());
 }
 
-#[test]
 #[in_vm(qemu)]
+#[test]
 #[hypervisor(host_pages = "4k")]
 fn vm_boots_with_standard_host_pages_on_qemu() {
     assert!(std::path::Path::new("/proc/meminfo").exists());
@@ -101,8 +101,8 @@ fn vm_boots_with_standard_host_pages_on_qemu() {
 // verifying the kernel command-line parameters are applied correctly
 // and the VM boots with the requested hugepage configuration.
 
-#[test]
 #[in_vm]
+#[test]
 #[guest(hugepage_size = "none")]
 fn vm_boots_without_guest_hugepages() {
     // When hugepage_size = "none", no hugepage pool should be reserved.
@@ -116,8 +116,8 @@ fn vm_boots_without_guest_hugepages() {
     assert_eq!(huge_total, 0, "expected no guest hugepages when hugepage_size = none");
 }
 
-#[test]
 #[in_vm]
+#[test]
 #[guest(hugepage_size = "2m", hugepage_count = 64)]
 fn vm_boots_with_2m_guest_hugepages() {
     // The kernel should have reserved exactly the requested count of
@@ -137,8 +137,8 @@ fn vm_boots_with_2m_guest_hugepages() {
 // These tests exercise both axes together, demonstrating that host
 // page size and guest hugepage reservation are truly independent.
 
-#[test]
 #[in_vm]
+#[test]
 #[hypervisor(host_pages = "4k")]
 #[guest(hugepage_size = "none")]
 fn vm_boots_with_4k_host_pages_and_no_guest_hugepages() {
@@ -153,11 +153,11 @@ fn vm_boots_with_4k_host_pages_and_no_guest_hugepages() {
     assert_eq!(huge_total, 0, "expected no guest hugepages in CI-friendly mode");
 }
 
-#[test]
 #[in_vm(qemu)]
+#[test]
 #[hypervisor(iommu, host_pages = "4k")]
 #[guest(hugepage_size = "2m", hugepage_count = 64)]
-fn vm_boots_with_4k_host_and_2m_guest_hugepages_on_qemu() {
+async fn vm_boots_with_4k_host_and_2m_guest_hugepages_on_qemu() {
     // Standard host pages but 2M guest hugepages with IOMMU -- the two
     // axes are independent, so this combination must work.
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();

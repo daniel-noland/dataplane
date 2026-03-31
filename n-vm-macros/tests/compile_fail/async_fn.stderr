@@ -1,5 +1,0 @@
-error: #[in_vm] cannot be applied to async functions; the generated code creates its own tokio runtime at the container tier
- --> tests/compile_fail/async_fn.rs:5:1
-  |
-5 | async fn async_fn() {}
-  | ^^^^^

@@ -1,0 +1,9 @@
+error: #[in_vm] manages its own tokio runtime and is incompatible with #[tokio::test]; use #[test] instead
+
+       #[in_vm]
+       #[test]
+       async fn my_test() { /* async code works here */ }
+ --> tests/compile_fail/tokio_test_attr.rs:5:1
+  |
+5 | #[tokio::test]
+  | ^^^^^^^^^^^^^^

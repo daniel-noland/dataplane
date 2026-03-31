@@ -44,6 +44,8 @@
 //!
 //! [`VmConfig`]: crate::config::VmConfig
 
+use std::future::Future;
+
 use crate::backend::HypervisorBackend;
 use crate::config::VmConfig;
 use n_vm_protocol::{ENV_IN_TEST_CONTAINER, ENV_IN_VM, ENV_MARKER_VALUE};
@@ -83,6 +85,29 @@ fn init_tracing() {
         .with_target(true)
         .with_file(true)
         .try_init();
+}
+
+/// Runs an async test body inside the VM guest (Tier 3).
+///
+/// When the `#[in_vm]` macro decorates an `async fn`, it strips the
+/// `async` keyword from the emitted signature (so the function satisfies
+/// `#[test]`'s `fn()` requirement) and wraps the original body in a call
+/// to this helper for the Tier 3 branch.
+///
+/// A single-threaded tokio runtime is created on the spot -- the VM
+/// guest has no pre-existing runtime, and using a current-thread
+/// scheduler avoids unnecessary complexity inside the lightweight guest
+/// environment.
+///
+/// # Panics
+///
+/// Panics if the tokio runtime cannot be created.
+pub fn block_on_in_guest<F: Future<Output = ()>>(f: F) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime for async #[in_vm] test body")
+        .block_on(f);
 }
 
 /// Container-tier dispatch: boot a VM and re-execute the test inside it.
