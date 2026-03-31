@@ -308,7 +308,7 @@ pub enum ContainerError {
     LogStream(#[source] bollard::errors::Error),
 
     /// The container inspection after exit did not include a
-    /// [`ContainerState`](bollard::secret::ContainerState).
+    /// [`ContainerState`](bollard::models::ContainerState).
     #[error("container returned no state on inspection")]
     #[diagnostic(code(n_vm::container::missing_state))]
     MissingState,

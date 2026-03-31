@@ -30,7 +30,7 @@ use bollard::query_parameters::{
     CreateContainerOptions, InspectContainerOptions, RemoveContainerOptions,
     RemoveContainerOptionsBuilder, StartContainerOptions,
 };
-use bollard::secret::{
+use bollard::models::{
     ContainerCreateBody, DeviceMapping, HostConfig, MountBindOptions, RestartPolicy,
     RestartPolicyNameEnum,
 };
@@ -99,7 +99,7 @@ const REQUIRED_DEVICES: [&str; 4] = [
 /// The result of running a test inside a Docker container.
 ///
 /// This is a lightweight wrapper that avoids exposing the `bollard` crate's
-/// [`ContainerState`](bollard::secret::ContainerState) type as part of the
+/// [`ContainerState`](bollard::models::ContainerState) type as part of the
 /// public API.
 #[derive(Debug)]
 pub struct ContainerTestResult {
@@ -568,10 +568,10 @@ impl ContainerParams {
         bollard::models::Mount {
             source: Some(source.into()),
             target: Some(target),
-            typ: Some(bollard::secret::MountTypeEnum::BIND),
+            typ: Some(bollard::models::MountTypeEnum::BIND),
             read_only: Some(true),
             bind_options: Some(MountBindOptions {
-                propagation: Some(bollard::secret::MountBindOptionsPropagationEnum::PRIVATE),
+                propagation: Some(bollard::models::MountBindOptionsPropagationEnum::PRIVATE),
                 non_recursive: Some(true),
                 create_mountpoint: Some(true),
                 ..Default::default()
@@ -589,10 +589,10 @@ impl ContainerParams {
         bollard::models::Mount {
             source: Some(source.into()),
             target: Some(target),
-            typ: Some(bollard::secret::MountTypeEnum::BIND),
+            typ: Some(bollard::models::MountTypeEnum::BIND),
             read_only: Some(false),
             bind_options: Some(MountBindOptions {
-                propagation: Some(bollard::secret::MountBindOptionsPropagationEnum::PRIVATE),
+                propagation: Some(bollard::models::MountBindOptionsPropagationEnum::PRIVATE),
                 non_recursive: Some(true),
                 create_mountpoint: Some(true),
                 ..Default::default()
@@ -1293,7 +1293,7 @@ mod tests {
         for mount in &mounts {
             assert_eq!(
                 mount.typ,
-                Some(bollard::secret::MountTypeEnum::BIND),
+                Some(bollard::models::MountTypeEnum::BIND),
                 "all scratch mounts should be bind mounts",
             );
             let target = mount.target.as_deref().unwrap_or("");
@@ -1341,11 +1341,11 @@ mod tests {
         let params = sample_params();
         let mounts = params.build_mounts();
         for mount in &mounts {
-            assert_eq!(mount.typ, Some(bollard::secret::MountTypeEnum::BIND),);
+            assert_eq!(mount.typ, Some(bollard::models::MountTypeEnum::BIND),);
             let opts = mount.bind_options.as_ref().expect("bind_options");
             assert_eq!(
                 opts.propagation,
-                Some(bollard::secret::MountBindOptionsPropagationEnum::PRIVATE),
+                Some(bollard::models::MountBindOptionsPropagationEnum::PRIVATE),
             );
             assert_eq!(opts.non_recursive, Some(true));
             assert_eq!(opts.create_mountpoint, Some(true));
@@ -1371,7 +1371,7 @@ mod tests {
         assert_eq!(mount.source.as_deref(), Some("/src/dir"));
         assert_eq!(mount.target.as_deref(), Some("/dst/dir"));
         assert_eq!(mount.read_only, Some(true));
-        assert_eq!(mount.typ, Some(bollard::secret::MountTypeEnum::BIND));
+        assert_eq!(mount.typ, Some(bollard::models::MountTypeEnum::BIND));
     }
 
     #[test]

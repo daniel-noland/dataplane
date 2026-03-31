@@ -105,7 +105,7 @@ bindgen = { version = "0.72.1", default-features = false, features = [] }
 bitflags = { version = "2.11.0", default-features = false, features = [] }
 bnum = { version = "0.14.4", default-features = false, features = [] }
 bolero = { version = "0.13.4", default-features = false, features = [] }
-bollard = { version = "0.19.4", default-features = false, features = [] }
+bollard = { version = "0.20.2", default-features = false, features = [] }
 bytecheck = { version = "0.8.2", default-features = false, features = [] }
 bytes = { version = "1.11.1", default-features = false, features = [] }
 capctl = { version = "0.2.4", default-features = false, features = [] }
@@ -202,11 +202,11 @@ tracing = { version = "0.1.44", default-features = false, features = [] }
 tracing-error = { version = "0.2.1", default-features = false, features = [] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [] }
 tracing-test = { version = "0.2.6", default-features = false, features = [] }
-trybuild = { version = "1.0.104", default-features = false, features = [] }
+trybuild = { version = "1.0.116", default-features = false, features = [] }
 ureq = { version = "3.3.0", default-features = false, features = [] }
 url = { version = "2.5.8", default-features = false, features = [] }
 uuid = { version = "1.23.0", default-features = false, features = [] }
-vsock = { version = "0.5.3", default-features = false, features = [] }
+vsock = { version = "0.5.4", default-features = false, features = [] }
 
 [profile.dev]
 panic = "unwind"
