@@ -39,6 +39,9 @@ mod accessor_macros;
 mod embedded;
 pub use embedded::*;
 
+#[cfg(feature = "packet-builder")]
+pub mod valid_builder;
+
 const MAX_VLANS: usize = 4;
 const MAX_NET_EXTENSIONS: usize = 2;
 
@@ -478,7 +481,17 @@ impl Parse for Headers {
                 Header::Encap(encap) => this.udp_encap = Some(encap),
                 Header::Vlan(vlan) => {
                     if this.vlan.len() < MAX_VLANS {
-                        this.vlan.push(vlan);
+                        // Insert at index 0 so the ArrayVec stores VLANs in
+                        // innermost-first order (index 0 = closest to IP),
+                        // matching the convention used by `push_vlan`.
+                        // Parse encounters outermost VLANs first on the wire,
+                        // so each new VLAN is more-outer than the previous and
+                        // must go after it; inserting at 0 shifts existing
+                        // (more-inner) entries toward higher indices.
+                        //
+                        // `deparse` iterates with `.rev()` to recover the
+                        // correct wire order (outermost first).
+                        this.vlan.insert(0, vlan);
                     } else {
                         break;
                     }

@@ -3,14 +3,83 @@
 
 //! Defines the cli protocol for the dataplane
 
+use rkyv::util::AlignedVec;
+
+/// The [`AlignedVec`] flavour returned by [`rkyv::to_bytes`] (i.e. with its
+/// default alignment).  Deserialization buffers must use the same alignment
+/// because the serializer inserts padding that assumes the buffer's base
+/// address satisfies this alignment; a misaligned base shifts every interior
+/// field, causing `bytecheck` validation to reject the archive.
+///
+/// Using a type alias rather than a bare constant keeps us in lockstep with
+/// rkyv: if the crate ever changes its default `AlignedVec` alignment, this
+/// alias picks it up automatically.
+type SerializerVec = AlignedVec;
+
+// `rkyv::from_bytes` only validates archived data when rkyv's `bytecheck`
+// feature is active.  If it were ever disabled, deserialization of IPC
+// messages would silently skip validation -- a safety hole.
+// This import fails at compile time if the feature is missing.
+const _: () = {
+    #[allow(unused_imports)]
+    use rkyv::bytecheck::CheckBytes as _;
+};
+
 use log::Level;
-use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
-use strum::IntoEnumIterator;
 use strum::{AsRefStr, EnumIter, EnumString};
 use thiserror::Error;
 
-#[derive(AsRefStr, EnumString, Debug, Clone, Serialize, Deserialize, EnumIter)]
+/// A log level for use in CLI protocol messages.
+///
+/// This mirrors [`log::Level`] but implements the [`rkyv`] serialization
+/// traits that `Level` itself does not provide.  Use the [`From`] /
+/// [`Into`] conversions to interoperate with [`log::Level`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum CliLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<Level> for CliLogLevel {
+    fn from(level: Level) -> Self {
+        match level {
+            Level::Error => Self::Error,
+            Level::Warn => Self::Warn,
+            Level::Info => Self::Info,
+            Level::Debug => Self::Debug,
+            Level::Trace => Self::Trace,
+        }
+    }
+}
+
+impl From<CliLogLevel> for Level {
+    fn from(level: CliLogLevel) -> Self {
+        match level {
+            CliLogLevel::Error => Self::Error,
+            CliLogLevel::Warn => Self::Warn,
+            CliLogLevel::Info => Self::Info,
+            CliLogLevel::Debug => Self::Debug,
+            CliLogLevel::Trace => Self::Trace,
+        }
+    }
+}
+
+#[derive(
+    AsRefStr,
+    EnumString,
+    Debug,
+    Clone,
+    EnumIter,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[strum(ascii_case_insensitive)]
 pub enum RouteProtocol {
     Local,
@@ -22,7 +91,9 @@ pub enum RouteProtocol {
 }
 
 /// Arguments to a cli request
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Default, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 #[allow(unused)]
 pub struct RequestArgs {
     pub address: Option<IpAddr>,         /* an IP address */
@@ -30,12 +101,12 @@ pub struct RequestArgs {
     pub vrfid: Option<u32>,              /* Id of a VRF */
     pub vni: Option<u32>,                /* Vxlan vni */
     pub ifname: Option<String>,          /* name of interface */
-    pub loglevel: Option<Level>,         /* loglevel, from crate log */
+    pub loglevel: Option<CliLogLevel>,   /* loglevel -- see [`CliLogLevel`] */
     pub protocol: Option<RouteProtocol>, /* a type of route or routing protocol */
 }
 
 /// A Cli request
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[allow(unused)]
 pub struct CliRequest {
     pub action: CliAction,
@@ -50,31 +121,47 @@ pub enum CliSerdeError {
     Deserialize,
 }
 
-pub trait CliSerialize {
-    fn serialize(&self) -> Result<Vec<u8>, CliSerdeError>
-    where
-        Self: Serialize,
-    {
-        bincode2::serialize(self).map_err(|_| CliSerdeError::Serialize)
+/// Convenience trait for serializing / deserializing CLI protocol messages
+/// using [`rkyv`].
+pub trait CliSerialize: Sized {
+    /// Serialize `self` into a byte vector.
+    fn serialize(&self) -> Result<Vec<u8>, CliSerdeError>;
+
+    /// Deserialize an instance from a byte slice.
+    fn deserialize(buf: &[u8]) -> Result<Self, CliSerdeError>;
+}
+
+impl CliSerialize for CliRequest {
+    fn serialize(&self) -> Result<Vec<u8>, CliSerdeError> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(self)
+            .map(|aligned| aligned.to_vec())
+            .map_err(|_| CliSerdeError::Serialize)
     }
-    fn serialized_size(&self) -> Result<u64, CliSerdeError>
-    where
-        Self: Serialize,
-    {
-        bincode2::serialized_size(self).map_err(|_| CliSerdeError::Serialize)
-    }
-    fn deserialize<'a>(buf: &'a [u8]) -> Result<Self, CliSerdeError>
-    where
-        Self: Deserialize<'a>,
-    {
-        bincode2::deserialize(buf).map_err(|_| CliSerdeError::Deserialize)
+
+    fn deserialize(buf: &[u8]) -> Result<Self, CliSerdeError> {
+        let mut aligned = SerializerVec::with_capacity(buf.len());
+        aligned.extend_from_slice(buf);
+        rkyv::from_bytes::<Self, rkyv::rancor::Error>(&aligned)
+            .map_err(|_| CliSerdeError::Deserialize)
     }
 }
 
-impl CliSerialize for CliRequest {}
-impl CliSerialize for CliResponse {}
+impl CliSerialize for CliResponse {
+    fn serialize(&self) -> Result<Vec<u8>, CliSerdeError> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(self)
+            .map(|aligned| aligned.to_vec())
+            .map_err(|_| CliSerdeError::Serialize)
+    }
 
-#[derive(Error, Debug, Serialize, Deserialize)]
+    fn deserialize(buf: &[u8]) -> Result<Self, CliSerdeError> {
+        let mut aligned = SerializerVec::with_capacity(buf.len());
+        aligned.extend_from_slice(buf);
+        rkyv::from_bytes::<Self, rkyv::rancor::Error>(&aligned)
+            .map_err(|_| CliSerdeError::Deserialize)
+    }
+}
+
+#[derive(Error, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum CliError {
     #[error("Internal error")]
     InternalError,
@@ -85,14 +172,11 @@ pub enum CliError {
 }
 
 /// A Cli response
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CliResponse {
     pub request: CliRequest,
-    // here we would add a union for the distinct objects which
-    // would need to implement Serialize & Deserialize, or , maybe
-    // pass a trait object implementing some sort of Serde.
-    // For the time being, we let the dataplane send a string, until
-    // all objects are defined and implement those traits.
+    // TODO: replace this String with a proper enum of response types
+    // once all CLI-visible objects derive the rkyv traits.
     pub result: Result<String, CliError>,
 }
 
@@ -120,8 +204,18 @@ impl CliResponse {
 }
 
 #[repr(u16)]
-#[allow(unused)]
-#[derive(Debug, Clone, Serialize, Deserialize, EnumIter, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    EnumIter,
+    PartialEq,
+    Eq,
+    strum::FromRepr,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum CliAction {
     Clear = 0,
     Connect,
@@ -206,19 +300,78 @@ pub enum CliAction {
     SetLoglevel,
 }
 
-impl CliAction {
-    fn discriminant(&self) -> u16 {
-        unsafe { *<*const _>::from(self).cast::<u16>() }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// Build a `CliRequest` that exercises every `RequestArgs` field so the
+    /// round-trip covers `Option`, `String`, `IpAddr`, `u32`, and enum
+    /// variants — the types most likely to contain alignment-sensitive
+    /// archived representations.
+    fn sample_request() -> CliRequest {
+        CliRequest::new(
+            CliAction::ShowRouterIpv4Routes,
+            RequestArgs {
+                address: Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+                prefix: Some((IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 24)),
+                vrfid: Some(42),
+                vni: Some(10_100),
+                ifname: Some("eth0".into()),
+                loglevel: Some(CliLogLevel::Debug),
+                protocol: Some(RouteProtocol::Bgp),
+            },
+        )
     }
-}
-impl TryFrom<u16> for CliAction {
-    type Error = ();
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        for a in CliAction::iter() {
-            if a.discriminant() == value {
-                return Ok(a);
-            }
+
+    /// Build a `CliResponse` that carries both the nested `CliRequest` and a
+    /// non-trivial `Ok(String)` result.
+    fn sample_response() -> CliResponse {
+        CliResponse::from_request_ok(sample_request(), "some result data".into())
+    }
+
+    #[test]
+    fn request_round_trip() {
+        let original = sample_request();
+        let bytes = original.serialize().expect("serialize");
+        let got = CliRequest::deserialize(&bytes).expect("deserialize");
+        assert_eq!(got, original);
+    }
+
+    #[test]
+    fn response_round_trip() {
+        let original = sample_response();
+        let bytes = original.serialize().expect("serialize");
+        let got = CliResponse::deserialize(&bytes).expect("deserialize");
+        assert_eq!(got, original);
+    }
+
+    /// Simulate the misalignment that `BytesMut::split_to` caused: prepend
+    /// between 1 and `SerializerVec::ALIGNMENT - 1` junk bytes so the rkyv
+    /// payload starts at every possible sub-alignment offset.  The
+    /// `AlignedVec` copy in `deserialize` must correct each one.
+    #[test]
+    fn request_deserialize_from_misaligned_buffer() {
+        let bytes = sample_request().serialize().expect("serialize");
+        for offset in 1..SerializerVec::ALIGNMENT {
+            let mut shifted = vec![0xFFu8; offset];
+            shifted.extend_from_slice(&bytes);
+            let got = CliRequest::deserialize(&shifted[offset..])
+                .unwrap_or_else(|_| panic!("deserialize failed at offset {offset}"));
+            assert_eq!(got, sample_request());
         }
-        Err(())
+    }
+
+    /// Same misalignment sweep for `CliResponse`.
+    #[test]
+    fn response_deserialize_from_misaligned_buffer() {
+        let bytes = sample_response().serialize().expect("serialize");
+        for offset in 1..SerializerVec::ALIGNMENT {
+            let mut shifted = vec![0xFFu8; offset];
+            shifted.extend_from_slice(&bytes);
+            let got = CliResponse::deserialize(&shifted[offset..])
+                .unwrap_or_else(|_| panic!("deserialize failed at offset {offset}"));
+            assert_eq!(got, sample_response());
+        }
     }
 }

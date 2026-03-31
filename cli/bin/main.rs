@@ -52,6 +52,11 @@ fn ask_user(question: &str) -> bool {
     }
 }
 
+/// Upper bound on a single CLI response payload.  Anything larger than this is
+/// almost certainly a bug or corrupt framing, so we reject it rather than
+/// attempting an unbounded allocation.
+const MAX_CLI_RESPONSE_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
+
 /// Receive the response, synchronously. This function may block the caller,
 /// which is the desired behavior. Now, unfortunately the `peek()` and the like
 /// methods of `UnixDatagram` are not stable. This creates an issue because if
@@ -72,6 +77,10 @@ fn process_cli_response(sock: &UnixDatagram) {
         return;
     }
     let msg_size = u64::from_ne_bytes(msg_size_wire);
+    if msg_size > MAX_CLI_RESPONSE_SIZE {
+        print_err!("Response size {msg_size} exceeds maximum ({MAX_CLI_RESPONSE_SIZE}), dropping");
+        return;
+    }
     #[allow(clippy::cast_possible_truncation)]
     if msg_size as usize > rx_buff.capacity() {
         rx_buff.resize(msg_size as usize, 0);
@@ -119,13 +128,12 @@ fn execute_remote_action(
 }
 
 fn execute_action(
-    action: u16,    // action to perform
-    args: &CliArgs, // action arguments
+    action: CliAction, // action to perform
+    args: &CliArgs,    // action arguments
     cmdline: &Cmdline,
     terminal: &mut Terminal, // this terminal
 ) {
-    let cli_action = action.try_into().expect("Bad action code");
-    match cli_action {
+    match action {
         CliAction::Clear => terminal.clear(),
         CliAction::Quit => terminal.stop(),
         CliAction::Help => terminal.get_cmd_tree().dump(),
@@ -143,7 +151,7 @@ fn execute_action(
             terminal.connect(&bind_addr, &path);
         }
         // all others are remote
-        _ => execute_remote_action(cli_action, args, terminal),
+        _ => execute_remote_action(action, args, terminal),
     }
 }
 

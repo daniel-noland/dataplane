@@ -39,7 +39,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.16.1"
+version = "0.18.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -92,10 +92,9 @@ async-trait = { version = "0.1.89", default-features = false, features = [] }
 atomic-instant-full = { version = "0.1.1", default-features = false, features = [] }
 axum = { version = "0.8.8", default-features = false, features = [] }
 axum-server = { version = "0.8.0", default-features = false, features = [] }
-bincode2 = { version = "2.0.1", default-features = false, features = [] } # TODO: try to remove this
 bindgen = { version = "0.72.1", default-features = false, features = [] }
 bitflags = { version = "2.11.0", default-features = false, features = [] }
-bnum = { version = "0.14.3", default-features = false, features = [] }
+bnum = { version = "0.14.4", default-features = false, features = [] }
 bolero = { version = "0.13.4", default-features = false, features = [] }
 bytecheck = { version = "0.8.2", default-features = false, features = [] }
 bytes = { version = "1.11.1", default-features = false, features = [] }
@@ -135,7 +134,7 @@ memmap2 = { version = "0.9.10", default-features = false, features = [] }
 metrics = { version = "0.24.3", default-features = false, features = [] }
 metrics-exporter-prometheus = { version = "0.18.1", default-features = false, features = [] }
 miette = { version = "7.6.0", default-features = false, features = [] }
-mio = { version = "1.1.1", default-features = false, features = [] }
+mio = { version = "1.2.0", default-features = false, features = [] }
 multi_index_map = { version = "0.15.1", default-features = false, features = [] }
 n-vm = { git = "https://github.com/githedgehog/testn.git", tag = "v0.0.9", default-features = false, features = [], package = "n-vm" }
 netdev = { version = "0.41.0", default-features = false, features = [] }
@@ -162,13 +161,13 @@ rkyv = { version = "0.8.15", default-features = false, features = [] }
 roaring = { version = "0.11.3", default-features = false, features = [] }
 rtnetlink = { git = "https://github.com/githedgehog/rtnetlink.git", branch = "hh/tc-actions3", default-features = false, features = [] }
 rustls = { version = "0.23.37", default-features = false, features = [] }
-rustyline = { version = "17.0.2", default-features = false, features = [] }
+rustyline = { version = "18.0.0", default-features = false, features = [] }
 schemars = { version = "1", default-features = false, features = [] }
 serde = { version = "1.0.228", default-features = false, features = [] }
 serde_json = { version = "1.0.149", default-features = false, features = [] }
 serde_yaml_ng = { version = "0.10.0", default-features = false, features = [] }
 serial_test = { version = "3.4.0", default-features = false, features = [] }
-sha2 = { version = "0.10.9", default-features = false, features = [] }
+sha2 = { version = "0.11.0", default-features = false, features = [] }
 shuttle = { version = "0.8.1", default-features = false, features = [] }
 small-map = { version = "0.1.5", default-features = false, features = [] }
 static_assertions = { version = "1.1.0", default-features = false, features = [] }
@@ -186,7 +185,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 tracing-test = { version = "0.2.6", default-features = false, features = [] }
 ureq = { version = "3.3.0", default-features = false, features = [] }
 url = { version = "2.5.8", default-features = false, features = [] }
-uuid = { version = "1.22.0", default-features = false, features = [] }
+uuid = { version = "1.23.0", default-features = false, features = [] }
 
 [profile.dev]
 panic = "unwind"

@@ -73,7 +73,7 @@ version:
 oci_repo := "127.0.0.1:30000"
 oci_insecure := ""
 oci_name := "githedgehog/dataplane"
-oci_frr_prefix := "githedgehog/dpdk-sys/frr"
+oci_frr_prefix := "githedgehog/dataplane/frr"
 oci_image_dataplane := oci_repo + "/" + oci_name + ":" + version
 oci_image_dataplane_debugger := oci_repo + "/" + oci_name + "/debugger:" + version
 oci_image_dataplane_validator := oci_repo + "/" + oci_name + "/validator:" + version
@@ -164,14 +164,21 @@ build-container target="dataplane" *args: (build (if target == "dataplane" { "da
             docker tag "ghcr.io/githedgehog/dataplane/debugger:{{version}}" "{{oci_image_dataplane_debugger}}"
             echo "imported {{ oci_image_dataplane_debugger }}"
             ;;
+        "debug-tools")
+            # Uses nix only to produce a base image with the runtime closure (glibc, bash, etc.)
+            # then layers locally-compiled cargo binaries on top via Dockerfile.
+            # See the `build-container-quick` recipe.
+            docker load < ./results/containers.debug-tools
+            echo "imported debug-tools:dev"
+            ;;
         "frr.dataplane")
             docker load < ./results/containers.frr.dataplane
-            docker tag "ghcr.io/githedgehog/dpdk-sys/frr:{{version}}" "{{oci_image_frr_dataplane}}"
+            docker tag "ghcr.io/githedgehog/dataplane/frr:{{version}}" "{{oci_image_frr_dataplane}}"
             echo "imported {{oci_image_frr_dataplane}}"
             ;;
         "frr.host")
             docker load < ./results/containers.frr.host
-            docker tag "ghcr.io/githedgehog/dpdk-sys/frr-host:{{version}}" "{{oci_image_frr_host}}"
+            docker tag "ghcr.io/githedgehog/dataplane/frr-host:{{version}}" "{{oci_image_frr_host}}"
             echo "imported {{oci_image_frr_host}}"
             ;;
         "validator")
@@ -181,6 +188,21 @@ build-container target="dataplane" *args: (build (if target == "dataplane" { "da
             >&2 echo "{{target}}" not a valid container
             exit 99
     esac
+
+# WARNING: The resulting image must NEVER be pushed to a shared registry.
+# NOTE: this recipe intentionally does not depend on build-container "debug-tools" to make the call fast.
+# Quick (non-sterile) container build using local cargo artifacts
+[script]
+build-container-quick:
+    {{ _just_debuggable_ }}
+    docker build \
+        --file ./Dockerfile \
+        --build-arg PROFILE="{{profile}}" \
+        --label sterile="false" \
+        --annotation sterile="false" \
+        --tag "dataplane:dev" \
+        .
+    echo "imported dataplane:dev"
 
 # Build and push the dataplane container
 [script]
@@ -195,6 +217,10 @@ push-container target="dataplane" *args: (build-container target args) && versio
         "dataplane-debugger")
             skopeo copy --src-daemon-host="${DOCKER_HOST}" {{ _skopeo_dest_insecure }} docker-daemon:{{ oci_image_dataplane_debugger }} docker://{{ oci_image_dataplane_debugger }}
             echo "Pushed {{ oci_image_dataplane_debugger }}"
+            ;;
+        "debug-tools")
+            >&2 echo "do not push the debug tools!"
+            exit 1
             ;;
         "frr.dataplane")
             skopeo copy --src-daemon-host="${DOCKER_HOST}" {{ _skopeo_dest_insecure }} docker-daemon:{{oci_image_frr_dataplane}} docker://{{oci_image_frr_dataplane}}
