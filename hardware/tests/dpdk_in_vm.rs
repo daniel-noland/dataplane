@@ -20,6 +20,20 @@
 //! all-nodes multicast group (`ff02::1`), the host kernel responds on
 //! the same TAP, and the response appears in the DPDK rx ring.
 //!
+//! # Host page size
+//!
+//! By default every test uses 1 GiB hugepages on the host to back the
+//! VM's memory (`memory-backend-file` pointing at `/dev/hugepages`).
+//! Tests suffixed with `_4k` override this to standard 4 KiB pages
+//! (`memory-backend-memfd`) via `#[hypervisor(host_pages = "4k")]`.
+//! This exercises the deployment path where no host hugepages are
+//! available.  Guest-side hugepages (2 MiB, reserved via the kernel
+//! command line) are unaffected — DPDK still gets its hugepage-backed
+//! mempools inside the VM.
+//!
+//! Transparent Huge Pages (THP) on the host may silently coalesce the
+//! memfd-backed 4 KiB pages into 2 MiB pages, but this is invisible to
+//! the guest and should not affect correctness.
 //!
 //! # Supported NIC models
 //!
@@ -1298,6 +1312,41 @@ fn dpdk_rx_frame_e1000_qemu_iommu() {
     run_rx_test("QEMU / e1000 / vIOMMU (VA)", true);
 }
 
+/// Rx spike: QEMU + e1000 (Intel 82540EM), VFIO no-IOMMU (PA mode),
+/// host 4 KiB pages.
+///
+/// Same as [`dpdk_rx_frame_e1000_qemu`] but the VM's memory is backed
+/// by standard 4 KiB pages on the host (`memory-backend-memfd`) instead
+/// of hugetlbfs.  Guest-side 2 MiB hugepages are still reserved for
+/// DPDK's mempool.  This exercises the "no host hugepages" deployment
+/// path — only the guest kernel's own hugepage allocator is used.
+///
+/// Transparent Huge Pages (THP) on the host may silently promote the
+/// backing pages to 2 MiB, but that is a host-side optimisation and
+/// does not affect DPDK's view of guest memory.
+#[in_vm(qemu)]
+#[test]
+#[network(nic_model = "e1000")]
+#[hypervisor(host_pages = "4k")]
+#[guest(hugepage_size = "2m", hugepage_count = 64)]
+fn dpdk_rx_frame_e1000_qemu_4k() {
+    run_rx_test("QEMU / e1000 / no-IOMMU (PA) / host 4K pages", true);
+}
+
+/// Rx spike: QEMU + e1000 (Intel 82540EM) + vIOMMU (VA mode),
+/// host 4 KiB pages.
+///
+/// Combines the vIOMMU variant with standard host pages.  DPDK should
+/// auto-detect VA mode via the IOMMU while the VM's memory is backed
+/// by `memory-backend-memfd` (no hugetlbfs on the host).
+#[in_vm(qemu)]
+#[test]
+#[network(nic_model = "e1000")]
+#[hypervisor(iommu, host_pages = "4k")]
+#[guest(hugepage_size = "2m", hugepage_count = 64)]
+fn dpdk_rx_frame_e1000_qemu_iommu_4k() {
+    run_rx_test("QEMU / e1000 / vIOMMU (VA) / host 4K pages", true);
+}
 
 // ---------------------------------------------------------------------------
 // e1000e tests (QEMU only)
@@ -1329,4 +1378,32 @@ fn dpdk_rx_frame_e1000e_qemu_iommu() {
     run_rx_test("QEMU / e1000e / vIOMMU (VA)", true);
 }
 
+/// Rx spike: QEMU + e1000e (Intel 82574L), VFIO no-IOMMU (PA mode),
+/// host 4 KiB pages.
+///
+/// Same as [`dpdk_rx_frame_e1000e_qemu`] but with standard 4 KiB host
+/// pages.  QEMU uses `memory-backend-memfd` instead of hugetlbfs-backed
+/// files, while the guest still reserves 2 MiB hugepages for DPDK.
+#[in_vm(qemu)]
+#[test]
+#[network(nic_model = "e1000e")]
+#[hypervisor(host_pages = "4k")]
+#[guest(hugepage_size = "2m", hugepage_count = 64)]
+fn dpdk_rx_frame_e1000e_qemu_4k() {
+    run_rx_test("QEMU / e1000e / no-IOMMU (PA) / host 4K pages", true);
+}
+
+/// Rx spike: QEMU + e1000e (Intel 82574L) + vIOMMU (VA mode),
+/// host 4 KiB pages.
+///
+/// Combines the vIOMMU variant with standard host pages.  DMA is
+/// remapped by the IOMMU while the VM's physical memory is backed by
+/// anonymous shared memory (no hugetlbfs).
+#[in_vm(qemu)]
+#[test]
+#[network(nic_model = "e1000e")]
+#[hypervisor(iommu, host_pages = "4k")]
+#[guest(hugepage_size = "2m", hugepage_count = 64)]
+fn dpdk_rx_frame_e1000e_qemu_iommu_4k() {
+    run_rx_test("QEMU / e1000e / vIOMMU (VA) / host 4K pages", true);
 }
