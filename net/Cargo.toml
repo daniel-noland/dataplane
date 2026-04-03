@@ -6,12 +6,13 @@ publish.workspace = true
 version.workspace = true
 
 [features]
-default = []
+default = ["packet-builder"]
 serde = ["id/serde"]
 netdevsim = []
 
-bolero = ["dep:bolero", "id/bolero"]
+bolero = ["dep:bolero", "id/bolero", "packet-builder"]
 test_buffer = []
+packet-builder = []
 
 [target.'cfg(unix)'.dependencies]
 atomic-instant-full = { workspace = true }
