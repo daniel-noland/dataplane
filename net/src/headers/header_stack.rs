@@ -723,3 +723,296 @@ fn fixup_lengths(headers: &mut Headers, payload: &[u8]) -> Result<(), BuildError
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipv4::UnicastIpv4Addr;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn ipv4_tcp_fixup_headers() {
+        let headers = HeaderStack::new()
+            .eth(|_| {})
+            .ipv4(|ip| {
+                ip.set_source(UnicastIpv4Addr::new(Ipv4Addr::new(10, 0, 0, 1)).unwrap());
+                ip.set_destination(Ipv4Addr::new(10, 0, 0, 2));
+            })
+            .tcp(|tcp| {
+                tcp.set_source(TcpPort::new_checked(12345).unwrap());
+                tcp.set_destination(TcpPort::new_checked(80).unwrap());
+            })
+            .headers()
+            .unwrap();
+
+        // Eth should have IPV4 ethtype (set by conform)
+        assert_eq!(headers.eth().unwrap().ether_type(), EthType::IPV4);
+
+        // IPv4 next_header should be TCP (set by conform)
+        let Net::Ipv4(ipv4) = headers.net().unwrap() else {
+            panic!("expected Ipv4");
+        };
+        assert_eq!(ipv4.next_header(), NextHeader::TCP);
+
+        // Transport should be TCP
+        assert!(matches!(headers.transport(), Some(Transport::Tcp(_))));
+    }
+
+    #[test]
+    fn ipv6_udp_fixup_headers() {
+        let headers = HeaderStack::new()
+            .eth(|_| {})
+            .ipv6(|_| {})
+            .udp(|udp| {
+                udp.set_source(UdpPort::new_checked(5000).unwrap());
+                udp.set_destination(UdpPort::new_checked(6000).unwrap());
+            })
+            .headers()
+            .unwrap();
+
+        assert_eq!(headers.eth().unwrap().ether_type(), EthType::IPV6);
+
+        let Net::Ipv6(ipv6) = headers.net().unwrap() else {
+            panic!("expected Ipv6");
+        };
+        assert_eq!(ipv6.next_header(), NextHeader::UDP);
+    }
+
+    #[test]
+    fn double_vlan_ordering() {
+        let headers = HeaderStack::new()
+            .eth(|_| {})
+            .vlan(|v| {
+                v.set_vid(Vid::new(100).unwrap());
+            })
+            .vlan(|v| {
+                v.set_vid(Vid::new(200).unwrap());
+            })
+            .ipv4(|_| {})
+            .tcp(|_| {})
+            .headers()
+            .unwrap();
+
+        let vlans = headers.vlan();
+        assert_eq!(vlans.len(), 2);
+        assert_eq!(vlans[0].vid(), Vid::new(100).unwrap());
+        assert_eq!(vlans[1].vid(), Vid::new(200).unwrap());
+    }
+
+    #[test]
+    fn vxlan_conforms_udp() {
+        let headers = HeaderStack::new()
+            .eth(|_| {})
+            .ipv4(|_| {})
+            .udp(|udp| {
+                // User sets a wrong port -- conform should overwrite it.
+                udp.set_destination(UdpPort::new_checked(9999).unwrap());
+            })
+            .vxlan(|_| {})
+            .headers()
+            .unwrap();
+
+        let Transport::Udp(udp) = headers.transport().unwrap() else {
+            panic!("expected Udp");
+        };
+        assert_eq!(udp.destination(), Vxlan::PORT);
+    }
+
+    #[test]
+    fn icmp4_with_embedded() {
+        let headers = HeaderStack::new()
+            .eth(|_| {})
+            .ipv4(|ip| {
+                ip.set_destination(Ipv4Addr::new(10, 0, 0, 1));
+            })
+            .icmp4(|_| {})
+            .embedded(|inner| {
+                inner
+                    .ipv4(|ip| {
+                        ip.set_source(UnicastIpv4Addr::new(Ipv4Addr::new(192, 168, 1, 1)).unwrap());
+                        ip.set_destination(Ipv4Addr::new(10, 0, 0, 1));
+                    })
+                    .tcp(
+                        TcpPort::new_checked(12345).unwrap(),
+                        TcpPort::new_checked(80).unwrap(),
+                        |_| {},
+                    )
+            })
+            .payload([])
+            .unwrap();
+
+        assert!(headers.embedded_ip().is_some());
+        assert!(matches!(headers.transport(), Some(Transport::Icmp4(_))));
+    }
+
+    #[test]
+    fn fixup_computes_ip_payload_length() {
+        let headers = HeaderStack::new()
+            .eth(|_| {})
+            .ipv4(|_| {})
+            .tcp(|_| {})
+            .payload([])
+            .unwrap();
+
+        let Net::Ipv4(ipv4) = headers.net().unwrap() else {
+            panic!("expected Ipv4");
+        };
+        let Transport::Tcp(tcp) = headers.transport().unwrap() else {
+            panic!("expected Tcp");
+        };
+
+        // IP payload length should equal the TCP header size.
+        assert_eq!(ipv4.total_len(), tcp.size().get());
+    }
+
+    #[test]
+    fn blank_eth_uses_locally_administered_macs() {
+        let eth = Eth::blank();
+        let src = eth.source();
+        let dst = eth.destination();
+        // Locally-administered bit (second-least-significant bit of first octet)
+        assert_ne!(src.inner().0, [0; 6]);
+        assert_ne!(dst.inner().0, [0; 6]);
+    }
+
+    // =====================================================================
+    // Property-based tests (bolero)
+    // =====================================================================
+
+    #[cfg(feature = "bolero")]
+    mod prop {
+        use super::*;
+        use crate::ipv4::UnicastIpv4Addr;
+        use crate::ipv6::UnicastIpv6Addr;
+
+        #[test]
+        fn prop_ipv4_tcp_conform_is_correct() {
+            bolero::check!().with_type().cloned().for_each(
+                |(src_mac, dst_mac, src_ip, dst_ip, src_port, dst_port): (
+                    SourceMac,
+                    DestinationMac,
+                    UnicastIpv4Addr,
+                    UnicastIpv4Addr,
+                    TcpPort,
+                    TcpPort,
+                )| {
+                    let headers = HeaderStack::new()
+                        .eth(|e| {
+                            e.set_source(src_mac).set_destination(dst_mac);
+                        })
+                        .ipv4(|ip| {
+                            ip.set_source(src_ip);
+                            ip.set_destination(dst_ip.inner());
+                        })
+                        .tcp(|tcp| {
+                            tcp.set_source(src_port);
+                            tcp.set_destination(dst_port);
+                        })
+                        .payload([])
+                        .unwrap();
+
+                    assert_eq!(headers.eth().unwrap().ether_type(), EthType::IPV4);
+                    let Net::Ipv4(ipv4) = headers.net().unwrap() else {
+                        panic!("expected Ipv4");
+                    };
+                    assert_eq!(ipv4.next_header(), NextHeader::TCP);
+                },
+            );
+        }
+
+        #[test]
+        fn prop_ipv6_udp_conform_is_correct() {
+            bolero::check!().with_type().cloned().for_each(
+                |(src_mac, dst_mac, src_ip, dst_ip, src_port, dst_port): (
+                    SourceMac,
+                    DestinationMac,
+                    UnicastIpv6Addr,
+                    UnicastIpv6Addr,
+                    UdpPort,
+                    UdpPort,
+                )| {
+                    let headers = HeaderStack::new()
+                        .eth(|e| {
+                            e.set_source(src_mac).set_destination(dst_mac);
+                        })
+                        .ipv6(|ip| {
+                            ip.set_source(src_ip);
+                            ip.set_destination(dst_ip.inner());
+                        })
+                        .udp(|udp| {
+                            udp.set_source(src_port);
+                            udp.set_destination(dst_port);
+                        })
+                        .payload([])
+                        .unwrap();
+
+                    assert_eq!(headers.eth().unwrap().ether_type(), EthType::IPV6);
+                    let Net::Ipv6(ipv6) = headers.net().unwrap() else {
+                        panic!("expected Ipv6");
+                    };
+                    assert_eq!(ipv6.next_header(), NextHeader::UDP);
+                },
+            );
+        }
+
+        #[test]
+        fn prop_ipv4_tcp_payload_length_consistent() {
+            bolero::check!().with_type().cloned().for_each(
+                |(src_ip, dst_ip, payload): (UnicastIpv4Addr, UnicastIpv4Addr, Vec<u8>)| {
+                    // Limit payload to avoid u16 overflow
+                    if payload.len() > 60_000 {
+                        return;
+                    }
+
+                    let headers = HeaderStack::new()
+                        .eth(|_| {})
+                        .ipv4(|ip| {
+                            ip.set_source(src_ip);
+                            ip.set_destination(dst_ip.inner());
+                        })
+                        .tcp(|_| {})
+                        .payload(&payload)
+                        .unwrap();
+
+                    let Net::Ipv4(ipv4) = headers.net().unwrap() else {
+                        panic!("expected Ipv4");
+                    };
+                    let Transport::Tcp(tcp) = headers.transport().unwrap() else {
+                        panic!("expected Tcp");
+                    };
+
+                    let expected_payload_len = tcp.size().get() + payload.len() as u16;
+                    assert_eq!(ipv4.payload_len(), expected_payload_len);
+                },
+            );
+        }
+
+        #[test]
+        fn prop_vxlan_always_overrides_udp_dst() {
+            bolero::check!()
+                .with_type()
+                .cloned()
+                .for_each(|(user_port, vni): (UdpPort, Vni)| {
+                    let headers = HeaderStack::new()
+                        .eth(|_| {})
+                        .ipv4(|_| {})
+                        .udp(|udp| {
+                            udp.set_destination(user_port);
+                        })
+                        .vxlan(|vx| {
+                            vx.set_vni(vni);
+                        })
+                        .headers()
+                        .unwrap();
+
+                    let Transport::Udp(udp) = headers.transport().unwrap() else {
+                        panic!("expected Udp");
+                    };
+                    assert_eq!(
+                        udp.destination(),
+                        Vxlan::PORT,
+                        "VXLAN conform must override user-set UDP dst port {user_port:?} to 4789",
+                    );
+                });
+        }
+    }
+}
