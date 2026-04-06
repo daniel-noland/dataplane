@@ -683,29 +683,30 @@ fn fixup_lengths(headers: &mut Headers, payload: &[u8]) -> Result<(), BuildError
 
     let payload_u16 = u16::try_from(payload.len()).map_err(|_| BuildError::PayloadTooLarge)?;
 
-    // UDP datagram length
-    if let Some(Transport::Udp(udp)) = &mut headers.transport {
-        let udp_total = Udp::MIN_LENGTH
-            .get()
-            .checked_add(encap_size)
-            .and_then(|v| v.checked_add(payload_u16))
-            .and_then(NonZero::new)
-            .ok_or(BuildError::PayloadTooLarge)?;
-
-        #[allow(unsafe_code)]
-        // SAFETY: `udp_total >= Udp::MIN_LENGTH` by construction.
-        unsafe {
-            udp.set_length(udp_total);
-        }
-    }
-
-    // IP payload length
+    // It is safe to combine values this way because the mutually exclusive values are mapped back
+    // to zero (e.g. embedded_size is 0 when transport is UDP, encap_size is 0 when transport is
+    // ICMP, etc.).
     // TODO: include net_ext size once IPv6 extension headers are supported.
     let ip_payload = transport_size
-        .checked_add(embedded_size)
+        .checked_add(payload_u16)
         .and_then(|v| v.checked_add(encap_size))
-        .and_then(|v| v.checked_add(payload_u16))
+        .and_then(|v| v.checked_add(embedded_size))
         .ok_or(BuildError::PayloadTooLarge)?;
+
+    match headers.transport {
+        Some(Transport::Udp(ref mut udp)) => {
+            // SAFETY: `transport_size >= Udp::MIN_LENGTH` when transport is UDP, so `ip_payload`
+            // is guaranteed non-zero.
+            let udp_len = NonZero::new(ip_payload).unwrap_or_else(|| unreachable!());
+            #[allow(unsafe_code)]
+            // SAFETY: `udp_len >= Udp::MIN_LENGTH` by construction.
+            unsafe {
+                udp.set_length(udp_len);
+            }
+        }
+        // No length field in these headers to adjust.
+        Some(Transport::Tcp(_) | Transport::Icmp4(_) | Transport::Icmp6(_)) | None => {}
+    }
 
     match &mut headers.net {
         Some(Net::Ipv4(ip)) => {
