@@ -325,7 +325,7 @@ where
     /// runs to customize it.  The *previous* top-of-stack is conformed
     /// (via [`Within`]) and installed into [`Headers`] before the new layer
     /// is created.
-    pub fn stack<U>(mut self, f: impl FnOnce(&mut U)) -> HeaderStack<U>
+    pub fn stack<U>(mut self, mutate: impl FnOnce(&mut U)) -> HeaderStack<U>
     where
         U: Blank + Within<T>,
         Headers: Install<U>,
@@ -334,7 +334,7 @@ where
         self.headers.install(self.working);
 
         let mut e = U::blank();
-        f(&mut e);
+        mutate(&mut e);
         HeaderStack {
             headers: self.headers,
             working: e,
