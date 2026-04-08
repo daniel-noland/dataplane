@@ -14,6 +14,7 @@ members = [
     "errno",
     "flow-entry",
     "flow-filter",
+    "flow-test",
     "hardware",
     "id",
     "init",
@@ -61,6 +62,7 @@ dplane-rpc = { git = "https://github.com/githedgehog/dplane-rpc.git", rev = "e8f
 errno = { path = "./errno", package = "dataplane-errno", features = [] }
 flow-entry = { path = "./flow-entry", package = "dataplane-flow-entry", features = [] }
 flow-filter = { path = "./flow-filter", package = "dataplane-flow-filter", features = [] }
+flow-test = { path = "./flow-test", package = "dataplane-flow-test", features = [] }
 hardware = { path = "./hardware", package = "dataplane-hardware", features = [] }
 id = { path = "./id", package = "dataplane-id", features = [] }
 init = { path = "./init", package = "dataplane-init", features = [] }
@@ -146,6 +148,7 @@ num-traits = { version = "0.2.19", default-features = false, features = [] }
 once_cell = { version = "1.21.4", default-features = false, features = [] }
 ordermap = { version = "1.1.0", default-features = false, features = [] }
 parking_lot = { version = "0.12.5", default-features = false, features = [] }
+pcap-file = { version = "2.0.0", default-features = false, features = [] }
 pci-ids = { version = "0.2.6", default-features = false, features = [] }
 prefix-trie = { version = "0.8.2", default-features = false, features = [] }
 pretty_assertions = { version = "1.4.1", default-features = false, features = [] }
@@ -164,6 +167,7 @@ rustls = { version = "0.23.37", default-features = false, features = [] }
 rustyline = { version = "18.0.0", default-features = false, features = [] }
 schemars = { version = "1", default-features = false, features = [] }
 serde = { version = "1.0.228", default-features = false, features = [] }
+smoltcp = { version = "0.13.0", default-features = false, features = [] }
 serde_json = { version = "1.0.149", default-features = false, features = [] }
 serde_yaml_ng = { version = "0.10.0", default-features = false, features = [] }
 serial_test = { version = "3.4.0", default-features = false, features = [] }
