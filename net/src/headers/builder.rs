@@ -466,7 +466,7 @@ where
     // ICMPv4 subtype layers -- available after `.icmp4()`
 
     layer_method!(
-        /// Specialize as `ICMPv4` Destination Unreachable (type 3).
+        /// Specialize as `Icmp4` Destination Unreachable (type 3).
         dest_unreachable, Icmp4DestUnreachable
     );
     layer_method!(
@@ -1653,6 +1653,38 @@ mod fuzz {
             crate::vxlan::Vxlan
         );
 
+        // IPv6 extension header layers
+        fuzz_layer_method!(
+            /// Push a `HopByHop` extension header.
+            hop_by_hop,
+            crate::ipv6::HopByHop
+        );
+        fuzz_layer_method!(
+            /// Push a `DestOpts` extension header.
+            dest_opts,
+            crate::ipv6::DestOpts
+        );
+        fuzz_layer_method!(
+            /// Push a `Routing` extension header.
+            routing,
+            crate::ipv6::Routing
+        );
+        fuzz_layer_method!(
+            /// Push a `Fragment` extension header.
+            fragment,
+            crate::ipv6::Fragment
+        );
+        fuzz_layer_method!(
+            /// Push an `Ipv4Auth` extension header.
+            ipv4_auth,
+            crate::ip_auth::Ipv4Auth
+        );
+        fuzz_layer_method!(
+            /// Push an `Ipv6Auth` extension header.
+            ipv6_auth,
+            crate::ip_auth::Ipv6Auth
+        );
+
         // ICMPv4 subtype layers
         fuzz_layer_method!(
             /// Specialize as `ICMPv4` Destination Unreachable.
@@ -2766,6 +2798,17 @@ mod tests {
                     panic!("no embedded ipv4");
                 };
                 assert_eq!(inner_ip.destination().octets(), [169, 254, 32, 53]);
+            });
+    }
+
+    #[test]
+    fn fuzz_ipv6_ext_headers() {
+        let generator = ChainBase::new().eth(|_| {}).ipv6(|_| {}).hop_by_hop(|_| {});
+
+        bolero::check!()
+            .with_generator(generator)
+            .for_each(|_headers| {
+                // ...
             });
     }
 }
