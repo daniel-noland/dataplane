@@ -16,10 +16,10 @@ use tracing::{error, info, warn};
 
 /// Safe wrapper around the DPDK Environment Abstraction Layer (EAL).
 ///
-/// This is a zero-sized type that is used for lifetime management and to ensure that the Eal is
-/// properly initialized and cleaned up.
+/// This type is used for lifetime management and to ensure that the EAL is
+/// properly initialized and cleaned up.  It owns the various DPDK sub-system
+/// managers whose lifetimes are tied to the EAL.
 #[derive(Debug)]
-#[repr(transparent)]
 #[non_exhaustive]
 pub struct Eal {
     /// The memory manager.
@@ -43,7 +43,19 @@ pub struct Eal {
     // TODO: flow
 }
 
-unsafe impl Sync for Eal {}
+// Eal is Send + Sync automatically because all of its fields (the Manager
+// unit structs) are Send + Sync.  No explicit `unsafe impl` is needed.
+//
+// If a future field introduces a non-Sync type (e.g. a raw pointer or
+// Cell), the compiler will reject the auto-derivation and force an
+// explicit, audited decision — which is the behavior we want.
+//
+// Methods reachable through &Eal (i.e. &self methods on the public
+// Manager fields) must only call DPDK functions that are documented as
+// thread-safe.  At present these are limited to read-only queries
+// (rte_eth_dev_info_get, rte_eth_dev_count_avail, rte_socket_id,
+// rte_socket_count, rte_lcore_count, etc.) which DPDK guarantees are
+// safe to call concurrently after EAL initialization.
 
 /// Error type for EAL initialization failures.
 #[derive(Debug, thiserror::Error)]
