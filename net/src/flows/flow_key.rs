@@ -986,10 +986,8 @@ mod tests {
                                 // Still need to set inner IPs so extraction
                                 // finds the addresses we expect.
                                 let ip = packet.try_inner_ip_mut().unwrap();
-                                ip.try_set_source(
-                                    UnicastIpAddr::try_from(*data.src_ip()).unwrap(),
-                                )
-                                .unwrap();
+                                ip.try_set_source(UnicastIpAddr::try_from(*data.src_ip()).unwrap())
+                                    .unwrap();
                                 ip.try_set_destination(*data.dst_ip()).unwrap();
                             }
                         },

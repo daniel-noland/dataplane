@@ -168,7 +168,10 @@ impl Icmp6PacketTooBig {
 #[repr(u8)]
 pub enum Icmp6TimeExceeded {
     /// Code 0: Hop Limit Exceeded in Transit.
-    #[strum(message = "hop limit exceeded", detailed_message = "Hop limit exceeded in transit")]
+    #[strum(
+        message = "hop limit exceeded",
+        detailed_message = "Hop limit exceeded in transit"
+    )]
     HopLimitExceeded = 0,
     /// Code 1: Fragment Reassembly Time Exceeded.
     #[strum(
@@ -974,7 +977,10 @@ mod contract {
                 0 => (c::TYPE_DST_UNREACH, Icmp6DestUnreachable::COUNT as u8),
                 1 => (c::TYPE_PACKET_TOO_BIG, 1),
                 2 => (c::TYPE_TIME_EXCEEDED, Icmp6TimeExceeded::COUNT as u8),
-                3 => (c::TYPE_PARAMETER_PROBLEM, Icmp6ParamProblemCode::COUNT as u8),
+                3 => (
+                    c::TYPE_PARAMETER_PROBLEM,
+                    Icmp6ParamProblemCode::COUNT as u8,
+                ),
                 4 => (c::TYPE_ECHO_REQUEST, 1),
                 5 => (c::TYPE_ECHO_REPLY, 1),
                 6 => (c::TYPE_ROUTER_SOLICITATION, 1),
