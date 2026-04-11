@@ -485,18 +485,23 @@ mod bolero_tests {
                     if *src_port == Some(NatPort::Identifier(0))
                         || *dst_port == Some(NatPort::Identifier(0))
                     {
-                        match icmp_error_msg_clone.try_embedded_transport_mut() {
-                            Some(EmbeddedTransport::Tcp(_) | EmbeddedTransport::Udp(_)) => {
-                                assert_eq!(
-                                    inner_translation_result,
-                                    Err(IcmpErrorMsgError::InvalidPort(0))
-                                );
-                                return;
-                            }
-                            _ => {
-                                assert!(inner_translation_result.is_ok());
-                            }
+                        if let Some(EmbeddedTransport::Tcp(_) | EmbeddedTransport::Udp(_)) =
+                            icmp_error_msg_clone.try_embedded_transport_mut()
+                        {
+                            assert_eq!(
+                                inner_translation_result,
+                                Err(IcmpErrorMsgError::InvalidPort(0))
+                            );
+                            return;
                         }
+                    }
+
+                    // Translation can legitimately fail on fuzzed inputs
+                    // (e.g., embedded headers too short to parse, IP
+                    // version mismatch, non-unicast source).  Only
+                    // verify post-conditions when translation succeeded.
+                    if inner_translation_result.is_err() {
+                        return;
                     }
 
                     let (translation_src_port, translation_dst_port) = (
