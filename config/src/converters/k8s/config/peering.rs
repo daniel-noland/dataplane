@@ -64,7 +64,7 @@ impl TryFrom<(&VpcSubnetMap, &str, &GatewayAgentPeerings)> for VpcPeering {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use super::*;
 
@@ -75,6 +75,7 @@ mod test {
 
     use crate::converters::k8s::config::{SubnetMap, VpcSubnetMap};
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_vpc_manifest_conversion() {
         let subnets = SubnetMap::new(); // Let this be empty since we are test subnet conversion elsewhere
@@ -93,6 +94,7 @@ mod test {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_vpc_peering_conversion() {
         let subnets = VpcSubnetMap::from([

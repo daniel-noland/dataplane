@@ -132,13 +132,14 @@ impl TryFrom<&GatewayAgent> for ExternalConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use k8s_intf::bolero::LegalValue;
     use k8s_intf::gateway_agent_crd::GatewayAgent;
 
     use crate::ExternalConfig;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_gateway_config_conversion() {
         bolero::check!()

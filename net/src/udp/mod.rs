@@ -264,7 +264,7 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use crate::checksum::Checksum;
     use crate::parse::IntoNonZeroUSize;
@@ -274,6 +274,7 @@ mod test {
 
     const MIN_LENGTH_USIZE: usize = 8;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_back() {
         bolero::check!().with_type().for_each(|input: &Udp| {
@@ -296,6 +297,7 @@ mod test {
         });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_arbitrary_bytes() {
         bolero::check!()
@@ -324,6 +326,7 @@ mod test {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn too_short_buffer_parse_fails_gracefully() {
         bolero::check!()
@@ -341,6 +344,7 @@ mod test {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn longer_buffer_parses_ok() {
         bolero::check!()
@@ -372,6 +376,7 @@ mod test {
     }
 
     // evolve an arbitrary source towards an arbitrary target to make sure mutation methods work
+    #[fuzz_list::fuzz]
     #[test]
     fn arbitrary_mutation() {
         bolero::check!()

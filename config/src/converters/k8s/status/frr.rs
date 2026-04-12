@@ -16,12 +16,13 @@ impl TryFrom<&FrrStatus> for GatewayAgentStatusStateFrr {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use super::*;
 
     use crate::internal::status::contract::LegalValue;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_frr_status_conversion() {
         bolero::check!()

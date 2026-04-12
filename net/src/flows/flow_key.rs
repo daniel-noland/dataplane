@@ -865,7 +865,7 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod tests {
     use super::*;
     use crate::buffer::TestBuffer;
@@ -1123,6 +1123,7 @@ mod tests {
         }
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_flow_key_data_from_packet() {
         bolero::check!()

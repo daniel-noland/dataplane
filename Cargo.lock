@@ -1366,6 +1366,7 @@ dependencies = [
  "caps",
  "chrono",
  "dataplane-common",
+ "dataplane-fuzz-list",
  "dataplane-hardware",
  "dataplane-k8s-intf",
  "dataplane-lpm",
@@ -1454,17 +1455,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "dataplane-fuzz-list"
+version = "0.18.0"
+dependencies = [
+ "clap",
+ "colored",
+ "dataplane-fuzz-list-macros",
+ "linkme",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "dataplane-fuzz-list-macros"
+version = "0.18.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "dataplane-hardware"
 version = "0.18.0"
 dependencies = [
  "bolero",
  "bytecheck",
  "dataplane-dpdk-sysroot-helper",
+ "dataplane-fuzz-list",
  "dataplane-id",
  "dataplane-sysfs",
  "dataplane-test-utils",
  "fixin",
  "hwlocality",
+ "linkme",
  "n-vm",
  "num-derive",
  "num-traits",
@@ -1484,6 +1509,8 @@ name = "dataplane-id"
 version = "0.18.0"
 dependencies = [
  "bolero",
+ "dataplane-fuzz-list",
+ "linkme",
  "rkyv",
  "serde",
  "uuid",
@@ -1511,11 +1538,13 @@ name = "dataplane-interface-manager"
 version = "0.18.0"
 dependencies = [
  "bolero",
+ "dataplane-fuzz-list",
  "dataplane-net",
  "dataplane-rekon",
  "derive_builder",
  "futures",
  "libc 1.0.0-alpha.3",
+ "linkme",
  "multi_index_map",
  "nix 0.31.2",
  "rtnetlink",
@@ -1579,7 +1608,9 @@ version = "0.18.0"
 dependencies = [
  "bnum",
  "bolero",
+ "dataplane-fuzz-list",
  "ipnet",
+ "linkme",
  "num-traits",
  "prefix-trie",
  "serde",
@@ -1645,6 +1676,7 @@ dependencies = [
  "dataplane-config",
  "dataplane-flow-entry",
  "dataplane-flow-filter",
+ "dataplane-fuzz-list",
  "dataplane-lpm",
  "dataplane-net",
  "dataplane-pipeline",
@@ -1675,14 +1707,17 @@ dependencies = [
  "bolero",
  "bytecheck",
  "dataplane-concurrency",
+ "dataplane-fuzz-list",
  "dataplane-id",
  "derive_builder",
  "downcast-rs 2.0.2",
  "etherparse",
+ "linkme",
  "multi_index_map",
  "rapidhash",
  "rkyv",
  "serde",
+ "serde_json",
  "static_assertions",
  "strum 0.28.0",
  "strum_macros 0.28.0",
@@ -1759,6 +1794,7 @@ dependencies = [
  "arrayvec",
  "bolero",
  "dataplane-concurrency",
+ "dataplane-fuzz-list",
  "dataplane-net",
  "dataplane-pipeline",
  "dataplane-tracectl",

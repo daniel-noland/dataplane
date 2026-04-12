@@ -1109,7 +1109,7 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use crate::icmp4::{Icmp4, Icmp4Type};
     use crate::parse::{DeParse, IntoNonZeroUSize, Parse};
@@ -1151,6 +1151,7 @@ mod test {
         assert_eq!(input.size(), bytes_read);
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_back() {
         bolero::check!()
@@ -1162,6 +1163,7 @@ mod test {
     ///
     /// Uses a 20-byte buffer because etherparse requires timestamp
     /// messages to be exactly 20 bytes (`Icmpv4Header::MAX_LEN`).
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_arbitrary_bytes() {
         bolero::check!()

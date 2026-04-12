@@ -346,7 +346,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod bolero_tests {
     use super::*;
     use crate::NatPort;
@@ -377,6 +377,7 @@ mod bolero_tests {
             .and_then(|ip| ip.set_checksum(Ipv4Checksum::new(0xffff)));
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_checksum_validation() {
         let generator = IcmpErrorMsg {};
@@ -446,6 +447,7 @@ mod bolero_tests {
         }
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_translation() {
         bolero::check!()

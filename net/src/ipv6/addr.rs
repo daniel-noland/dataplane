@@ -110,10 +110,11 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use crate::ipv6::addr::UnicastIpv6Addr;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn generated_unicast_ipv6_address_is_unicast() {
         bolero::check!()

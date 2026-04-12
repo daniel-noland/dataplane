@@ -68,7 +68,7 @@ fn collapse_prefix_lists(prefixes: &PrefixPortsSet, excludes: &PrefixPortsSet) -
     result
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod tests {
     use super::*;
     use crate::external::overlay::vpcpeering::{VpcExpose, VpcManifest};
@@ -557,6 +557,7 @@ mod tests {
         excludes.lookup(*addr).is_none() && prefixes.lookup(*addr).is_some()
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_bolero_collapse_prefix_lists() {
         let generator = PrefixExcludeAddrsGenerator {

@@ -88,11 +88,12 @@ impl TryFrom<&InterfaceConfig> for GatewayAgentGatewayInterfaces {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use super::*;
     use k8s_intf::bolero::{LegalValue, Normalize};
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_interface_conversion() {
         bolero::check!()

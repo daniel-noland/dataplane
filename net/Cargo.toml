@@ -10,7 +10,7 @@ default = []
 serde = ["id/serde"]
 netdevsim = []
 
-bolero = ["dep:bolero", "id/bolero"]
+bolero = ["dep:bolero", "id/bolero", "test_buffer", "dep:fuzz-list", "dep:linkme", "dep:ahash"]
 test_buffer = []
 builder = []
 
@@ -18,6 +18,7 @@ builder = []
 atomic-instant-full = { workspace = true }
 
 [dependencies]
+ahash = { workspace = true, features = ["no-rng"], optional = true }
 arrayvec = { workspace = true, features = ["serde", "std"] }
 bitflags = { workspace = true }
 bolero = { workspace = true, features = ["std"], optional = true }
@@ -26,7 +27,9 @@ concurrency = { workspace = true }
 derive_builder = { workspace = true, features = ["alloc"] }
 downcast-rs = { workspace = true, features = ["sync"] }
 etherparse = { workspace = true, features = ["std"] }
+fuzz-list = { workspace = true, optional = true }
 id = { workspace = true }
+linkme = { workspace = true, optional = true }
 multi_index_map = { workspace = true, default-features = false, features = ["serde"] }
 rapidhash = { workspace = true }
 rkyv = { workspace = true, features = ["alloc", "bytecheck"]}
@@ -41,3 +44,13 @@ tracing = { workspace = true }
 [dev-dependencies]
 ahash = { workspace = true, features = ["no-rng"] }
 bolero = { workspace = true, features = ["std"] }
+serde = { workspace = true }
+serde_json = { workspace = true, default-features = true }
+fuzz-list = { workspace = true }
+linkme = { workspace = true }
+
+[[test]]
+name = "fuzz"
+path = "tests/fuzz/main.rs"
+harness = false
+required-features = ["bolero"]

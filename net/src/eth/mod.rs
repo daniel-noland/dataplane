@@ -254,12 +254,13 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     const HEADER_LEN_USIZE: usize = Eth::HEADER_LEN.get() as usize;
     use crate::eth::{DestinationMacAddressError, Eth, EthError, SourceMacAddressError};
     use crate::parse::{DeParse, IntoNonZeroUSize, Parse, ParseError};
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_back() {
         bolero::check!().with_type().for_each(|eth: &Eth| {
@@ -311,6 +312,7 @@ mod test {
         }
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_arbitrary_bytes() {
         bolero::check!()
@@ -318,6 +320,7 @@ mod test {
             .for_each(parse_buffer_of_fixed_length::<{ HEADER_LEN_USIZE }>);
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_prop_test_buffer_too_short() {
         bolero::check!()
@@ -325,6 +328,7 @@ mod test {
             .for_each(parse_buffer_of_fixed_length::<{ HEADER_LEN_USIZE - 1 }>);
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_prop_test_excess_buffer() {
         bolero::check!()

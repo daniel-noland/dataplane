@@ -209,7 +209,7 @@ pub enum ChecksumError<T: Checksum + ?Sized> {
     NotPresent,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod tests {
     use crate::checksum::Checksum;
     use crate::ipv4::Ipv4;
@@ -250,6 +250,7 @@ mod tests {
             .expect("expected valid checksum after destination address change");
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_increment_update_checksum() {
         bolero::check!()

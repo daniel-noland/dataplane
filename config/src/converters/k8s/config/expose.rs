@@ -256,7 +256,7 @@ fn set_port_ranges(
 pub(crate) struct VpcExposes(Vec<VpcExpose>);
 
 impl VpcExposes {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bolero"))]
     fn get_single(self) -> Result<VpcExpose, FromK8sConversionError> {
         if self.0.len() != 1 {
             return Err(FromK8sConversionError::NotAllowed(
@@ -330,7 +330,7 @@ impl TryFrom<(&SubnetMap, &GatewayAgentPeeringsPeeringExpose)> for VpcExposes {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use super::*;
     use crate::external::overlay::vpcpeering::VpcExposeNatConfig;
@@ -496,6 +496,7 @@ mod test {
         assert!(parse_port_ranges("80,,443").is_err());
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_vpc_conversion() {

@@ -5,6 +5,7 @@
   sanitizers,
   platform,
   profile,
+  instrumentation,
   ...
 }:
 final: prev:
@@ -165,6 +166,7 @@ in
         # We disable that warning here to make sure rdma-core can build (more specifically, to make sure that it can
         # build with debug symbols).
         CFLAGS = "-Wno-unused-command-line-argument";
+        LDFLAGS = "-Wl,--unresolved-symbols=ignore-all";
         cmakeFlags =
           orig.cmakeFlags
           ++ [
@@ -191,6 +193,7 @@ in
                 (builtins.elem "thread" sanitizers)
                 || (builtins.elem "address" sanitizers)
                 || (builtins.elem "safe-stack" sanitizers)
+                || (instrumentation == "fuzz")
               )
               [
                 # This allows address / thread sanitizer to build (some sanitizers do not like -Wl,-z,defs or

@@ -14,6 +14,8 @@ members = [
     "errno",
     "flow-entry",
     "flow-filter",
+    "fuzz-list",
+    "fuzz-list-macros",
     "hardware",
     "id",
     "init",
@@ -61,6 +63,8 @@ dplane-rpc = { git = "https://github.com/githedgehog/dplane-rpc.git", rev = "e8f
 errno = { path = "./errno", package = "dataplane-errno", features = [] }
 flow-entry = { path = "./flow-entry", package = "dataplane-flow-entry", features = [] }
 flow-filter = { path = "./flow-filter", package = "dataplane-flow-filter", features = [] }
+fuzz-list = { path = "./fuzz-list", package = "dataplane-fuzz-list", features = [] }
+fuzz-list-macros = { path = "./fuzz-list-macros", package = "dataplane-fuzz-list-macros", features = [] }
 hardware = { path = "./hardware", package = "dataplane-hardware", features = [] }
 id = { path = "./id", package = "dataplane-id", features = [] }
 init = { path = "./init", package = "dataplane-init", features = [] }

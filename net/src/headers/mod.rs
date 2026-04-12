@@ -1305,7 +1305,7 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // fine to unwrap in tests
 mod test {
     use std::net::Ipv4Addr;
@@ -1344,11 +1344,13 @@ mod test {
         assert_eq!(bytes_parsed, headers.size());
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_back() {
         bolero::check!().with_type().for_each(parse_back_test);
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_back_common() {
         bolero::check!()

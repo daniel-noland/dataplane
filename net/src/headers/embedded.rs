@@ -1404,7 +1404,7 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod tests_fuzzing {
     use super::contract::CommonEmbeddedHeaders;
     use super::*;
@@ -1433,6 +1433,7 @@ mod tests_fuzzing {
         assert_eq!(bytes_parsed, headers.size());
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_back_common() {
         bolero::check!()

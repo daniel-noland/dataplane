@@ -422,10 +422,11 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 pub mod test {
     use super::*;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn interface_name_validates() {
         bolero::check!()
@@ -436,6 +437,7 @@ pub mod test {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn interface_name_with_illegal_char_rejects() {
         bolero::check!().with_type().for_each(|x: &InterfaceName| {
@@ -450,6 +452,7 @@ pub mod test {
         });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn interface_name_with_null_char_rejects() {
         bolero::check!().with_type().for_each(|x: &InterfaceName| {
@@ -472,6 +475,7 @@ pub mod test {
         }
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn too_long_interface_name_rejected() {
         bolero::check!().with_type().for_each(|x: &InterfaceName| {

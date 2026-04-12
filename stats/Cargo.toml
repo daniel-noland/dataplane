@@ -7,7 +7,7 @@ version.workspace = true
 
 [features]
 default = []
-bolero = ["dep:bolero", "vpcmap/bolero", "net/bolero"]
+bolero = ["dep:bolero", "dep:fuzz-list", "vpcmap/bolero", "net/bolero"]
 
 [dependencies]
 # internal
@@ -21,6 +21,7 @@ vpcmap = { workspace = true }
 arrayvec = { workspace = true }
 bolero = { workspace = true, optional = true }
 derive_builder = { workspace = true }
+fuzz-list = { workspace = true, optional = true }
 hashbrown = { workspace = true, features = ["default-hasher", "inline-more"] }
 kanal = { workspace = true, features = ["async"] }
 linkme = { workspace = true }
@@ -35,5 +36,12 @@ tracing = { workspace = true, features = ["attributes"] }
 
 [dev-dependencies]
 bolero = { workspace = true }
+fuzz-list = { workspace = true }
 net = { workspace = true, features = ["bolero"] }
 vpcmap = { workspace = true, features = ["bolero"] }
+
+[[test]]
+name = "fuzz"
+path = "tests/fuzz/main.rs"
+harness = false
+required-features = ["bolero"]

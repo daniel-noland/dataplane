@@ -87,12 +87,13 @@ impl TryFrom<&GatewayAgentSpec> for Overlay {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use super::*;
 
     use k8s_intf::bolero::LegalValue;
 
+    #[fuzz_list::fuzz]
     #[test]
     // Neither I (manish) nor AI can figure out the correct syntax to replace the closure with BTreeMap<String, GatewayAgentPeerings>::len and BTreeMap<String, GatewayAgentVpcs>::len>
     #[allow(clippy::redundant_closure_for_method_calls)]

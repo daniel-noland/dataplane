@@ -34,12 +34,13 @@ impl TryFrom<(&str, &GatewayAgentVpcs)> for Vpc {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use super::*;
 
     use k8s_intf::bolero::LegalValue;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_vpc_conversion() {
         bolero::check!()

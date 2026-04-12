@@ -1184,7 +1184,7 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use crate::icmp6::{Icmp6, Icmp6Type};
     use crate::parse::{DeParse, Parse};
@@ -1218,6 +1218,7 @@ mod test {
         assert_eq!(header.size(), bytes_read);
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_back() {
         bolero::check!()
@@ -1225,6 +1226,7 @@ mod test {
             .for_each(parse_back_test_helper);
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_arbitrary_bytes() {
         bolero::check!()

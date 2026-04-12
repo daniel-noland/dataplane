@@ -435,7 +435,7 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 mod tests {
     use super::*;
     use num_traits::Bounded;
@@ -559,6 +559,7 @@ mod tests {
         assert_eq!(root_prefix, P::ROOT);
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn ipv4_prefix_contract() {
         bolero::check!()
@@ -566,6 +567,7 @@ mod tests {
             .for_each(prefix_contract);
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn ipv6_prefix_contract() {
         bolero::check!()

@@ -7,15 +7,18 @@ version.workspace = true
 
 [features]
 shuttle = ["concurrency/shuttle", "dep:shuttle"]
+bolero = ["dep:bolero", "dep:fuzz-list", "net/bolero"]
 
 [dependencies]
 ahash = { workspace = true }
 arc-swap = { workspace = true }
 bnum = { workspace = true }
+bolero = { workspace = true, optional = true }
 common = { workspace = true }
 concurrency = { workspace = true, features = [] }
 config = { workspace = true }
 flow-entry = { workspace = true }
+fuzz-list = { workspace = true, optional = true }
 indenter = { workspace = true }
 left-right = { workspace = true }
 linkme = { workspace = true }
@@ -33,6 +36,7 @@ tracing = { workspace = true }
 # internal
 fixin = { workspace = true }
 flow-filter = { workspace = true }
+fuzz-list = { workspace = true }
 test-utils = { workspace = true }
 lpm = { workspace = true, features = ["testing"] }
 net = { workspace = true, features = ["bolero"] }
@@ -44,3 +48,9 @@ bolero = { workspace = true, default-features = false, features = ["alloc"] }
 etherparse = { workspace = true }
 shuttle = { workspace = true, features = [] }
 tracing-test = { workspace = true, features = [] }
+
+[[test]]
+name = "fuzz"
+path = "tests/fuzz/main.rs"
+harness = false
+required-features = ["bolero"]

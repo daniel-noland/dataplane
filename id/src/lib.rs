@@ -303,11 +303,12 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use crate::{Id, UuidIdGenerator};
     use uuid::Uuid;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn new_generates_unique() {
         bolero::check!()
@@ -318,6 +319,7 @@ mod test {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_v5() {
         bolero::check!()
@@ -330,6 +332,7 @@ mod test {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_static() {
         bolero::check!().with_type().for_each(|x: &String| {

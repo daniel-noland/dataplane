@@ -9,7 +9,7 @@ version.workspace = true
 [features]
 default = []
 # Enables property testing / fuzzing support for testing.
-bolero = ["dep:bolero"]
+bolero = ["dep:bolero", "dep:fuzz-list", "dep:linkme"]
 # Enables hardware topology scanning using the `hwlocality` crate.
 scan = ["dep:hwlocality", "dep:pci-ids"]
 # Adds serialization support for all types using serde.
@@ -31,6 +31,8 @@ serde = { workspace = true, optional = true, features = ["std"] }
 strum = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true, features = ["std"] }
 tracing = { workspace = true, features = ["std"] }
+fuzz-list = { workspace = true, optional = true }
+linkme = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 sysfs = { workspace = true }
@@ -43,13 +45,21 @@ n-vm = { workspace = true }
 test-utils = { workspace = true, features = [] }
 
 # external
-bolero = { workspace = true, features = ["alloc"] }
+bolero = { workspace = true, default-features = true, features = ["alloc"] }
 hwlocality = { workspace = true, features = ["hwloc-latest"] }
 pci-ids = { workspace = true, features = [] }
 serde = { workspace = true, features = ["std"] }
 serde_yaml_ng = { workspace = true, features = [] }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+fuzz-list = { workspace = true }
+
+[[test]]
+name = "fuzz"
+path = "tests/fuzz/main.rs"
+harness = false
+required-features = ["bolero"]
 
 [build-dependencies]
 dpdk-sysroot-helper = { workspace = true }

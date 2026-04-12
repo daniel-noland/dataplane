@@ -146,11 +146,12 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod tests {
     use super::HopByHop;
     use crate::parse::{DeParse, IntoNonZeroUSize, Parse};
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_back() {
         bolero::check!().with_type().for_each(|header: &HopByHop| {

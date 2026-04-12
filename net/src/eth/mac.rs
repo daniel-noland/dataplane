@@ -465,7 +465,7 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use super::Mac;
     use crate::eth::mac::contract::MacTestStringGenerator;
@@ -493,6 +493,7 @@ mod test {
         }
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_mac_from_valid_string() {
         bolero::check!()
@@ -506,6 +507,7 @@ mod test {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_mac_from_invalid_string() {
         bolero::check!()

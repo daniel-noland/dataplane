@@ -120,12 +120,13 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use std::net::Ipv4Addr;
 
     use crate::ipv4::addr::UnicastIpv4Addr;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn generated_unicast_ipv4_address_is_unicast() {
         bolero::check!()
