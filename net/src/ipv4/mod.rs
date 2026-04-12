@@ -17,7 +17,7 @@ use crate::parse::{
 };
 use crate::tcp::{Tcp, TruncatedTcp};
 use crate::udp::{TruncatedUdp, Udp};
-use etherparse::{IpDscp, IpEcn, IpFragOffset, IpNumber, Ipv4Header};
+use etherparse::{IpNumber, Ipv4Header};
 use std::net::Ipv4Addr;
 use std::num::NonZero;
 use tracing::trace;
@@ -26,8 +26,10 @@ pub mod addr;
 
 mod checksum;
 pub mod frag_offset;
+mod options;
 
 pub use checksum::*;
+pub use options::*;
 
 #[cfg(any(test, feature = "bolero"))]
 pub use contract::*;
@@ -75,18 +77,16 @@ impl Ipv4 {
         Ipv4Addr::from(self.0.destination)
     }
 
-    // TODO: proper wrapper type
-    /// Get the options for this header (as a byte slice)
+    /// Get the options for this header.
     #[must_use]
-    pub fn options(&self) -> &[u8] {
-        self.0.options.as_slice()
+    pub fn options(&self) -> Ipv4Options {
+        Ipv4Options(self.0.options.clone())
     }
 
-    // TODO: proper wrapper type for [`IpNumber`] (low priority)
     /// Get the next layer protocol which follows this header.
     #[must_use]
-    pub fn protocol(&self) -> IpNumber {
-        self.0.protocol
+    pub fn protocol(&self) -> NextHeader {
+        self.0.protocol.into()
     }
 
     /// The IP protocol / next-header field as a [`NextHeader`].
@@ -117,22 +117,20 @@ impl Ipv4 {
         self.0.time_to_live
     }
 
-    // TODO: proper wrapper type (low priority)
     /// Get the header's [differentiated services code point].
     ///
     /// [differentiated services code point]: https://en.wikipedia.org/wiki/Differentiated_services
     #[must_use]
-    pub fn dscp(&self) -> IpDscp {
-        self.0.dscp
+    pub fn dscp(&self) -> Dscp {
+        Dscp(self.0.dscp)
     }
 
-    // TODO: proper wrapper type (low priority)
     /// Get the header's [explicit congestion notification]
     ///
     /// [explicit congestion notification]: https://en.wikipedia.org/wiki/Explicit_Congestion_Notification
     #[must_use]
-    pub fn ecn(&self) -> IpEcn {
-        self.0.ecn
+    pub fn ecn(&self) -> Ecn {
+        Ecn(self.0.ecn)
     }
 
     /// Returns true if the "don't fragment" bit is set in this header.
@@ -147,12 +145,11 @@ impl Ipv4 {
         self.0.more_fragments
     }
 
-    // TODO: proper wrapper type (low priority)
     /// In case this message contains parts of a fragmented packet, the fragment offset is the
     /// offset of payload the current message relative to the original payload of the message.
     #[must_use]
-    pub fn fragment_offset(&self) -> IpFragOffset {
-        self.0.fragment_offset
+    pub fn fragment_offset(&self) -> FragOffset {
+        FragOffset(self.0.fragment_offset)
     }
 
     /// Return the headers "identification".
@@ -487,6 +484,8 @@ mod contract {
 
         /// Generates an arbitrary [`Ipv4`] header with the [`NextHeader`] specified in `self`.
         fn generate<D: Driver>(&self, u: &mut D) -> Option<Self::Output> {
+            use crate::ipv4::Ipv4Options;
+
             let mut header = Ipv4(Ipv4Header::default());
             header.set_source(u.produce()?);
             header.set_destination(Ipv4Addr::from(u.produce::<u32>()?));
@@ -499,6 +498,10 @@ mod contract {
                 .set_more_fragments(u.produce()?)
                 .set_identification(u.produce()?)
                 .set_fragment_offset(u.produce()?);
+
+            let options: Ipv4Options = u.produce()?;
+            header.0.options = options.0;
+
             header
                 .set_payload_len(u16::gen_bounded(
                     u,
@@ -512,15 +515,6 @@ mod contract {
 
     impl TypeGenerator for Ipv4 {
         /// Generates an arbitrary [`Ipv4`] header.
-        ///
-        /// # Note
-        ///
-        /// Ideally, the generated header would cover the space of all possible [`Ipv4`] headers.
-        /// That is, if you called `generate` a (very) large number of times, you would eventually
-        /// reach the set of all [`Ipv4`] (as should be true with any implementation of
-        /// [`TypeGenerator`]).
-        ///
-        /// Unfortunately, the current implementation does not cover [`Ipv4::options`].
         fn generate<D: Driver>(u: &mut D) -> Option<Self> {
             GenWithNextHeader(u.produce()?).generate(u)
         }
@@ -540,11 +534,10 @@ mod test {
     #[test]
     fn parse_back() {
         bolero::check!().with_type().for_each(|header: &Ipv4| {
-            let mut buffer = [0u8; MIN_LEN_USIZE];
+            let mut buffer = [0u8; MAX_LEN_USIZE];
             let bytes_written = header
                 .deparse(&mut buffer)
                 .unwrap_or_else(|e| unreachable!("{e:?}"));
-            assert_eq!(bytes_written, Ipv4::MIN_LEN);
             let (parse_back, bytes_read) = Ipv4::parse(&buffer[..(bytes_written.get() as usize)])
                 .unwrap_or_else(|e| unreachable!("{e:?}"));
             assert_eq!(header.source(), parse_back.source());
@@ -552,6 +545,7 @@ mod test {
             assert_eq!(header.protocol(), parse_back.protocol());
             assert_eq!(header.ecn(), parse_back.ecn());
             assert_eq!(header.dscp(), parse_back.dscp());
+            assert_eq!(header.options(), parse_back.options());
             assert_eq!(header, &parse_back);
             assert_eq!(bytes_written, bytes_read);
         });
