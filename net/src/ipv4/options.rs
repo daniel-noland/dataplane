@@ -66,3 +66,32 @@ mod contract {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn empty_options() {
+        let opts = Ipv4Options(etherparse::Ipv4Options::new());
+        assert!(opts.is_empty());
+        assert_eq!(opts.len(), 0);
+        assert_eq!(opts.as_bytes(), None);
+    }
+
+    #[test]
+    fn options_len_consistency() {
+        bolero::check!().with_type().for_each(|opts: &Ipv4Options| {
+            if opts.is_empty() {
+                assert_eq!(opts.len(), 0);
+                assert_eq!(opts.as_bytes(), None);
+            } else {
+                assert!(!opts.is_empty());
+                assert!(opts.len() <= Ipv4Options::MAX_LEN);
+                assert_eq!(opts.len() % 4, 0);
+                let bytes = opts.as_bytes().unwrap_or_else(|| unreachable!());
+                assert_eq!(bytes.len(), opts.len());
+            }
+        });
+    }
+}
