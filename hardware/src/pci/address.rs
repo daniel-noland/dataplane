@@ -502,7 +502,7 @@ mod scan {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use crate::pci::address::{PciAddress, PciEbdfError, PciEbdfString};
 
@@ -537,6 +537,7 @@ mod test {
         let _ = PciEbdfString::try_new(s).unwrap_err();
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_arbitrary_string() {
         bolero::check!().with_type().for_each(|x: &String| {
@@ -552,6 +553,7 @@ mod test {
         });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_valid() {
         bolero::check!()
@@ -571,6 +573,7 @@ mod test {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_back() {
         bolero::check!().with_type().for_each(|x: &PciAddress| {
@@ -579,6 +582,7 @@ mod test {
         });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_valid_ebdf() {
         bolero::check!().with_type().for_each(|x: &PciEbdfString| {

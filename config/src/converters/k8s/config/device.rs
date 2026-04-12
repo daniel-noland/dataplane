@@ -19,13 +19,14 @@ impl TryFrom<&GatewayAgentGateway> for DeviceConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use super::*;
 
     use k8s_intf::bolero::LegalValue;
     use k8s_intf::gateway_agent_crd::GatewayAgent;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_simple_hostname() {
         bolero::check!()

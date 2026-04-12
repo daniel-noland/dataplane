@@ -158,7 +158,7 @@ impl TryFrom<&GatewayAgentGateway> for Underlay {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use super::*;
 
@@ -171,6 +171,7 @@ mod test {
         GatewayAgentGatewayInterfaces, GatewayAgentGatewayNeighbors,
     };
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_underlay_conversion() {
         bolero::check!()

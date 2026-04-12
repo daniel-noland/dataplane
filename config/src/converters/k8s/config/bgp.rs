@@ -89,12 +89,13 @@ impl TryFrom<&BgpNeighbor> for GatewayAgentGatewayNeighbors {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod tests {
     use super::*;
 
     use k8s_intf::bolero::{LegalValue, Normalize};
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_neighbor_conversion() {
         bolero::check!()

@@ -5,7 +5,13 @@ license.workspace = true
 publish.workspace = true
 version.workspace = true
 
+[features]
+default = []
+bolero = ["dep:bolero", "dep:fuzz-list"]
+
 [dependencies]
+bolero = { workspace = true, optional = true }
+fuzz-list = { workspace = true, optional = true }
 # internal
 common = { workspace = true }
 hardware = { workspace = true }
@@ -29,6 +35,7 @@ tracectl = { workspace = true }
 
 [dev-dependencies]
 # internal
+fuzz-list = { workspace = true }
 pipeline = { workspace = true } # should be removed w/ NAT
 lpm = { workspace = true, features = ["testing"] }
 hardware = { workspace = true, features = ["bolero"] }
@@ -39,3 +46,9 @@ bolero = { workspace = true, features = ["alloc"] }
 caps = { workspace = true }
 ipnet = { workspace = true }
 pretty_assertions = { workspace = true, features = ["std"] }
+
+[[test]]
+name = "fuzz"
+path = "tests/fuzz/main.rs"
+harness = false
+required-features = ["bolero"]

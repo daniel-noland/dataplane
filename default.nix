@@ -46,6 +46,7 @@ let
     inherit
       sources
       sanitizers
+      instrumentation
       ;
     profile = profile';
     platform = platform';

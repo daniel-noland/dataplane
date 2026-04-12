@@ -105,7 +105,7 @@ impl TryFrom<&DataplaneStatusForK8sConversion<'_>> for GatewayAgentStatus {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod tests {
     use super::*;
 
@@ -151,6 +151,7 @@ mod tests {
         }
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_dataplane_status_conversion() {
         bolero::check!()

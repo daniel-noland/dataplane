@@ -20,6 +20,20 @@ libc := if platform == "wasm32-wasip1" { "unknown" } else { "gnu" }
 # kernel (linux or wasip1)
 kernel := if platform == "wasm32-wasip1" { "wasip1" } else { "linux" }
 
+# timeout for tests (currently only supports fuzz tests)
+timeout := "200s"
+
+# fuzz max input length
+[private]
+fuzz_max_len := "32768"
+
+# fuzz RSS limit (MB)
+[private]
+fuzz_rss_limit := "1000000"
+
+# packge to build / test (currently only supports fuzz tests)
+package := ""
+
 # List out the available commands
 [private]
 [default]
@@ -345,3 +359,83 @@ bump_version version:
 [script]
 shell:
    nix-shell
+
+# Run a bolero fuzz test under the feedback-driven fuzzer.
+# Example: just package=dataplane-nat filter=icmp_handler::icmp_error_msg::bolero_tests::test_translation fuzz
+[script]
+fuzz:
+    {{ _just_debuggable_ }}
+    if [ -z "{{ package }}" ]; then
+        >&2 echo "error: package is required"
+        >&2 echo "example: just package=dataplane-nat filter=icmp4::test::parse_back fuzz"
+        exit 1
+    fi
+    if [ -z "{{ filter }}" ]; then
+        >&2 echo "error: filter is required"
+        >&2 echo "example: just package=dataplane-nat filter=icmp4::test::parse_back fuzz"
+        exit 1
+    fi
+    declare -r desc="{{ filter }}"
+    if [ -z "{{ sanitize }}" ]; then
+        declare -r sanitize="NONE"
+    else
+        declare -r sanitize="{{sanitize}}"
+    fi
+    echo "fuzzing {{ package }}::{{ filter }} (sanitizer=${sanitize}, timeout={{ timeout }})"
+    cargo bolero test \
+        '{{ filter }}' \
+        --rustc-bootstrap \
+        --profile='{{ if profile == "debug" { "dev" } else { profile } }}' \
+        --package='{{ package }}' \
+        {{ if default_features == "true" { "" } else { "--no-default-features" } }} \
+        --sanitizer="${sanitize}" \
+        --features='{{features}}' \
+        -T '{{ timeout }}' \
+        --build-std \
+        --jobs '{{ jobs }}' \
+        --corpus-dir ./fuzz/corpus \
+        --crashes-dir ./fuzz/crashes \
+        --engine-args='-rss_limit_mb={{ fuzz_rss_limit }} -max_len={{ fuzz_max_len }}'
+
+# Collect -p flags for all packages that have a [[test]] name="fuzz" target.
+[private]
+[script]
+fuzz-packages:
+    for dir in $(tomlq -r '.workspace.members[]' Cargo.toml); do
+        if [ ! -f "$dir/Cargo.toml" ]; then
+            continue
+        fi
+        has_fuzz=$(tomlq -r '(.test // [])[] | select(.name == "fuzz") | select(.harness == false) | .name' "$dir/Cargo.toml" 2>/dev/null || true)
+        if [ -z "$has_fuzz" ]; then
+            continue
+        fi
+        tomlq -r '.package.name' "$dir/Cargo.toml"
+    done
+
+# List all fuzz tests across the workspace.
+[script]
+fuzz-list:
+    {{ _just_debuggable_ }}
+    pkg_flags=""
+    for pkg in $(just fuzz-packages); do
+        pkg_flags="$pkg_flags -p $pkg"
+    done
+    if [ -z "$pkg_flags" ]; then
+        >&2 echo "no packages with fuzz test targets found"
+        exit 1
+    fi
+    cargo test $pkg_flags --test fuzz --features bolero -- list {{ filter }}
+
+# Build instrumented fuzz binaries across the workspace.
+[script]
+fuzz-build:
+    {{ _just_debuggable_ }}
+    pkg_flags=""
+    for pkg in $(just fuzz-packages); do
+        pkg_flags="$pkg_flags -p $pkg"
+    done
+    if [ -z "$pkg_flags" ]; then
+        >&2 echo "no packages with fuzz test targets found"
+        exit 1
+    fi
+    cargo test $pkg_flags --test fuzz --features bolero -- build {{ filter }}

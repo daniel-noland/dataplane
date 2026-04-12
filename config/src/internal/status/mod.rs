@@ -7,11 +7,11 @@
 
 use std::collections::HashMap;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 use bolero::TypeGenerator;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[cfg_attr(test, derive(TypeGenerator))]
+#[cfg_attr(any(test, feature = "bolero"), derive(TypeGenerator))]
 pub enum InterfaceOperStatusType {
     #[default]
     Unknown,
@@ -21,7 +21,7 @@ pub enum InterfaceOperStatusType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[cfg_attr(test, derive(TypeGenerator))]
+#[cfg_attr(any(test, feature = "bolero"), derive(TypeGenerator))]
 pub enum InterfaceAdminStatusType {
     #[default]
     Unknown,
@@ -30,7 +30,7 @@ pub enum InterfaceAdminStatusType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[cfg_attr(test, derive(TypeGenerator))]
+#[cfg_attr(any(test, feature = "bolero"), derive(TypeGenerator))]
 pub enum ZebraStatusType {
     #[default]
     NotConnected,
@@ -38,7 +38,7 @@ pub enum ZebraStatusType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[cfg_attr(test, derive(TypeGenerator))]
+#[cfg_attr(any(test, feature = "bolero"), derive(TypeGenerator))]
 pub enum FrrAgentStatusType {
     #[default]
     NotConnected,
@@ -46,7 +46,7 @@ pub enum FrrAgentStatusType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[cfg_attr(test, derive(TypeGenerator))]
+#[cfg_attr(any(test, feature = "bolero"), derive(TypeGenerator))]
 pub enum DataplaneStatusType {
     #[default]
     Unknown,
@@ -56,7 +56,7 @@ pub enum DataplaneStatusType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[cfg_attr(test, derive(TypeGenerator))]
+#[cfg_attr(any(test, feature = "bolero"), derive(TypeGenerator))]
 pub enum BgpNeighborSessionState {
     #[default]
     Unset,
@@ -383,7 +383,7 @@ impl DataplaneStatus {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 pub(crate) mod contract {
     use super::*;
 

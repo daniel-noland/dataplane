@@ -81,12 +81,13 @@ mod contracts {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod tests {
     use crate::interface::bridge::BridgePropertiesSpec;
     use net::interface::BridgeProperties;
     use rekon::AsRequirement;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn as_requirement_obeys_contract() {
         bolero::check!()
@@ -98,6 +99,7 @@ mod tests {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn equality_meaning() {
         bolero::check!().with_type().for_each(

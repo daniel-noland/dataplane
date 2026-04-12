@@ -168,12 +168,13 @@ mod helper {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bolero"))]
     mod test {
         use crate::interface::tap::helper::InterfaceRequestInner;
         use net::interface::InterfaceName;
         use std::ffi::CStr;
 
+        #[fuzz_list::fuzz]
         #[test]
         fn interface_request_new_contract() {
             bolero::check!()
@@ -202,6 +203,7 @@ mod helper {
                 });
         }
 
+        #[fuzz_list::fuzz]
         #[test]
         fn interface_request_contract() {
             bolero::check!()

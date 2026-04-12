@@ -40,7 +40,7 @@ impl TryFrom<&GatewayAgentGatewayLogs> for TracingConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use super::*;
 
@@ -58,6 +58,7 @@ mod test {
         }
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_tracing_config_conversion() {
         bolero::check!()

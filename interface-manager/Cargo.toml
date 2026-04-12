@@ -8,7 +8,7 @@ version.workspace = true
 [features]
 default = []
 netdevsim = ["net/netdevsim"]
-bolero = ["dep:bolero", "netdevsim", "net/test_buffer", "net/serde", "net/bolero"]
+bolero = ["dep:bolero", "dep:fuzz-list", "dep:linkme", "netdevsim", "net/test_buffer", "net/serde", "net/bolero"]
 
 [dependencies]
 # internal
@@ -18,8 +18,10 @@ rekon = { workspace = true }
 # external
 bolero = { workspace = true, optional = true, default-features = false, features = ["alloc"] }
 derive_builder = { workspace = true, default-features = false, features = ["default"] }
+fuzz-list = { workspace = true, optional = true }
 futures = { workspace = true, features = ["default"] }
 libc = { workspace = true, features = [] }
+linkme = { workspace = true, optional = true }
 multi_index_map = { workspace = true, features = ["serde"] }
 nix = { workspace = true, default-features = false, features = ["ioctl"] }
 rtnetlink = { workspace = true, features = ["default", "tokio"] }
@@ -31,7 +33,14 @@ tracing = { workspace = true, features = ["attributes"] }
 
 [dev-dependencies]
 # internal
+fuzz-list = { workspace = true }
 net = { workspace = true, features = ["bolero", "test_buffer", "serde", "netdevsim"] }
 
 # external
 bolero = { workspace = true, default-features = false, features = ["alloc"] }
+
+[[test]]
+name = "fuzz"
+path = "tests/fuzz/main.rs"
+harness = false
+required-features = ["bolero"]

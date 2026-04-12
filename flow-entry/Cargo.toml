@@ -9,7 +9,7 @@ version.workspace = true
 shuttle = ["concurrency/shuttle"]
 std = []
 testing = []
-bolero = ["dep:bolero", "net/bolero"]
+bolero = ["dep:bolero", "dep:fuzz-list", "net/bolero", "dep:tracing-test"]
 
 [dependencies]
 ahash = { workspace = true, features = ["no-rng"] }
@@ -25,10 +25,20 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tracectl = { workspace = true }
 tracing = { workspace = true }
+fuzz-list = { workspace = true, optional = true }
+tracing-test = { workspace = true, optional = true }
 
 [dev-dependencies]
+fuzz-list = { workspace = true }
+
 bolero = { workspace = true, default-features = false }
 net = { workspace = true, features = ["bolero"] }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tracing-test = { workspace = true, features = [] }
 shuttle = { workspace = true }
+
+[[test]]
+name = "fuzz"
+path = "tests/fuzz/main.rs"
+harness = false
+required-features = ["bolero"]

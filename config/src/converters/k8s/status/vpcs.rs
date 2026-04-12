@@ -18,12 +18,13 @@ impl TryFrom<&VpcCounters> for GatewayAgentStatusStateVpcs {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use super::*;
 
     use crate::internal::status::contract::LegalValue;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_vpc_status_conversion() {
         bolero::check!()

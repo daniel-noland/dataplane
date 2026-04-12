@@ -497,7 +497,7 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use crate::ipv6::{Ipv6, Ipv6Error};
     use crate::parse::{DeParse, IntoNonZeroUSize, Parse, ParseError};
@@ -505,6 +505,7 @@ mod test {
 
     const MIN_LEN: usize = Ipv6::MIN_LEN.get() as usize;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_back() {
         bolero::check!().with_type().for_each(|header: &Ipv6| {
@@ -517,6 +518,7 @@ mod test {
         });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_arbitrary_bytes() {
         bolero::check!()
@@ -549,6 +551,7 @@ mod test {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_arbitrary_bytes_too_short() {
         bolero::check!()
@@ -562,6 +565,7 @@ mod test {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_arbitrary_bytes_above_minimum() {
         bolero::check!()

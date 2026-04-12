@@ -145,12 +145,13 @@ impl DeParse for Vxlan {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use crate::parse::{DeParse, DeParseError, IntoNonZeroUSize, Parse, ParseError};
     use crate::vxlan::{InvalidVni, Vni, Vxlan, VxlanError};
     const MIN_LENGTH_USIZE: usize = 8;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_back() {
         bolero::check!().with_type().for_each(|vxlan: &Vxlan| {
@@ -165,6 +166,7 @@ mod test {
         });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn creation_identity_check() {
         bolero::check!().with_type().for_each(|vxlan: &Vxlan| {
@@ -173,6 +175,7 @@ mod test {
         });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_noise() {
         bolero::check!()
@@ -219,6 +222,7 @@ mod test {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn write_to_insufficient_buffer_fails_gracefully() {
         bolero::check!().with_type().for_each(|vni: &Vxlan| {
@@ -233,6 +237,7 @@ mod test {
         });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_of_insufficient_buffer_fails_gracefully() {
         bolero::check!()
@@ -248,6 +253,7 @@ mod test {
             );
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn mutation_of_header_preserves_contract() {
         bolero::check!()

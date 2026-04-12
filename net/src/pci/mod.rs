@@ -84,7 +84,7 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod tests {
     use crate::pci::{PciEbdf, PciEbdfError};
 
@@ -119,6 +119,7 @@ mod tests {
         let _ = PciEbdf::try_new(s.to_string()).unwrap_err();
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_arbitrary_string() {
         bolero::check!()
@@ -132,6 +133,7 @@ mod tests {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_valid() {
         bolero::check!()

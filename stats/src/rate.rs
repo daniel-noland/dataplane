@@ -736,7 +736,7 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use crate::rate::{Derivative, DerivativeComparer, DerivativeError, SavitzkyGolayFilter};
 
@@ -843,6 +843,7 @@ mod test {
         arbitrary_polynomial::<12>();
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn derivative_filter_basic() {
         bolero::check!()
@@ -858,6 +859,7 @@ mod test {
             })
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn derivative_filter_basic_packet_and_byte() {
         bolero::check!()
@@ -877,6 +879,7 @@ mod test {
             )
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn derivative_filter_transmit_summary() {
         bolero::check!()

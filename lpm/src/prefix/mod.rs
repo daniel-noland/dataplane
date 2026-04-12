@@ -1043,7 +1043,7 @@ impl TryFrom<&PrefixSize> for u128 {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 mod tests {
     use crate::prefix::*;
     use serde_yaml_ng;
@@ -1798,6 +1798,7 @@ mod tests {
         }
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_bolero_prefixsize_compare() {
         bolero::check!()

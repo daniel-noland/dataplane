@@ -407,7 +407,7 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
     use crate::checksum::Checksum;
     use crate::parse::{DeParse, IntoNonZeroUSize, Parse, ParseError};
@@ -415,6 +415,7 @@ mod test {
 
     const MIN_LEN: usize = Tcp::MIN_LENGTH.get() as usize;
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_back() {
         bolero::check!().with_type().for_each(|tcp: &Tcp| {
@@ -449,6 +450,7 @@ mod test {
         });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn parse_noise() {
         bolero::check!()

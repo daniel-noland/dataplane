@@ -200,6 +200,7 @@ let
   instrument.none.NIX_CFLAGS_LINK = instrument.none.NIX_CFLAGS_COMPILE;
   instrument.none.RUSTFLAGS =
     [ ] ++ (map (flag: "-Clink-arg=${flag}") instrument.none.NIX_CFLAGS_LINK);
+  # Source-based code coverage for llvm-cov / llvm-profdata reports.
   instrument.coverage.NIX_CFLAGS_COMPILE = [
     "-fprofile-instr-generate"
     "-fcoverage-mapping"
@@ -210,6 +211,33 @@ let
     "-Cinstrument-coverage"
   ]
   ++ (map (flag: "-Clink-arg=${flag}") instrument.coverage.NIX_CFLAGS_LINK);
+  # SanitizerCoverage instrumentation for coverage-guided fuzzing (libfuzzer / bolero).
+  # This instruments both C (DPDK, etc.) and Rust code so the fuzzer can see into all code paths.
+  instrument.fuzz.NIX_CFLAGS_COMPILE = [
+    "-fsanitize-coverage=edge,inline-8bit-counters,pc-table,trace-cmp"
+    # LTO's section GC discards sancov module constructors (.text.sancov.module_ctor_*)
+    # that register coverage counters at startup, breaking instrumentation.
+    # Override the -flto=thin inherited from the fuzz/release profile.
+    "-fno-lto"
+  ] ++ (if arch == "x86_64" then [
+    "-fsanitize-coverage=stack-depth"
+  ] else []);
+  instrument.fuzz.NIX_CXXFLAGS_COMPILE = instrument.fuzz.NIX_CFLAGS_COMPILE;
+  # sancov flags are compile-time only; the callbacks are resolved at final link time by
+  # libfuzzer in the fuzz binary, not during library/sysroot builds.
+  instrument.fuzz.NIX_CFLAGS_LINK = [
+    "-Wl,--no-as-needed,--no-gc-sections"
+  ];
+  instrument.fuzz.RUSTFLAGS = [
+    "-Cpasses=sancov-module"
+    "-Cllvm-args=-sanitizer-coverage-inline-8bit-counters"
+    "-Cllvm-args=-sanitizer-coverage-level=4"
+    "-Cllvm-args=-sanitizer-coverage-pc-table"
+    "-Cllvm-args=-sanitizer-coverage-trace-compares"
+  ] ++ (if arch == "x86_64" then [
+    "-Cllvm-args=-sanitizer-coverage-stack-depth"
+  ] else [])
+  ++ (map (flag: "-Clink-arg=${flag}") instrument.fuzz.NIX_CFLAGS_LINK);
   combine-profiles =
     features:
     builtins.foldl' (

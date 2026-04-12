@@ -7,7 +7,7 @@ version.workspace = true
 
 [features]
 default = []
-bolero = ["dep:bolero"]
+bolero = ["dep:bolero", "dep:fuzz-list", "dep:linkme"]
 serde = ["dep:serde", "uuid/serde"]
 rkyv = ["dep:rkyv"]
 
@@ -16,9 +16,18 @@ bolero = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true, features = ["uuid-1"] }
 serde = { workspace = true, optional = true, features = ["derive"] }
 uuid = { workspace = true, features = ["v4", "v5"] }
+fuzz-list = { workspace = true, optional = true }
+linkme = { workspace = true, optional = true }
 
 [dev-dependencies]
 bolero = { workspace = true, features = ["std"] }
+fuzz-list = { workspace = true }
+
+[[test]]
+name = "fuzz"
+path = "tests/fuzz/main.rs"
+harness = false
+required-features = ["bolero"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

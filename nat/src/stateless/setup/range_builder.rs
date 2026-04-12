@@ -924,7 +924,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod bolero_tests {
     use super::super::generate_nat_values;
     use super::*;
@@ -1269,6 +1269,7 @@ mod bolero_tests {
         }
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_bolero() {
         let generator = PrefixListsGenerator {};

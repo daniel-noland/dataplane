@@ -214,13 +214,14 @@ mod contract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod tests {
     use crate::ip::UnicastIpAddr;
     use crate::ipv4::UnicastIpv4Addr;
     use crate::ipv6::UnicastIpv6Addr;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+    #[fuzz_list::fuzz]
     #[test]
     fn generated_unicast_ip_address_is_unicast() {
         bolero::check!()
@@ -231,6 +232,7 @@ mod tests {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn unicast_ipv4_is_unicast_ip() {
         bolero::check!()
@@ -245,6 +247,7 @@ mod tests {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn unicast_ipv6_is_unicast_ip() {
         bolero::check!()
@@ -259,6 +262,7 @@ mod tests {
             });
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn try_from_obeys_contract() {
         bolero::check!()

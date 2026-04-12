@@ -1,0 +1,22 @@
+[package]
+name = "dataplane-fuzz-list"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["default-address"]
+default-address = []
+default-thread = []
+
+[dependencies]
+chrono = { workspace = true, features = ["clock"] }
+clap = { workspace = true, features = ["derive"] }
+colored = { workspace = true }
+fuzz-list-macros = { workspace = true }
+linkme = { workspace = true }
+quick-junit = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, default-features = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "process", "time", "sync", "macros", "fs", "io-util"] }
