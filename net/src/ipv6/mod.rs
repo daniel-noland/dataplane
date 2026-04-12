@@ -16,7 +16,7 @@ use crate::parse::{
 };
 use crate::tcp::{Tcp, TruncatedTcp};
 use crate::udp::{TruncatedUdp, Udp};
-use etherparse::{IpDscp, IpEcn, IpNumber, Ipv6Header};
+use etherparse::{IpNumber, Ipv6Header};
 use std::net::Ipv6Addr;
 use std::num::NonZero;
 use tracing::trace;
@@ -92,22 +92,20 @@ impl Ipv6 {
         self.0.traffic_class
     }
 
-    // TODO: wrapper type (low priority)
     /// Get the header's [differentiated services code point].
     ///
     /// [differentiated services code point]: https://en.wikipedia.org/wiki/Differentiated_services
     #[must_use]
-    pub fn dscp(&self) -> IpDscp {
-        self.0.dscp()
+    pub fn dscp(&self) -> Dscp {
+        Dscp(self.0.dscp())
     }
 
-    // TODO: wrapper type (low priority)
     /// Get the header's [explicit congestion notification]
     ///
     /// [explicit congestion notification]: https://en.wikipedia.org/wiki/Explicit_Congestion_Notification
     #[must_use]
-    pub fn ecn(&self) -> IpEcn {
-        self.0.ecn()
+    pub fn ecn(&self) -> Ecn {
+        Ecn(self.0.ecn())
     }
 
     // TODO: proper wrapper type (low priority)

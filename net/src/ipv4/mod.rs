@@ -17,7 +17,7 @@ use crate::parse::{
 };
 use crate::tcp::{Tcp, TruncatedTcp};
 use crate::udp::{TruncatedUdp, Udp};
-use etherparse::{IpDscp, IpEcn, IpFragOffset, IpNumber, Ipv4Header};
+use etherparse::{IpNumber, Ipv4Header};
 use std::net::Ipv4Addr;
 use std::num::NonZero;
 use tracing::trace;
@@ -83,11 +83,10 @@ impl Ipv4 {
         Ipv4Options(self.0.options.clone())
     }
 
-    // TODO: proper wrapper type for [`IpNumber`] (low priority)
     /// Get the next layer protocol which follows this header.
     #[must_use]
-    pub fn protocol(&self) -> IpNumber {
-        self.0.protocol
+    pub fn protocol(&self) -> NextHeader {
+        self.0.protocol.into()
     }
 
     /// The IP protocol / next-header field as a [`NextHeader`].
@@ -118,22 +117,20 @@ impl Ipv4 {
         self.0.time_to_live
     }
 
-    // TODO: proper wrapper type (low priority)
     /// Get the header's [differentiated services code point].
     ///
     /// [differentiated services code point]: https://en.wikipedia.org/wiki/Differentiated_services
     #[must_use]
-    pub fn dscp(&self) -> IpDscp {
-        self.0.dscp
+    pub fn dscp(&self) -> Dscp {
+        Dscp(self.0.dscp)
     }
 
-    // TODO: proper wrapper type (low priority)
     /// Get the header's [explicit congestion notification]
     ///
     /// [explicit congestion notification]: https://en.wikipedia.org/wiki/Explicit_Congestion_Notification
     #[must_use]
-    pub fn ecn(&self) -> IpEcn {
-        self.0.ecn
+    pub fn ecn(&self) -> Ecn {
+        Ecn(self.0.ecn)
     }
 
     /// Returns true if the "don't fragment" bit is set in this header.
@@ -148,12 +145,11 @@ impl Ipv4 {
         self.0.more_fragments
     }
 
-    // TODO: proper wrapper type (low priority)
     /// In case this message contains parts of a fragmented packet, the fragment offset is the
     /// offset of payload the current message relative to the original payload of the message.
     #[must_use]
-    pub fn fragment_offset(&self) -> IpFragOffset {
-        self.0.fragment_offset
+    pub fn fragment_offset(&self) -> FragOffset {
+        FragOffset(self.0.fragment_offset)
     }
 
     /// Return the headers "identification".
