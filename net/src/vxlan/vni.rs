@@ -190,7 +190,7 @@ mod test {
         Vni::try_from(2).expect("2 is a legal Vni");
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 1)]
     #[test]
     fn arbitrary_value_complies_with_contract() {
         bolero::check!().with_type().cloned().for_each(|vni: Vni| {
@@ -199,7 +199,7 @@ mod test {
         });
     }
 
-    #[fuzz_list::fuzz(sanitizers += thread)]
+    #[fuzz_list::fuzz(sanitizers += thread, timeout = 2)]
     #[test]
     fn try_from_produces_only_values_which_comply_with_contract_or_which_return_correct_errors() {
         bolero::check!()

@@ -1433,7 +1433,7 @@ mod tests_fuzzing {
         assert_eq!(bytes_parsed, headers.size());
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn parse_back_common() {
         bolero::check!()

@@ -377,7 +377,7 @@ mod bolero_tests {
             .and_then(|ip| ip.set_checksum(Ipv4Checksum::new(0xffff)));
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn test_checksum_validation() {
         let generator = IcmpErrorMsg {};
@@ -447,7 +447,7 @@ mod bolero_tests {
         }
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn test_translation() {
         bolero::check!()

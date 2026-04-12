@@ -1123,7 +1123,7 @@ mod tests {
         }
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn test_flow_key_data_from_packet() {
         bolero::check!()

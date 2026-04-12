@@ -93,9 +93,13 @@ enum Command {
         #[arg(long)]
         binary: Option<String>,
 
-        /// Override per-test timeout (seconds).  Applies to all tests.
-        #[arg(long, short = 'T')]
-        timeout: Option<u32>,
+        /// Minimum time (seconds) per test.  Tests requesting less will be promoted.
+        #[arg(long, default_value = "1")]
+        min_time: u32,
+
+        /// Maximum time (seconds) per test.  Tests requesting more will be capped.
+        #[arg(long, default_value = "300")]
+        max_time: u32,
 
         /// Maximum total concurrent fuzzer jobs across all tests.
         /// Defaults to the number of logical CPUs.
@@ -113,6 +117,10 @@ enum Command {
         /// Number of fuzzer iterations per test (if unset, runs until timeout).
         #[arg(long, short = 'r')]
         runs: Option<u64>,
+
+        /// Write a `JUnit` XML report to the given path after the run.
+        #[arg(long)]
+        junit: Option<String>,
 
         /// Build options (used when --binary is not provided).
         #[command(flatten)]
@@ -192,20 +200,24 @@ pub fn main() -> ! {
         Command::Ci {
             filter,
             binary,
-            timeout,
+            min_time,
+            max_time,
             max_jobs,
             corpus_dir,
             crashes_dir,
             runs,
+            junit,
             build_opts,
         } => cmd_ci(
             filter.as_deref(),
             binary,
-            timeout,
+            min_time,
+            max_time,
             max_jobs,
             &corpus_dir,
             &crashes_dir,
             runs,
+            junit.as_deref(),
             &build_opts,
         ),
     };
@@ -556,6 +568,12 @@ struct CiResult {
     jobs: u32,
     timeout: u32,
     status: CiStatus,
+    /// Path to the stdout log file for this test.
+    #[serde(skip)]
+    stdout_log: std::path::PathBuf,
+    /// Path to the stderr log file for this test.
+    #[serde(skip)]
+    stderr_log: std::path::PathBuf,
 }
 
 #[derive(Debug, Copy, Clone, serde::Serialize)]
@@ -571,15 +589,33 @@ enum CiStatus {
     Failed { exit_code: Option<i32> },
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Resolve a user-provided path against `CARGO_MANIFEST_DIR` if relative.
+///
+/// `cargo test` sets cwd to the package directory, so relative paths from
+/// the user's shell need to be resolved against the workspace root.
+fn resolve_path(path: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(path);
+    if path.is_relative() {
+        std::env::var("CARGO_MANIFEST_DIR").map_or_else(
+            |_| path.to_path_buf(),
+            |dir| std::path::PathBuf::from(dir).join(path),
+        )
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn cmd_ci(
     filter: Option<&str>,
     binary: Option<String>,
-    timeout_override: Option<u32>,
+    min_time: u32,
+    max_time: u32,
     max_jobs: Option<u32>,
     corpus_dir: &str,
     crashes_dir: &str,
     runs: Option<u64>,
+    junit_path: Option<&str>,
     build_opts: &BuildOpts,
 ) -> ExitCode {
     let matched = filter_tests(filter);
@@ -604,7 +640,10 @@ fn cmd_ci(
         path
     };
 
+    let log_dir = resolve_path("./fuzz/logs");
+
     eprintln!("ci: binary = {binary}");
+    eprintln!("ci: logs   = {}", log_dir.display());
 
     let max_jobs = max_jobs.unwrap_or_else(|| {
         std::thread::available_parallelism()
@@ -612,8 +651,16 @@ fn cmd_ci(
             .unwrap_or(4)
     });
 
+    if min_time > max_time {
+        eprintln!(
+            "{} --min-time ({min_time}s) > --max-time ({max_time}s)",
+            "error:".red().bold(),
+        );
+        return ExitCode::FAILURE;
+    }
+
     eprintln!(
-        "ci: {} tests, max {max_jobs} concurrent jobs\n",
+        "ci: {} tests, max {max_jobs} concurrent jobs, time {min_time}s..{max_time}s\n",
         matched.len()
     );
 
@@ -628,15 +675,17 @@ fn cmd_ci(
     let results = rt.block_on(run_ci(
         &matched,
         &binary,
-        timeout_override,
+        min_time,
+        max_time,
         max_jobs,
         corpus_dir,
         crashes_dir,
         runs,
+        &log_dir,
     ));
 
-    // Print results
-    eprintln!("{}", "Results:".bold());
+    // Print final results
+    eprintln!("\n{}", "--- Results ---".bold());
     let mut failures = 0u32;
     for result in &results {
         let status_str = match &result.status {
@@ -659,12 +708,24 @@ fn cmd_ci(
             result.timeout,
             result.jobs,
         );
+        if matches!(result.status, CiStatus::Failed { .. }) {
+            eprintln!(
+                "    {} {}",
+                "log:".dimmed(),
+                result.stderr_log.display().to_string().dimmed(),
+            );
+        }
+    }
+
+    // Write JUnit report if requested.
+    if let Some(path) = junit_path {
+        let path = resolve_path(path);
+        write_junit_report(&path, &results);
     }
 
     eprintln!();
     if failures > 0 {
         eprintln!("{}", format!("ci: {failures} test(s) FAILED").red().bold());
-        // Print JSON summary for CI systems to parse
         if let Ok(json) = serde_json::to_string_pretty(&results) {
             println!("{json}");
         }
@@ -677,6 +738,65 @@ fn cmd_ci(
                 .bold()
         );
         ExitCode::SUCCESS
+    }
+}
+
+fn write_junit_report(path: &std::path::Path, results: &[CiResult]) {
+    use quick_junit::{NonSuccessKind, Report, TestCase, TestCaseStatus, TestSuite};
+
+    let mut suite = TestSuite::new("fuzz-ci");
+
+    for result in results {
+        let status = match result.status {
+            CiStatus::Ok | CiStatus::Timeout => TestCaseStatus::success(),
+            CiStatus::Failed { exit_code } => {
+                let mut status = TestCaseStatus::non_success(NonSuccessKind::Failure);
+                status.set_message(exit_code.map_or("killed by signal".to_string(), |c| {
+                    format!("exited with code {c}")
+                }));
+                status
+            }
+        };
+
+        let mut tc = TestCase::new(result.name.clone(), status);
+        tc.set_classname(result.package.clone());
+        tc.set_time(std::time::Duration::from_secs(u64::from(result.timeout)));
+
+        // Read log files for JUnit system-out / system-err
+        if let Ok(stdout) = std::fs::read_to_string(&result.stdout_log)
+            && !stdout.is_empty()
+        {
+            tc.set_system_out(stdout);
+        }
+        if let Ok(stderr) = std::fs::read_to_string(&result.stderr_log)
+            && !stderr.is_empty()
+        {
+            tc.set_system_err(stderr);
+        }
+
+        suite.add_test_case(tc);
+    }
+
+    let mut report = Report::new("fuzz-ci");
+    report.add_test_suite(suite);
+
+    match std::fs::File::create(path) {
+        Ok(file) => {
+            if let Err(e) = report.serialize(std::io::BufWriter::new(file)) {
+                eprintln!(
+                    "warning: failed to write JUnit report to {}: {e}",
+                    path.display()
+                );
+            } else {
+                eprintln!("ci: JUnit report written to {}", path.display());
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: failed to create JUnit report file {}: {e}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -727,87 +847,138 @@ fn build_and_get_binary(filter: Option<&str>, build_opts: &BuildOpts) -> Option<
 
 /// Events sent from test tasks to the status monitor.
 enum CiEvent {
-    Start { name: String, jobs: u32 },
-    Finish { name: String, status: CiStatus },
+    Start {
+        name: String,
+        jobs: u32,
+        started_at: std::time::Instant,
+    },
+    Finish {
+        name: String,
+        status: CiStatus,
+    },
     /// Sentinel: all tests have been spawned and completed.
     Shutdown,
 }
 
+/// Format the current local wall-clock time as `HH:MM:SS`.
+fn format_wall_clock() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+/// Info tracked per active test.
+struct ActiveTest {
+    jobs: u32,
+    started_at: std::time::Instant,
+}
+
 /// Status monitor that owns all mutable state.  Receives events via channel,
-/// prints periodic status updates via a ticker.
+/// periodically prints a rich multi-line colored dashboard.
+#[allow(clippy::too_many_lines)]
 async fn status_monitor(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<CiEvent>,
     total: u32,
     cores_total: u32,
+    queued: u32,
     color_map: std::collections::HashMap<String, colored::Color>,
 ) {
-    let mut active: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    let mut active: std::collections::BTreeMap<String, ActiveTest> =
+        std::collections::BTreeMap::new();
     let mut cores_used: u32 = 0;
     let mut completed: u32 = 0;
+    let mut remaining = queued;
     let mut failed: Vec<String> = Vec::new();
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
+    // Track how many lines the last dashboard print used, so we can clear them.
+    let mut last_lines: u16 = 0;
 
-    let print_status =
-        |active: &std::collections::BTreeMap<String, u32>,
+    let clear_dashboard = |last_lines: u16| {
+        for _ in 0..last_lines {
+            // Move up one line and clear it.
+            eprint!("\x1b[A\x1b[2K");
+        }
+    };
+
+    let print_dashboard =
+        |active: &std::collections::BTreeMap<String, ActiveTest>,
          cores_used: u32,
          completed: u32,
+         remaining: u32,
          failed: &[String],
-         color_map: &std::collections::HashMap<String, colored::Color>| {
-            let active_names: Vec<String> = active
-                .keys()
-                .map(|name| {
+         color_map: &std::collections::HashMap<String, colored::Color>|
+         -> u16 {
+            let now = format_wall_clock();
+            let mut lines: u16 = 0;
+
+            eprintln!(
+                "{} {} {}/{} {} {}/{} {} {} {}",
+                format!("--- fuzz-ci [{now}]").bold(),
+                "---".bold(),
+                completed.to_string().green().bold(),
+                total,
+                "done".dimmed(),
+                cores_used.to_string().cyan().bold(),
+                cores_total,
+                "cores".dimmed(),
+                remaining.to_string().yellow(),
+                "queued".dimmed(),
+            );
+            lines += 1;
+
+            if !active.is_empty() {
+                eprintln!("  {}:", "Active".cyan().bold());
+                lines += 1;
+                for (name, info) in active {
                     let color = color_map
                         .get(name.as_str())
                         .copied()
                         .unwrap_or(colored::Color::White);
-                    name.color(color).to_string()
-                })
-                .collect();
-            eprint!(
-                "\r{} {}/{} {} {} {} {}/{} {}",
-                "[".bold(),
-                completed.to_string().green().bold(),
-                total,
-                "done,".dimmed(),
-                active.len().to_string().cyan().bold(),
-                "running,".dimmed(),
-                cores_used.to_string().cyan(),
-                cores_total,
-                "cores".dimmed(),
-            );
-            if !failed.is_empty() {
-                eprint!(
-                    ", {} {}",
-                    failed.len().to_string().red().bold(),
-                    "FAILED".red().bold(),
-                );
+                    let elapsed = info.started_at.elapsed().as_secs();
+                    eprintln!(
+                        "    {} {}",
+                        name.color(color),
+                        format!("[{elapsed}s]").dimmed(),
+                    );
+                    lines += 1;
+                }
             }
-            eprint!("{} {}", "]".bold(), active_names.join(", "));
-            eprint!("\x1b[K");
+
+            if !failed.is_empty() {
+                eprintln!("  {}:", "Failed".red().bold());
+                lines += 1;
+                for name in failed {
+                    eprintln!("    {}", name.red());
+                    lines += 1;
+                }
+            }
+
+            lines
         };
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 if completed < total {
-                    print_status(&active, cores_used, completed, &failed, &color_map);
+                    clear_dashboard(last_lines);
+                    last_lines = print_dashboard(&active, cores_used, completed, remaining, &failed, &color_map);
                 }
             }
             event = rx.recv() => {
                 match event {
-                    Some(CiEvent::Start { name, jobs }) => {
-                        active.insert(name, jobs);
+                    Some(CiEvent::Start { name, jobs, started_at }) => {
+                        active.insert(name, ActiveTest { jobs, started_at });
                         cores_used += jobs;
+                        remaining = remaining.saturating_sub(1);
                     }
                     Some(CiEvent::Finish { name, status }) => {
-                        if let Some(jobs) = active.remove(&name) {
-                            cores_used -= jobs;
+                        if let Some(info) = active.remove(&name) {
+                            cores_used -= info.jobs;
                         }
                         completed += 1;
                         if matches!(status, CiStatus::Failed { .. }) {
                             failed.push(name);
                         }
-                        print_status(&active, cores_used, completed, &failed, &color_map);
+                        clear_dashboard(last_lines);
+                        last_lines = print_dashboard(&active, cores_used, completed, remaining, &failed, &color_map);
                     }
                     Some(CiEvent::Shutdown) | None => {
                         break;
@@ -817,53 +988,74 @@ async fn status_monitor(
         }
     }
 
-    // Clear the status line
-    eprintln!();
+    clear_dashboard(last_lines);
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_ci(
     tests: &[&Test],
     binary: &str,
-    timeout_override: Option<u32>,
+    min_time: u32,
+    max_time: u32,
     max_jobs: u32,
     corpus_dir: &str,
     crashes_dir: &str,
     runs: Option<u64>,
+    log_dir: &std::path::Path,
 ) -> Vec<CiResult> {
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_jobs as usize));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // Build a color map: test_name -> color
     let color_map: std::collections::HashMap<String, colored::Color> = tests
         .iter()
         .enumerate()
         .map(|(i, t)| (t.name().to_string(), test_color(i)))
         .collect();
 
+    let total = u32::try_from(tests.len()).unwrap_or(u32::MAX);
+
     let monitor = tokio::spawn(status_monitor(
         rx,
-        u32::try_from(tests.len()).unwrap_or(u32::MAX),
+        total,
         max_jobs,
-        color_map.clone(),
+        total,
+        color_map,
     ));
 
     let mut handles = Vec::new();
     let binary = std::sync::Arc::<str>::from(binary);
+    let log_dir = std::sync::Arc::<std::path::Path>::from(log_dir);
 
-    for (i, test) in tests.iter().enumerate() {
+    for test in tests {
         let test_name = test.name().to_string();
         let package = test.package();
-        let jobs = test.jobs();
-        let timeout = timeout_override.unwrap_or(test.timeout());
+        let mut jobs = test.jobs();
+        if jobs > max_jobs {
+            eprintln!(
+                "{} {} requested {} jobs but --max-jobs is {}; clamping",
+                "warning:".yellow().bold(),
+                test_name,
+                jobs,
+                max_jobs,
+            );
+            jobs = max_jobs;
+        }
+        let timeout = test.timeout().clamp(min_time, max_time);
         let sem = semaphore.clone();
         let bin = binary.clone();
         let tx = tx.clone();
-        let color = test_color(i);
+        let ld = log_dir.clone();
 
         let test_corpus = format!("{corpus_dir}/{}", test_name.replace("::", "/"));
         let test_crashes = format!("{crashes_dir}/{}", test_name.replace("::", "/"));
 
         let handle = tokio::spawn(async move {
+            // Per-test log directory
+            let test_log_dir = ld.join(test_name.replace("::", "/"));
+            let _ = tokio::fs::create_dir_all(&test_log_dir).await;
+            let stdout_log = test_log_dir.join("stdout.log");
+            let stderr_log = test_log_dir.join("stderr.log");
+
             // Acquire tokens equal to the number of jobs this test wants.
             let mut permits = Vec::new();
             for _ in 0..jobs {
@@ -871,7 +1063,7 @@ async fn run_ci(
                     let status = CiStatus::Failed { exit_code: None };
                     let _ = tx.send(CiEvent::Finish {
                         name: test_name.clone(),
-                        status: CiStatus::Failed { exit_code: None },
+                        status,
                     });
                     return CiResult {
                         name: test_name,
@@ -879,6 +1071,8 @@ async fn run_ci(
                         jobs,
                         timeout,
                         status,
+                        stdout_log,
+                        stderr_log,
                     };
                 };
                 permits.push(permit);
@@ -887,17 +1081,19 @@ async fn run_ci(
             let _ = tx.send(CiEvent::Start {
                 name: test_name.clone(),
                 jobs,
+                started_at: std::time::Instant::now(),
             });
 
             let status = run_one_test(&TestRun {
                 binary: &bin,
                 test_name: &test_name,
-                color,
                 timeout,
                 jobs,
                 corpus_dir: &test_corpus,
                 crashes_dir: &test_crashes,
                 runs,
+                stdout_log: &stdout_log,
+                stderr_log: &stderr_log,
             })
             .await;
 
@@ -906,7 +1102,6 @@ async fn run_ci(
                 status,
             });
 
-            // Release semaphore permits
             drop(permits);
 
             CiResult {
@@ -915,6 +1110,8 @@ async fn run_ci(
                 jobs,
                 timeout,
                 status,
+                stdout_log,
+                stderr_log,
             }
         });
 
@@ -928,7 +1125,6 @@ async fn run_ci(
         }
     }
 
-    // Signal the monitor to shut down and wait for it.
     let _ = tx.send(CiEvent::Shutdown);
     drop(tx);
     let _ = monitor.await;
@@ -940,36 +1136,31 @@ async fn run_ci(
 struct TestRun<'a> {
     binary: &'a str,
     test_name: &'a str,
-    color: colored::Color,
     timeout: u32,
     jobs: u32,
     corpus_dir: &'a str,
     crashes_dir: &'a str,
     runs: Option<u64>,
+    stdout_log: &'a std::path::Path,
+    stderr_log: &'a std::path::Path,
 }
 
 async fn run_one_test(params: &TestRun<'_>) -> CiStatus {
     let TestRun {
         binary,
         test_name,
-        color,
         timeout,
         jobs,
         corpus_dir,
         crashes_dir,
         runs,
+        stdout_log,
+        stderr_log,
     } = params;
-    // Create corpus/crashes dirs
+
     let _ = tokio::fs::create_dir_all(corpus_dir).await;
     let _ = tokio::fs::create_dir_all(crashes_dir).await;
 
-    // Build libfuzzer args.
-    //
-    // -max_total_time: total fuzzing duration (the CI timeout).  This lets libfuzzer
-    //   exit cleanly (saving corpus, printing stats) rather than being SIGKILLed.
-    // -timeout: per-input timeout (if a single input takes longer, it's a crash).
-    //   10s is a generous default; the CI timeout is NOT the right value here.
-    // -jobs: number of parallel libfuzzer worker processes.
     let per_input_timeout = 10;
     let mut libfuzzer_args = vec![
         corpus_dir.to_string(),
@@ -983,8 +1174,6 @@ async fn run_one_test(params: &TestRun<'_>) -> CiStatus {
         libfuzzer_args.push(format!("-runs={runs}"));
     }
 
-    // Run the pre-built instrumented test binary.  This is the unit test binary
-    // (not the harness) containing the actual bolero test functions.
     let mut cmd = tokio::process::Command::new(binary);
     cmd.arg(test_name);
     cmd.args(["--exact", "--nocapture", "--quiet", "--test-threads", "1"]);
@@ -992,29 +1181,27 @@ async fn run_one_test(params: &TestRun<'_>) -> CiStatus {
     cmd.env("BOLERO_LIBTEST_HARNESS", "1");
     cmd.env("BOLERO_LIBFUZZER_ARGS", libfuzzer_args.join(" "));
 
-    // Capture stdout/stderr so we can prefix each line with the test name.
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-
-    let colored_prefix = format!("{}>", test_name.color(*color).bold());
-    eprintln!("{colored_prefix} start (timeout={timeout}s, jobs={jobs})");
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{colored_prefix} error spawning: {e}");
+            eprintln!("error spawning {test_name}: {e}");
             return CiStatus::Failed { exit_code: None };
         }
     };
 
-    // Take the pipes before waiting -- we read them concurrently with the child running.
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let relay_task = tokio::spawn(relay_output(colored_prefix.clone(), stdout, stderr));
+    let relay_task = tokio::spawn(relay_output(
+        stdout_log.to_path_buf(),
+        stderr_log.to_path_buf(),
+        stdout,
+        stderr,
+    ));
 
-    // Give libfuzzer a few extra seconds beyond -max_total_time to exit cleanly
-    // (save corpus, print summary).  If it doesn't exit by then, SIGKILL.
     let grace = 5;
     let duration = std::time::Duration::from_secs(u64::from(*timeout) + grace);
 
@@ -1029,46 +1216,48 @@ async fn run_one_test(params: &TestRun<'_>) -> CiStatus {
             }
         }
         Ok(Err(e)) => {
-            eprintln!("{test_name}> error waiting: {e}");
+            eprintln!("error waiting for {test_name}: {e}");
             CiStatus::Failed { exit_code: None }
         }
         Err(_) => {
-            // Timeout -- kill the child.  This is expected for fuzz tests that run
-            // for their full budget without finding a crash.
             let _ = child.kill().await;
             CiStatus::Timeout
         }
     };
 
-    // Wait for the relay task to drain remaining output.
     let _ = relay_task.await;
-
     status
 }
 
-/// Read lines from a child's stdout and stderr, printing each with a colored prefix.
+/// Stream child stdout/stderr to per-test log files (no terminal output).
 async fn relay_output(
-    colored_prefix: String,
+    stdout_path: std::path::PathBuf,
+    stderr_path: std::path::PathBuf,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
 ) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let pfx = colored_prefix.clone();
     let out_task = async {
-        if let Some(out) = stdout {
+        if let Some(out) = stdout
+            && let Ok(mut file) = tokio::fs::File::create(&stdout_path).await
+        {
             let mut lines = BufReader::new(out).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                println!("{pfx} {line}");
+                let _ = file.write_all(line.as_bytes()).await;
+                let _ = file.write_all(b"\n").await;
             }
         }
     };
 
     let err_task = async {
-        if let Some(err) = stderr {
+        if let Some(err) = stderr
+            && let Ok(mut file) = tokio::fs::File::create(&stderr_path).await
+        {
             let mut lines = BufReader::new(err).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("{colored_prefix} {line}");
+                let _ = file.write_all(line.as_bytes()).await;
+                let _ = file.write_all(b"\n").await;
             }
         }
     };

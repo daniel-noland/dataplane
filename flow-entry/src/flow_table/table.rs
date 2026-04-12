@@ -301,7 +301,7 @@ impl FlowTable {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod tests {
     use super::*;
     use std::net::IpAddr;
@@ -422,6 +422,7 @@ mod tests {
             }
         }
 
+        #[fuzz_list::fuzz]
         #[tokio::test]
         async fn test_flow_table_remove_bolero() {
             let flow_table = FlowTable::default();

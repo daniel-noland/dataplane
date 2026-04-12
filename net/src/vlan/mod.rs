@@ -499,7 +499,7 @@ mod test {
         }
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 1)]
     #[test]
     fn pcp_bounds_respected() {
         bolero::check!()
@@ -518,7 +518,7 @@ mod test {
             });
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 1)]
     #[test]
     fn parse_back() {
         bolero::check!().with_type().for_each(|vlan: &Vlan| {
@@ -537,7 +537,7 @@ mod test {
         });
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 1)]
     #[test]
     fn parse_noise() {
         bolero::check!().with_type().for_each(|buf: &[u8; MIN_LENGTH_USIZE]| {
@@ -560,7 +560,7 @@ mod test {
         });
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 1)]
     #[test]
     fn parse_noise_too_short() {
         bolero::check!().with_type().for_each(
@@ -574,7 +574,7 @@ mod test {
         );
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 1)]
     #[test]
     fn arbitrary_mutation() {
         bolero::check!()
@@ -594,7 +594,7 @@ mod test {
             });
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 1)]
     #[test]
     fn deparse_to_insufficient_buffer_is_graceful() {
         bolero::check!().with_type().for_each(|vlan: &Vlan| {

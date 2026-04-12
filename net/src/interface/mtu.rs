@@ -122,7 +122,7 @@ mod contract {
 pub mod test {
     use super::*;
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 1)]
     #[test]
     fn mtu_is_constrained() {
         bolero::check!().with_type().for_each(|x: &Mtu| {

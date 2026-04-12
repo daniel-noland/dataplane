@@ -20,7 +20,7 @@ client = [
     "kube/runtime",
     "kube/rustls-tls",
 ]
-bolero = ["dep:bolero", "dep:hardware", "dep:net", "dep:lpm", "net/test_buffer", "net/bolero", "hardware/bolero"]
+bolero = ["dep:bolero", "dep:fuzz-list", "dep:linkme", "dep:hardware", "dep:net", "dep:lpm", "net/test_buffer", "net/bolero", "hardware/bolero"]
 
 [dependencies]
 # internal
@@ -28,14 +28,14 @@ hardware = { workspace = true, optional = true, features = ["bolero"] }
 lpm = { workspace = true, optional = true }
 net = { workspace = true, optional = true, features = ["bolero"] }
 tracectl = { workspace = true, optional = true }
-tracing = { workspace = true }
+fuzz-list = { workspace = true, optional = true }
 
 # external
 bolero = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, features = ["latest", "schemars", "std"] }
 kube = { workspace = true, features = ["derive"] }
 kube-core = { workspace = true }
-k8s-openapi = { workspace = true, features = ["latest", "schemars", "std"] }
 linkme = { workspace = true, optional = true }
 rustls = { workspace = true, features = ["aws-lc-rs"], optional = true }
 schemars = { workspace = true, features = ["derive", "std"] }
@@ -44,12 +44,20 @@ serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 bolero = { workspace = true }
+fuzz-list = { workspace = true }
 hardware = { workspace = true, features = ["bolero"] }
 lpm = { workspace = true, features = [] }
 net = { workspace = true, features = ["bolero", "test_buffer"] }
+
+[[test]]
+name = "fuzz"
+path = "tests/fuzz/main.rs"
+harness = false
+required-features = ["bolero"]
 
 [build-dependencies]
 dpdk-sysroot-helper = { workspace = true }

@@ -2552,7 +2552,7 @@ mod tests {
 
     const MAX_PAYLOAD_LEN: usize = 60_000;
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn ipv4_tcp_consistent() {
         bolero::check!().with_type().cloned().for_each(
@@ -2595,7 +2595,7 @@ mod tests {
         );
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn ipv6_udp_vxlan_consistent() {
         bolero::check!().with_type().cloned().for_each(
@@ -2647,7 +2647,7 @@ mod tests {
         );
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn vxlan_always_overrides_udp_dst() {
         bolero::check!().with_type().cloned().for_each(
@@ -2674,7 +2674,7 @@ mod tests {
 
     // -- Fuzz ValueGenerator tests -------------------------------------------
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn fuzz_ipv4_tcp_dst_port_pinned() {
         bolero::check!()
@@ -2711,7 +2711,7 @@ mod tests {
             });
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn fuzz_ipv6_udp_vxlan_conforms() {
         let generator = ChainBase::new()
@@ -2740,7 +2740,7 @@ mod tests {
             });
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn fuzz_round_trips_through_parse() {
         let generator = ChainBase::new().eth(|_| {}).ipv4(|_| {}).tcp(|_| {});
@@ -2756,7 +2756,7 @@ mod tests {
             });
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn fuzz_icmp4_with_embedded_ipv4_tcp() {
         bolero::check!()
@@ -2788,7 +2788,7 @@ mod tests {
             });
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn fuzz_icmp6_with_embedded_ipv6_udp() {
         let generator = ChainBase::new()
@@ -2808,7 +2808,7 @@ mod tests {
             });
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn fuzz_icmp4_embedded_net_with_udp() {
         bolero::check!()
@@ -2844,7 +2844,7 @@ mod tests {
             });
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 60, jobs = 4)]
     #[test]
     fn fuzz_ipv6_ext_headers() {
         let generator = ChainBase::new().eth(|_| {}).ipv6(|_| {}).hop_by_hop(|_| {});

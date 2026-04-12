@@ -493,7 +493,7 @@ mod test {
         }
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 1)]
     #[test]
     fn test_mac_from_valid_string() {
         bolero::check!()
@@ -507,7 +507,7 @@ mod test {
             });
     }
 
-    #[fuzz_list::fuzz]
+    #[fuzz_list::fuzz(timeout = 1)]
     #[test]
     fn test_mac_from_invalid_string() {
         bolero::check!()

@@ -283,8 +283,9 @@ pub fn generate_prefixes<D: Driver>(
     Some(prefixes)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bolero"))]
 mod test {
+    #[fuzz_list::fuzz]
     #[test]
     fn test_unique_v4_cidr_generator() {
         for mask in 0..=32 {
@@ -310,6 +311,7 @@ mod test {
         }
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_unique_v6_cidr_generator() {
         for mask in 0..=128 {
@@ -335,6 +337,7 @@ mod test {
         }
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_unique_v4_interface_address_generator() {
         for count in [0, 1, 10, 16, 100] {
@@ -370,6 +373,7 @@ mod test {
         }
     }
 
+    #[fuzz_list::fuzz]
     #[test]
     fn test_unique_v6_interface_address_generator() {
         for count in [0, 1, 10, 16, 100] {
