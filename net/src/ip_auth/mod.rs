@@ -3,68 +3,39 @@
 
 //! IP authentication header type and logic.
 
-use crate::headers::{EmbeddedHeader, Header};
-use crate::icmp4::Icmp4;
-use crate::icmp6::Icmp6;
-use crate::impl_from_for_enum;
-use crate::parse::{
-    DeParse, DeParseError, IntoNonZeroUSize, LengthError, Parse, ParseError, ParseHeader, Reader,
-};
-use crate::tcp::{Tcp, TruncatedTcp};
-use crate::udp::{TruncatedUdp, Udp};
-use etherparse::{IpAuthHeader, IpNumber};
-use std::num::NonZero;
-use tracing::{debug, trace};
+pub mod v4;
+pub mod v6;
 
-/// An Ip authentication header.
+pub use v4::Ipv4Auth;
+pub use v6::Ipv6Auth;
+
+use crate::ip::NextHeader;
+use crate::parse::{DeParse, DeParseError, IntoNonZeroUSize, LengthError, Parse, ParseError};
+use etherparse::IpAuthHeader;
+use std::num::NonZero;
+
+/// An IP authentication header.
 ///
 /// This may appear in IPv4 and IPv6 headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpAuth(Box<IpAuthHeader>);
 
+impl From<Box<IpAuthHeader>> for IpAuth {
+    fn from(inner: Box<IpAuthHeader>) -> Self {
+        Self(inner)
+    }
+}
+
 impl IpAuth {
-    /// Parse the payload of the IP authentication header.
-    ///
-    /// # Returns
-    ///
-    /// * `Some(IpAuthNext)`: the parsed next header, if supported.
-    /// * `None`: if parsing the next header is not supported.
-    pub(crate) fn parse_payload(&self, cursor: &mut Reader) -> Option<IpAuthNext> {
-        match self.0.next_header {
-            IpNumber::TCP => cursor.parse_header::<Tcp, IpAuthNext>(),
-            IpNumber::UDP => cursor.parse_header::<Udp, IpAuthNext>(),
-            IpNumber::ICMP => cursor.parse_header::<Icmp4, IpAuthNext>(),
-            IpNumber::IPV6_ICMP => cursor.parse_header::<Icmp6, IpAuthNext>(),
-            IpNumber::AUTHENTICATION_HEADER => {
-                debug!("nested ip auth header");
-                cursor.parse_header::<IpAuth, IpAuthNext>()
-            }
-            _ => {
-                trace!("unsupported protocol: {:?}", self.0.next_header);
-                None
-            }
-        }
+    /// Get the next-header protocol number.
+    #[must_use]
+    pub fn next_header(&self) -> NextHeader {
+        NextHeader::from(self.0.next_header)
     }
 
-    /// Parse the payload of the IP authentication header embedded in an ICMP Error message.
-    ///
-    /// # Returns
-    ///
-    /// * `Some(EmbeddedIpAuthNext)`: the parsed next header, if supported.
-    /// * `None`: if parsing the next header is not supported.
-    pub(crate) fn parse_embedded_payload(&self, cursor: &mut Reader) -> Option<EmbeddedIpAuthNext> {
-        match self.0.next_header {
-            IpNumber::TCP => cursor.parse_header::<TruncatedTcp, EmbeddedIpAuthNext>(),
-            IpNumber::UDP => cursor.parse_header::<TruncatedUdp, EmbeddedIpAuthNext>(),
-            IpNumber::AUTHENTICATION_HEADER => {
-                debug!("nested ip auth header");
-                cursor.parse_header::<IpAuth, EmbeddedIpAuthNext>()
-            }
-            _ => {
-                trace!("unsupported protocol: {:?}", self.0.next_header);
-                None
-            }
-        }
+    /// Set the next-header protocol number.
+    pub fn set_next_header(&mut self, nh: NextHeader) {
+        self.0.next_header = nh.into();
     }
 }
 
@@ -113,54 +84,36 @@ impl DeParse for IpAuth {
     }
 }
 
-pub(crate) enum IpAuthNext {
-    Tcp(Tcp),
-    Udp(Udp),
-    Icmp4(Icmp4),
-    Icmp6(Icmp6),
-    IpAuth(IpAuth),
-}
+#[cfg(any(test, feature = "bolero"))]
+mod contract {
+    use super::IpAuth;
+    use bolero::{Driver, TypeGenerator};
+    use etherparse::{IpAuthHeader, IpNumber};
 
-impl_from_for_enum![
-    IpAuthNext,
-    Tcp(Tcp),
-    Udp(Udp),
-    Icmp4(Icmp4),
-    Icmp6(Icmp6),
-    IpAuth(IpAuth)
-];
+    /// Valid ICV lengths (multiples of 4).
+    ///
+    /// Includes the boundaries: 0 (minimum), small values for fast fuzzing,
+    /// and `MAX_ICV_LEN` (1016) to cover the upper limit.
+    const VALID_ICV_LENS: [usize; 5] = [0, 4, 8, 12, IpAuthHeader::MAX_ICV_LEN];
 
-impl From<IpAuthNext> for Header {
-    fn from(value: IpAuthNext) -> Self {
-        match value {
-            IpAuthNext::Tcp(x) => Header::Tcp(x),
-            IpAuthNext::Udp(x) => Header::Udp(x),
-            IpAuthNext::Icmp4(x) => Header::Icmp4(x),
-            IpAuthNext::Icmp6(x) => Header::Icmp6(x),
-            IpAuthNext::IpAuth(x) => Header::IpAuth(x),
-        }
-    }
-}
-
-pub(crate) enum EmbeddedIpAuthNext {
-    Tcp(TruncatedTcp),
-    Udp(TruncatedUdp),
-    IpAuth(IpAuth),
-}
-
-impl_from_for_enum![
-    EmbeddedIpAuthNext,
-    Tcp(TruncatedTcp),
-    Udp(TruncatedUdp),
-    IpAuth(IpAuth)
-];
-
-impl From<EmbeddedIpAuthNext> for EmbeddedHeader {
-    fn from(value: EmbeddedIpAuthNext) -> Self {
-        match value {
-            EmbeddedIpAuthNext::Tcp(x) => EmbeddedHeader::Tcp(x),
-            EmbeddedIpAuthNext::Udp(x) => EmbeddedHeader::Udp(x),
-            EmbeddedIpAuthNext::IpAuth(x) => EmbeddedHeader::IpAuth(x),
+    impl TypeGenerator for IpAuth {
+        fn generate<D: Driver>(driver: &mut D) -> Option<Self> {
+            let next_header: u8 = driver.produce()?;
+            let spi: u32 = driver.produce()?;
+            let sequence_number: u32 = driver.produce()?;
+            let idx = driver.gen_usize(
+                std::ops::Bound::Included(&0),
+                std::ops::Bound::Excluded(&VALID_ICV_LENS.len()),
+            )?;
+            let icv_len = VALID_ICV_LENS[idx];
+            let mut icv = vec![0u8; icv_len];
+            for byte in &mut icv {
+                *byte = driver.produce()?;
+            }
+            #[allow(clippy::unwrap_used)] // lengths are valid by construction
+            let header =
+                IpAuthHeader::new(IpNumber(next_header), spi, sequence_number, &icv).unwrap();
+            Some(IpAuth::from(Box::new(header)))
         }
     }
 }

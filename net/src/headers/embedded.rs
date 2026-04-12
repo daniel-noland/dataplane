@@ -8,9 +8,9 @@ use crate::icmp_any::TruncatedIcmpAny;
 use crate::icmp4::{Icmp4Checksum, TruncatedIcmp4};
 use crate::icmp6::{Icmp6Checksum, TruncatedIcmp6};
 use crate::impl_from_for_enum;
-use crate::ip_auth::IpAuth;
+use crate::ip_auth::{Ipv4Auth, Ipv6Auth};
 use crate::ipv4::Ipv4;
-use crate::ipv6::{Ipv6, Ipv6Ext};
+use crate::ipv6::{DestOpts, Fragment, HopByHop, Ipv6, Routing};
 use crate::parse::{
     DeParse, DeParseError, IllegalBufferLength, IntoNonZeroUSize, LengthError, ParseError,
     ParseHeader, ParseWith, Reader, Writer,
@@ -324,11 +324,47 @@ impl ParseWith for EmbeddedHeaders {
                 EmbeddedHeader::Ipv6(ipv6) => {
                     this.net = Some(Net::Ipv6(ipv6));
                 }
-                EmbeddedHeader::IpAuth(auth) => {
-                    this.net_ext.push(NetExt::IpAuth(auth));
+                EmbeddedHeader::Ipv4Auth(h) => {
+                    if this.net_ext.len() < MAX_NET_EXTENSIONS {
+                        this.net_ext.push(NetExt::Ipv4Auth(h));
+                    } else {
+                        break;
+                    }
                 }
-                EmbeddedHeader::IpV6Ext(ext) => {
-                    this.net_ext.push(NetExt::Ipv6Ext(ext));
+                EmbeddedHeader::Ipv6Auth(h) => {
+                    if this.net_ext.len() < MAX_NET_EXTENSIONS {
+                        this.net_ext.push(NetExt::Ipv6Auth(h));
+                    } else {
+                        break;
+                    }
+                }
+                EmbeddedHeader::HopByHop(h) => {
+                    if this.net_ext.len() < MAX_NET_EXTENSIONS {
+                        this.net_ext.push(NetExt::HopByHop(h));
+                    } else {
+                        break;
+                    }
+                }
+                EmbeddedHeader::DestOpts(h) => {
+                    if this.net_ext.len() < MAX_NET_EXTENSIONS {
+                        this.net_ext.push(NetExt::DestOpts(h));
+                    } else {
+                        break;
+                    }
+                }
+                EmbeddedHeader::Routing(h) => {
+                    if this.net_ext.len() < MAX_NET_EXTENSIONS {
+                        this.net_ext.push(NetExt::Routing(h));
+                    } else {
+                        break;
+                    }
+                }
+                EmbeddedHeader::Fragment(h) => {
+                    if this.net_ext.len() < MAX_NET_EXTENSIONS {
+                        this.net_ext.push(NetExt::Fragment(h));
+                    } else {
+                        break;
+                    }
                 }
                 EmbeddedHeader::Tcp(tcp) => {
                     this.transport = Some(EmbeddedTransport::Tcp(tcp));
@@ -435,25 +471,33 @@ pub(crate) enum EmbeddedHeader {
     Udp(TruncatedUdp),
     Icmp4(TruncatedIcmp4),
     Icmp6(TruncatedIcmp6),
-    IpAuth(IpAuth),
-    IpV6Ext(Ipv6Ext), // TODO: break out nested enum.  Nesting is counter productive here
+    Ipv4Auth(Ipv4Auth),
+    Ipv6Auth(Ipv6Auth),
+    HopByHop(HopByHop),
+    DestOpts(DestOpts),
+    Routing(Routing),
+    Fragment(Fragment),
 }
 
 impl EmbeddedHeader {
     fn parse_payload(&self, cursor: &mut Reader) -> Option<EmbeddedHeader> {
-        use EmbeddedHeader::{Icmp4, Icmp6, IpAuth, IpV6Ext, Ipv4, Ipv6, Tcp, Udp};
         match self {
-            Ipv4(ipv4) => ipv4
+            EmbeddedHeader::Ipv4(ipv4) => ipv4
                 .parse_embedded_payload(cursor)
                 .map(EmbeddedHeader::from),
-            Ipv6(ipv6) => ipv6
+            EmbeddedHeader::Ipv6(ipv6) => ipv6
                 .parse_embedded_payload(cursor)
                 .map(EmbeddedHeader::from),
-            IpAuth(auth) => auth
-                .parse_embedded_payload(cursor)
-                .map(EmbeddedHeader::from),
-            IpV6Ext(ext) => ext.parse_embedded_payload(cursor).map(EmbeddedHeader::from),
-            Tcp(_) | Udp(_) | Icmp4(_) | Icmp6(_) => None,
+            EmbeddedHeader::Ipv4Auth(auth) => auth.parse_embedded_payload(cursor),
+            EmbeddedHeader::Ipv6Auth(auth) => auth.parse_embedded_payload(cursor),
+            EmbeddedHeader::HopByHop(h) => h.parse_embedded_payload(cursor),
+            EmbeddedHeader::DestOpts(h) => h.parse_embedded_payload(cursor),
+            EmbeddedHeader::Routing(h) => h.parse_embedded_payload(cursor),
+            EmbeddedHeader::Fragment(h) => h.parse_embedded_payload(cursor),
+            EmbeddedHeader::Tcp(_)
+            | EmbeddedHeader::Udp(_)
+            | EmbeddedHeader::Icmp4(_)
+            | EmbeddedHeader::Icmp6(_) => None,
         }
     }
 }
@@ -466,8 +510,12 @@ impl_from_for_enum![
     Tcp(TruncatedTcp),
     Icmp4(TruncatedIcmp4),
     Icmp6(TruncatedIcmp6),
-    IpAuth(IpAuth),
-    IpV6Ext(Ipv6Ext)
+    Ipv4Auth(Ipv4Auth),
+    Ipv6Auth(Ipv6Auth),
+    HopByHop(HopByHop),
+    DestOpts(DestOpts),
+    Routing(Routing),
+    Fragment(Fragment)
 ];
 
 #[derive(Debug, thiserror::Error)]
