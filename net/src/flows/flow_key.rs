@@ -15,14 +15,15 @@ use crate::headers::{
     TryIp, TryTransport,
 };
 use crate::icmp_any::TruncatedIcmpAny;
+use crate::icmp4::Icmp4Type;
 use crate::icmp4::{Icmp4, TruncatedIcmp4};
+use crate::icmp6::Icmp6Type;
 use crate::icmp6::{Icmp6, TruncatedIcmp6};
 use crate::ip::NextHeader;
 use crate::packet::Packet;
 use crate::packet::VpcDiscriminant;
 use crate::tcp::{TcpPort, TcpPortError};
 use crate::udp::{UdpPort, UdpPortError};
-use etherparse::{Icmpv4Type, Icmpv6Type};
 
 #[derive(Debug, thiserror::Error)]
 /// Errors that may occur when building a `FlowKey`
@@ -308,10 +309,9 @@ pub enum IcmpProtoKey {
 impl IcmpProtoKey {
     fn new_icmp_v4<Buf: PacketBufferMut>(packet: &Packet<Buf>, icmp: &Icmp4) -> Self {
         match icmp.icmp_type() {
-            Icmpv4Type::EchoRequest(echo_header) | Icmpv4Type::EchoReply(echo_header) => {
-                IcmpProtoKey::QueryMsgData(echo_header.id)
-            }
-            Icmpv4Type::TimeExceeded(_) | Icmpv4Type::DestinationUnreachable(_) => {
+            Icmp4Type::EchoRequest(v) => IcmpProtoKey::QueryMsgData(v.id),
+            Icmp4Type::EchoReply(v) => IcmpProtoKey::QueryMsgData(v.id),
+            Icmp4Type::TimeExceeded(_) | Icmp4Type::DestUnreachable(_) => {
                 IcmpProtoKey::ErrorMsgData(EmbeddedPacketData::try_from_packet(packet))
             }
             _ => IcmpProtoKey::Unsupported,
@@ -319,12 +319,10 @@ impl IcmpProtoKey {
     }
 
     fn new_icmp_v6<Buf: PacketBufferMut>(packet: &Packet<Buf>, icmp: &Icmp6) -> Self {
-        #[allow(clippy::match_single_binding)]
         match icmp.icmp_type() {
-            Icmpv6Type::EchoRequest(echo_header) | Icmpv6Type::EchoReply(echo_header) => {
-                IcmpProtoKey::QueryMsgData(echo_header.id)
-            }
-            Icmpv6Type::TimeExceeded(_) | Icmpv6Type::DestinationUnreachable(_) => {
+            Icmp6Type::EchoRequest(v) => IcmpProtoKey::QueryMsgData(v.id),
+            Icmp6Type::EchoReply(v) => IcmpProtoKey::QueryMsgData(v.id),
+            Icmp6Type::TimeExceeded(_) | Icmp6Type::DestUnreachable(_) => {
                 IcmpProtoKey::ErrorMsgData(EmbeddedPacketData::try_from_packet(packet))
             }
             _ => IcmpProtoKey::Unsupported,
@@ -1029,20 +1027,20 @@ mod tests {
                 })),
                 // To keep in sync with IcmpProtoKey::new_icmp_v4()
                 Transport::Icmp4(icmp) => match icmp.icmp_type() {
-                    Icmpv4Type::EchoRequest(_) | Icmpv4Type::EchoReply(_) => Some(
-                        IpProtoKey::Icmp(IcmpProtoKey::QueryMsgData(driver.produce()?)),
-                    ),
-                    Icmpv4Type::DestinationUnreachable(_) | Icmpv4Type::TimeExceeded(_) => {
+                    Icmp4Type::EchoRequest(_) | Icmp4Type::EchoReply(_) => Some(IpProtoKey::Icmp(
+                        IcmpProtoKey::QueryMsgData(driver.produce()?),
+                    )),
+                    Icmp4Type::DestUnreachable(_) | Icmp4Type::TimeExceeded(_) => {
                         Some(IpProtoKey::Icmp(IcmpProtoKey::ErrorMsgData(None)))
                     }
                     _ => Some(IpProtoKey::Icmp(IcmpProtoKey::Unsupported)),
                 },
                 // To keep in sync with IcmpProtoKey::new_icmp_v6()
                 Transport::Icmp6(icmp) => match icmp.icmp_type() {
-                    Icmpv6Type::EchoRequest(_) | Icmpv6Type::EchoReply(_) => Some(
-                        IpProtoKey::Icmp(IcmpProtoKey::QueryMsgData(driver.produce()?)),
-                    ),
-                    Icmpv6Type::DestinationUnreachable(_) | Icmpv6Type::TimeExceeded(_) => {
+                    Icmp6Type::EchoRequest(_) | Icmp6Type::EchoReply(_) => Some(IpProtoKey::Icmp(
+                        IcmpProtoKey::QueryMsgData(driver.produce()?),
+                    )),
+                    Icmp6Type::DestUnreachable(_) | Icmp6Type::TimeExceeded(_) => {
                         Some(IpProtoKey::Icmp(IcmpProtoKey::ErrorMsgData(None)))
                     }
                     _ => Some(IpProtoKey::Icmp(IcmpProtoKey::Unsupported)),
