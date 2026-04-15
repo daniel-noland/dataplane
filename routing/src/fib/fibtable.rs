@@ -141,6 +141,8 @@ impl FibTableWriter {
     pub fn unregister_vni(&mut self, vni: Vni) {
         self.0.append(FibTableChange::UnRegisterVni(vni));
         self.0.publish();
+        self.0.append(FibTableChange::UnRegisterVni(vni));
+        self.0.publish();
     }
     pub fn del_fib(&mut self, vrfid: VrfId, vni: Option<Vni>) {
         let fibid = FibKey::from_vrfid(vrfid);
@@ -148,6 +150,8 @@ impl FibTableWriter {
         if let Some(vni) = vni {
             self.0.append(FibTableChange::UnRegisterVni(vni));
         }
+        self.0.publish();
+        self.0.append(FibTableChange::Del(fibid));
         self.0.publish();
     }
 }
@@ -208,7 +212,7 @@ impl ReadHandleProvider for FibTable {
         &self,
     ) -> (
         u64,
-        impl Iterator<Item = (FibKey, &ReadHandleFactory<Fib>, FibKey)>,
+        impl Iterator<Item = (Self::Key, &ReadHandleFactory<Fib>, Self::Key)>,
     ) {
         let iter = self
             .entries

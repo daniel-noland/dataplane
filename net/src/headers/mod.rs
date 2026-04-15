@@ -12,9 +12,9 @@ use crate::icmp4::Icmp4;
 use crate::icmp6::{Icmp6, Icmp6ChecksumPayload};
 use crate::impl_from_for_enum;
 use crate::ip::{NextHeader, UnicastIpAddr};
-use crate::ip_auth::IpAuth;
+use crate::ip_auth::{Ipv4Auth, Ipv6Auth};
 use crate::ipv4::Ipv4;
-use crate::ipv6::{Ipv6, Ipv6Ext};
+use crate::ipv6::{DestOpts, Fragment, HopByHop, Ipv6, Routing};
 use crate::parse::{
     DeParse, DeParseError, IllegalBufferLength, IntoNonZeroUSize, LengthError, Parse, ParseError,
     Reader, Writer,
@@ -39,11 +39,16 @@ mod accessor_macros;
 mod embedded;
 pub use embedded::*;
 
+pub(crate) mod within;
+pub use within::{EmbeddedStart, Within};
+
+pub mod pat;
+
 #[cfg(any(test, feature = "builder"))]
 pub mod builder;
 
 const MAX_VLANS: usize = 4;
-const MAX_NET_EXTENSIONS: usize = 2;
+const MAX_NET_EXTENSIONS: usize = 3;
 
 /// A parsed set of network packet headers.
 ///
@@ -162,8 +167,18 @@ impl DeParse for Net {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetExt {
-    IpAuth(IpAuth),
-    Ipv6Ext(Ipv6Ext),
+    /// IPv6 Hop-by-Hop Options (RFC 8200 section 4.3).
+    HopByHop(HopByHop),
+    /// IPv6 Destination Options (RFC 8200 section 4.6).
+    DestOpts(DestOpts),
+    /// IPv6 Routing Header (RFC 8200 section 4.4).
+    Routing(Routing),
+    /// IPv6 Fragment Header (RFC 8200 section 4.5).
+    Fragment(Fragment),
+    /// IP Authentication Header in IPv4 context (RFC 4302).
+    Ipv4Auth(Ipv4Auth),
+    /// IP Authentication Header in IPv6 context (RFC 4302).
+    Ipv6Auth(Ipv6Auth),
 }
 
 impl DeParse for NetExt {
@@ -171,15 +186,23 @@ impl DeParse for NetExt {
 
     fn size(&self) -> NonZero<u16> {
         match self {
-            NetExt::IpAuth(auth) => auth.size(),
-            NetExt::Ipv6Ext(ext) => ext.size(),
+            NetExt::HopByHop(h) => h.size(),
+            NetExt::DestOpts(h) => h.size(),
+            NetExt::Routing(h) => h.size(),
+            NetExt::Fragment(h) => h.size(),
+            NetExt::Ipv4Auth(h) => h.size(),
+            NetExt::Ipv6Auth(h) => h.size(),
         }
     }
 
     fn deparse(&self, buf: &mut [u8]) -> Result<NonZero<u16>, DeParseError<Self::Error>> {
         match self {
-            NetExt::IpAuth(auth) => auth.deparse(buf),
-            NetExt::Ipv6Ext(ext) => ext.deparse(buf),
+            NetExt::HopByHop(h) => h.deparse(buf),
+            NetExt::DestOpts(h) => h.deparse(buf),
+            NetExt::Routing(h) => h.deparse(buf),
+            NetExt::Fragment(h) => h.deparse(buf),
+            NetExt::Ipv4Auth(h) => h.deparse(buf),
+            NetExt::Ipv6Auth(h) => h.deparse(buf),
         }
     }
 }
@@ -400,6 +423,7 @@ impl DeParse for Transport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Header {
     Eth(Eth),
     Vlan(Vlan),
@@ -409,28 +433,33 @@ pub enum Header {
     Udp(Udp),
     Icmp4(Icmp4),
     Icmp6(Icmp6),
-    IpAuth(IpAuth),
-    IpV6Ext(Ipv6Ext), // TODO: break out nested enum.  Nesting is counter productive here
+    HopByHop(HopByHop),
+    DestOpts(DestOpts),
+    Routing(Routing),
+    Fragment(Fragment),
+    Ipv4Auth(Ipv4Auth),
+    Ipv6Auth(Ipv6Auth),
     Encap(UdpEncap),
     EmbeddedIp(EmbeddedHeaders),
 }
 
 impl Header {
     fn parse_payload(&self, cursor: &mut Reader) -> Option<Header> {
-        use Header::{
-            EmbeddedIp, Encap, Eth, Icmp4, Icmp6, IpAuth, IpV6Ext, Ipv4, Ipv6, Tcp, Udp, Vlan,
-        };
         match self {
-            Eth(eth) => eth.parse_payload(cursor).map(Header::from),
-            Vlan(vlan) => vlan.parse_payload(cursor).map(Header::from),
-            Ipv4(ipv4) => ipv4.parse_payload(cursor).map(Header::from),
-            Ipv6(ipv6) => ipv6.parse_payload(cursor).map(Header::from),
-            IpAuth(auth) => auth.parse_payload(cursor).map(Header::from),
-            IpV6Ext(ext) => ext.parse_payload(cursor).map(Header::from),
-            Icmp4(icmp4) => icmp4.parse_payload(cursor).map(Header::from),
-            Icmp6(icmp6) => icmp6.parse_payload(cursor).map(Header::from),
-            Udp(udp) => udp.parse_payload(cursor).map(Header::from),
-            Encap(_) | Tcp(_) | EmbeddedIp(_) => None,
+            Header::Eth(eth) => eth.parse_payload(cursor).map(Header::from),
+            Header::Vlan(vlan) => vlan.parse_payload(cursor).map(Header::from),
+            Header::Ipv4(ipv4) => ipv4.parse_payload(cursor).map(Header::from),
+            Header::Ipv6(ipv6) => ipv6.parse_payload(cursor).map(Header::from),
+            Header::Ipv4Auth(auth) => auth.parse_payload(cursor),
+            Header::Ipv6Auth(auth) => auth.parse_payload(cursor),
+            Header::HopByHop(h) => h.parse_payload(cursor),
+            Header::DestOpts(h) => h.parse_payload(cursor),
+            Header::Routing(h) => h.parse_payload(cursor),
+            Header::Fragment(h) => h.parse_payload(cursor),
+            Header::Icmp4(icmp4) => icmp4.parse_payload(cursor).map(Header::from),
+            Header::Icmp6(icmp6) => icmp6.parse_payload(cursor).map(Header::from),
+            Header::Udp(udp) => udp.parse_payload(cursor).map(Header::from),
+            Header::Encap(_) | Header::Tcp(_) | Header::EmbeddedIp(_) => None,
         }
     }
 }
@@ -451,6 +480,17 @@ impl Parse for Headers {
             udp_encap: None,
             embedded_ip: None,
         };
+        // TODO: after parsing, validate RFC 8200 section 4.1 extension header
+        // ordering constraints (e.g. HopByHop must be first and appear at most
+        // once, DestOpts may appear at most twice, etc.).  The parser currently
+        // accepts any ordering from the wire.  A validate() method or post-parse
+        // check would catch malformed chains without rejecting packets outright.
+        //
+        // TODO: consider returning a parse error instead of silently stopping
+        // when MAX_NET_EXTENSIONS is exceeded.  The current `break` exits the
+        // entire parse loop, so transport and embedded headers that follow the
+        // overflow point are also not parsed.  This matches the MAX_VLANS
+        // handling but the caller has no way to detect a partial parse.
         let mut prior = Header::Eth(eth);
         loop {
             let header = prior.parse_payload(&mut cursor);
@@ -470,16 +510,44 @@ impl Parse for Headers {
                         break;
                     }
                 }
-                Header::IpAuth(auth) => {
+                Header::HopByHop(h) => {
                     if this.net_ext.len() < MAX_NET_EXTENSIONS {
-                        this.net_ext.push(NetExt::IpAuth(auth));
+                        this.net_ext.push(NetExt::HopByHop(h));
                     } else {
                         break;
                     }
                 }
-                Header::IpV6Ext(ext) => {
+                Header::DestOpts(h) => {
                     if this.net_ext.len() < MAX_NET_EXTENSIONS {
-                        this.net_ext.push(NetExt::Ipv6Ext(ext));
+                        this.net_ext.push(NetExt::DestOpts(h));
+                    } else {
+                        break;
+                    }
+                }
+                Header::Routing(h) => {
+                    if this.net_ext.len() < MAX_NET_EXTENSIONS {
+                        this.net_ext.push(NetExt::Routing(h));
+                    } else {
+                        break;
+                    }
+                }
+                Header::Fragment(h) => {
+                    if this.net_ext.len() < MAX_NET_EXTENSIONS {
+                        this.net_ext.push(NetExt::Fragment(h));
+                    } else {
+                        break;
+                    }
+                }
+                Header::Ipv4Auth(h) => {
+                    if this.net_ext.len() < MAX_NET_EXTENSIONS {
+                        this.net_ext.push(NetExt::Ipv4Auth(h));
+                    } else {
+                        break;
+                    }
+                }
+                Header::Ipv6Auth(h) => {
+                    if this.net_ext.len() < MAX_NET_EXTENSIONS {
+                        this.net_ext.push(NetExt::Ipv6Auth(h));
                     } else {
                         break;
                     }
@@ -912,8 +980,12 @@ impl_from_for_enum![
     Udp(Udp),
     Icmp4(Icmp4),
     Icmp6(Icmp6),
-    IpAuth(IpAuth),
-    IpV6Ext(Ipv6Ext),
+    HopByHop(HopByHop),
+    DestOpts(DestOpts),
+    Routing(Routing),
+    Fragment(Fragment),
+    Ipv4Auth(Ipv4Auth),
+    Ipv6Auth(Ipv6Auth),
     Encap(UdpEncap),
     EmbeddedIp(EmbeddedHeaders),
 ];
@@ -1296,7 +1368,9 @@ mod test {
         use crate::eth::mac::{DestinationMac, Mac, SourceMac};
         use crate::headers::{Headers, HeadersBuilder, Net, Transport};
         use crate::icmp4::Icmp4;
+        use crate::icmp4::{Icmp4EchoRequest, Icmp4Type};
         use crate::icmp6::Icmp6;
+        use crate::icmp6::{Icmp6EchoRequest, Icmp6Type};
         use crate::ip::NextHeader;
         use crate::ip::dscp::Dscp;
         use crate::ip::ecn::Ecn;
@@ -1305,7 +1379,6 @@ mod test {
         use crate::parse::DeParse;
         use crate::tcp::Tcp;
         use crate::udp::Udp;
-        use etherparse::{IcmpEchoHeader, Icmpv4Type, Icmpv6Type};
         use std::net::{Ipv4Addr, Ipv6Addr};
 
         pub(super) fn eth(ethertype: EthType) -> Eth {
@@ -1358,14 +1431,14 @@ mod test {
 
         pub(super) fn icmp4() -> Icmp4 {
             let mut icmp4 =
-                Icmp4::with_type(Icmpv4Type::EchoRequest(IcmpEchoHeader { id: 18, seq: 2 }));
+                Icmp4::with_type(Icmp4Type::EchoRequest(Icmp4EchoRequest { id: 18, seq: 2 }));
             icmp4.set_checksum(1234.into()).unwrap();
             icmp4
         }
 
         pub(super) fn icmp6() -> Icmp6 {
             let mut icmp6 =
-                Icmp6::with_type(Icmpv6Type::EchoRequest(IcmpEchoHeader { id: 18, seq: 2 }));
+                Icmp6::with_type(Icmp6Type::EchoRequest(Icmp6EchoRequest { id: 18, seq: 2 }));
             icmp6.set_checksum(1234.into()).unwrap();
             icmp6
         }
@@ -1963,8 +2036,8 @@ mod test {
             "expected one IPv6 extension header"
         );
         assert!(
-            matches!(headers.net_ext[0], super::NetExt::Ipv6Ext(_)),
-            "expected Ipv6Ext variant in net_ext"
+            matches!(headers.net_ext[0], super::NetExt::HopByHop(_)),
+            "expected HopByHop variant in net_ext"
         );
 
         // IPv6 and TCP should be present.
