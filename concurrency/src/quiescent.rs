@@ -55,28 +55,13 @@ impl Domain {
 
     fn register(&self) -> Epoch {
         let epoch = Epoch::new();
-        let guard = self.active.lock();
-        // Loom still exposes `LockResult<MutexGuard>` raw; the
-        // poison-as-panic wrapper for loom lands in a subsequent PR
-        // and drops this `.expect`.
-        #[cfg(feature = "loom")]
-        #[allow(clippy::expect_used)]
-        // the mutex is poisoned only in unrecoverable error cases
-        let mut guard = guard.expect("qsbr mutex poisoned");
-        #[cfg(not(feature = "loom"))]
-        let mut guard = guard;
+        let mut guard = self.active.lock();
         guard.push(Arc::clone(&epoch.cell));
         epoch
     }
 
     fn min_observed(&self) -> Option<Version> {
-        let guard = self.active.lock();
-        #[cfg(feature = "loom")]
-        #[allow(clippy::expect_used)]
-        // the mutex is poisoned only in unrecoverable error cases
-        let mut active = guard.expect("qsbr mutex poisoned");
-        #[cfg(not(feature = "loom"))]
-        let mut active = guard;
+        let mut active = self.active.lock();
         let mut min = u64::MAX;
         let mut any_in_flight = false;
         active.retain(|cell| {
@@ -211,18 +196,17 @@ impl Version {
             // LCOV_EXCL_START - reaching this path is itself the failure;
             // chasing coverage of it is absurd.  See the comment below.
             core::hint::cold_path();
-            #[allow(clippy::panic)]
-            {
-                // This whole path is technically reachable, but only technically.
-                // If you got config updates 1B times per second on average it would
-                // still take 584 years to wrap around.  Even that requires us to receive
-                // and process config updates faster than the line rate of an 800Gb/s NIC.
-                // For hundreds of years.  With no reboot.
-                //
-                // The only realistic way to reach this point is via a bug in this code,
-                // not via normal operation.
-                panic!("Version wrapped!  This is a bug");
-            }
+            // This whole path is technically reachable, but only technically.
+            // If you got config updates 1B times per second on average it would
+            // still take 584 years to wrap around.  Even that requires us to receive
+            // and process config updates faster than the line rate of an 800Gb/s NIC.
+            // For hundreds of years.  With no reboot.
+            //
+            // The only realistic way to reach this point is via a bug in this code,
+            // not via normal operation -- this is exactly what `unreachable!()` is
+            // for per development/programming-rules/error-handling.md. The
+            // formatting variant is non-const, so we use the bare form.
+            unreachable!()
             // LCOV_EXCL_STOP
         }
     }

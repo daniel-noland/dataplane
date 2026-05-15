@@ -15,10 +15,7 @@
 ///     }
 /// }
 /// ```
-#[cfg(all(
-    any(feature = "shuttle", feature = "shuttle_pct", feature = "shuttle_dfs"),
-    not(feature = "silence_clippy")
-))]
+#[cfg(all(feature = "shuttle", not(feature = "silence_clippy")))]
 #[macro_export]
 macro_rules! with_shuttle {
     ($($item:item)*) => {
@@ -42,10 +39,7 @@ macro_rules! with_shuttle {
 ///     }
 /// }
 /// ```
-#[cfg(any(
-    not(any(feature = "shuttle", feature = "shuttle_pct", feature = "shuttle_dfs")),
-    feature = "silence_clippy"
-))]
+#[cfg(any(not(feature = "shuttle"), feature = "silence_clippy"))]
 #[macro_export]
 macro_rules! with_shuttle {
     ($($item:item)*) => {};
@@ -109,12 +103,7 @@ macro_rules! with_loom {
 ///     }
 /// }
 /// ```
-#[cfg(not(any(
-    feature = "loom",
-    feature = "shuttle",
-    feature = "shuttle_pct",
-    feature = "shuttle_dfs"
-)))]
+#[cfg(not(any(feature = "loom", feature = "shuttle")))]
 #[macro_export]
 macro_rules! with_std {
     ($($item:item)*) => {
@@ -164,16 +153,11 @@ macro_rules! with_std {
 /// ```
 #[cfg(all(
     not(feature = "silence_clippy"),
-    any(
-        feature = "loom",
-        feature = "shuttle",
-        feature = "shuttle_pct",
-        feature = "shuttle_dfs"
-    )
+    any(feature = "loom", feature = "shuttle")
 ))]
 #[macro_export]
 macro_rules! with_std {
     ($($item:item)*) => {};
 }
 
-pub use concurrency_macros::concurrency_mode;
+pub use concurrency_macros::{concurrency_mode, test};

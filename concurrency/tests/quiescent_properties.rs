@@ -29,12 +29,7 @@
 
 // Single-threaded bolero property tests; only meaningful under the
 // default backend.  Same rationale as in `quiescent_protocol.rs`.
-#![cfg(not(any(
-    feature = "loom",
-    feature = "shuttle",
-    feature = "shuttle_pct",
-    feature = "shuttle_dfs"
-)))]
+#![cfg(not(any(feature = "loom", feature = "shuttle")))]
 
 use bolero::TypeGenerator;
 use dataplane_concurrency::quiescent::channel;

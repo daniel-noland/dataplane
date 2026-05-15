@@ -15,6 +15,17 @@
 //! protocol -- atomic publish, atomic load -- which is all the model
 //! checker needs to see.
 //!
+//! **Important coverage limit.** Model-checker tests that go through
+//! `Slot` / `SlotOption` exercise the *protocol* of a single-slot
+//! atomic publication: one writer swaps, readers see either old or
+//! new, no torn read.  They do *not* exercise `arc_swap`'s internal
+//! hazard-pointer machinery, which is what the production path
+//! actually runs.  A bug inside `arc_swap` itself (e.g. a missed
+//! retire, an incorrect epoch comparison) cannot surface under loom
+//! or shuttle here.  If you want coverage of `arc_swap`'s internals,
+//! the miri job (which runs against the real `ArcSwap` in
+//! permissive-provenance mode) is where it lives.
+//!
 //! [`Subscriber::snapshot`]: crate::Subscriber::snapshot
 
 // Strict provenance checks fail with arc-swap since it uses hazard pointers and does not (yet) use the new
@@ -22,22 +33,8 @@
 // As a result, we can still check for provenance violations in this crate, but only with the Mutex based
 // fallback implementation.
 cfg_select! {
-    any(feature = "loom", feature = "shuttle", feature = "shuttle_pct", feature = "shuttle_dfs", feature = "_strict_provenance") => {
+    any(feature = "loom", feature = "shuttle", feature = "_strict_provenance") => {
         use crate::sync::{Arc, Mutex};
-
-        // Loom still exposes `LockResult`-shaped `.lock()`; the wrapped
-        // backends (shuttle, _strict_provenance) return naked guards.
-        // PR 6 wraps loom too and drops this helper.
-        macro_rules! unwrap_lock {
-            ($guard:expr) => {{
-                #[cfg(feature = "loom")]
-                #[allow(clippy::expect_used)] // poisoned only in unrecoverable cases
-                let g = $guard.expect("slot mutex poisoned");
-                #[cfg(not(feature = "loom"))]
-                let g = $guard;
-                g
-            }};
-        }
 
         pub struct Slot<T>(Mutex<Arc<T>>);
 
@@ -52,17 +49,17 @@ cfg_select! {
             }
 
             pub fn load_full(&self) -> Arc<T> {
-                let guard = unwrap_lock!(self.0.lock());
+                let guard = self.0.lock();
                 Arc::clone(&*guard)
             }
 
             pub fn swap(&self, new: Arc<T>) -> Arc<T> {
-                let mut guard = unwrap_lock!(self.0.lock());
+                let mut guard = self.0.lock();
                 core::mem::replace(&mut *guard, new)
             }
 
             pub fn store(&self, new: Arc<T>) {
-                let mut guard = unwrap_lock!(self.0.lock());
+                let mut guard = self.0.lock();
                 *guard = new;
             }
         }
@@ -88,17 +85,17 @@ cfg_select! {
             }
 
             pub fn load_full(&self) -> Option<Arc<T>> {
-                let guard = unwrap_lock!(self.0.lock());
+                let guard = self.0.lock();
                 guard.as_ref().map(Arc::clone)
             }
 
             pub fn swap(&self, new: Option<Arc<T>>) -> Option<Arc<T>> {
-                let mut guard = unwrap_lock!(self.0.lock());
+                let mut guard = self.0.lock();
                 core::mem::replace(&mut *guard, new)
             }
 
             pub fn store(&self, new: Option<Arc<T>>) {
-                let mut guard = unwrap_lock!(self.0.lock());
+                let mut guard = self.0.lock();
                 *guard = new;
             }
         }

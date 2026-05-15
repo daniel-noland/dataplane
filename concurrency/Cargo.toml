@@ -20,11 +20,17 @@ parking_lot = ["dep:parking_lot"]
 #                      exhaustive small-state exploration.
 #
 # All three share the same `dep:shuttle` machinery; only the scheduler
-# selected at runtime differs.  See the `concurrency_mode` macro and
-# `concurrency::stress` (added in a later PR) for the dispatch.
+# selected at runtime differs.  See `concurrency::stress` for the
+# dispatch and the `#[concurrency::test]` attribute macro for the
+# write-once-run-everywhere wrapper.
+#
+# The features form a chain (`shuttle_dfs` -> `shuttle_pct` -> `shuttle`)
+# so that any `feature = "shuttle"` cfg check is true under all three
+# variants.  cfg_select-style precedence (most-specific first) still
+# picks the right scheduler.  See `concurrency::stress`.
 shuttle = ["dep:shuttle", "concurrency-macros/shuttle"]
-shuttle_pct = ["dep:shuttle", "concurrency-macros/shuttle"]
-shuttle_dfs = ["dep:shuttle", "concurrency-macros/shuttle"]
+shuttle_pct = ["shuttle"]
+shuttle_dfs = ["shuttle_pct"]
 silence_clippy = ["concurrency-macros/silence_clippy"] # Do not manually enable this feature, let --all-features do it for you
 # Force the Mutex-based slot fallback even without a model checker.
 # Intended for the CI miri job that exercises the fallback slot under
