@@ -697,6 +697,13 @@ jobs:
     # "summary" itself to be skipped.
     if: ${{ always() }}
     steps:
+      # Required by the local `./.github/actions/sticky-pr-comment` use
+      # below: composite actions can only run from a checked-out tree.
+      - name: "Checkout"
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: "actions/checkout@v6"
+        with:
+          persist-credentials: "false"
       - name: "Flag any check matrix failures"
         if: ${{ needs.check.result != 'success' && needs.check.result != 'skipped' }}
         run: |
@@ -737,14 +744,41 @@ jobs:
         run: |
           echo '::error:: Some vlab job(s) failed'
           exit 1
-      # Cross is advisory (continue-on-error), so don't exit 1 here --
-      # surface a sticky PR comment instead.
+      # Cross is advisory (continue-on-error at the job level), so don't
+      # exit 1 here -- surface a sticky PR comment instead.  We can't gate
+      # on `needs.cross.result`: at the job level, `continue-on-error: true`
+      # masks the result to `success` for dependents.  Ask the API for the
+      # actual per-matrix-cell conclusions instead.
+      - name: "Detect cross failures"
+        id: "cross_status"
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: "actions/github-script@v8"
+        env:
+          RUN_ID: "${{ github.run_id }}"
+        with:
+          script: |
+            const jobs = await github.paginate(
+              github.rest.actions.listJobsForWorkflowRun,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: Number(process.env.RUN_ID),
+                per_page: 100,
+              },
+            );
+            // Cross matrix cell names follow the job's `name:` template:
+            // `${matrix.recipe.name}/${matrix.recipe.args}/${matrix.platform}/${matrix.libc}`.
+            // Today `matrix.recipe.name` is always `build-container`; if that
+            // changes, broaden the predicate.
+            const cross = jobs.filter(j => j.name.startsWith('build-container/'));
+            const failed = cross.filter(j => j.conclusion === 'failure');
+            core.info(`cross matrix: ${cross.length} cells, ${failed.length} failed`);
+            core.setOutput('any_failed', failed.length > 0 ? 'true' : 'false');
       - name: "Surface cross failures via sticky PR comment"
         if: >-
           ${{
             github.event_name == 'pull_request'
-            && needs.cross.result != 'success'
-            && needs.cross.result != 'skipped'
+            && steps.cross_status.outputs.any_failed == 'true'
           }}
         uses: "./.github/actions/sticky-pr-comment"
         with:
