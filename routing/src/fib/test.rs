@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn test_concurrency_fib() {
         const NUM_PACKETS: u64 = cfg_select! {
-            miri => 50,
+            emulated => 50,
             _ => 100_000,
         };
         const NUM_WORKERS: u16 = 4;
@@ -254,7 +254,7 @@ mod tests {
         // number of threads looking up fibtable
         const NUM_WORKERS: u16 = 6;
         const NUM_PACKETS: u64 = cfg_select! {
-            miri => 30,
+            emulated => 30,
             _ => 100_000,
         };
         const TENTH: u64 = NUM_PACKETS / 10;
@@ -281,7 +281,7 @@ mod tests {
             let handle = Builder::new()
                 .name(format!("WORKER-{n}"))
                 .spawn(move || {
-                    #[cfg(not(miri))]
+                    #[cfg(not(emulated))]
                     println!("Worker-{n} started");
                     let mut rng = rand::rng();
                     let mut packet = test_packet();
@@ -317,7 +317,7 @@ mod tests {
                             nofibs += 1;
                         }
                     }
-                    #[cfg(not(miri))]
+                    #[cfg(not(emulated))]
                     {
                         println!("=== Worker {n} finished ====");
                         println!("Stats:");
@@ -429,7 +429,7 @@ mod tests {
         let mut iterations = 0;
         loop {
             const MAX_ITERATIONS: usize = cfg_select! {
-                miri => 50,
+                emulated => 50,
                 _ => 1000,
             };
             let fibw = fibtw.add_fib(vrfid, None);
@@ -481,7 +481,7 @@ mod tests {
 
         const NUM_WORKERS: u16 = 6;
         const ITERATIONS: usize = cfg_select! {
-            miri => 50,
+            emulated => 50,
             _ => 5_000,
         };
 
