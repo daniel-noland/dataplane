@@ -675,6 +675,10 @@ jobs:
   summary:
     name: "Summary"
     runs-on: "ubuntu-latest"
+    # `pull-requests: write` is for the "Surface cross failures" step.
+    permissions:
+      contents: "read"
+      pull-requests: "write"
     needs:
       - check
       - sanitize
@@ -733,6 +737,22 @@ jobs:
         run: |
           echo '::error:: Some vlab job(s) failed'
           exit 1
+      # Cross is advisory (continue-on-error), so don't exit 1 here --
+      # surface a sticky PR comment instead.
+      - name: "Surface cross failures via sticky PR comment"
+        if: >-
+          ${{
+            github.event_name == 'pull_request'
+            && needs.cross.result != 'success'
+            && needs.cross.result != 'skipped'
+          }}
+        uses: "./.github/actions/sticky-pr-comment"
+        with:
+          marker: "<!-- ci:dev:cross-advisory -->"
+          body: |
+            ## :warning: Cross build advisory: failure detected :warning:
+
+            [Please investigate before merging](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
   publish:
     runs-on: lab
