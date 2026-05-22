@@ -4,7 +4,6 @@
 # Copyright Open Network Fabric Authors
 
 set -euo pipefail
-set -o allexport
 
 if [ -n "${MIRI_SYSROOT:-}" ]; then
     declare miri_wrapper
@@ -32,6 +31,13 @@ shift
 
 if [ "${host_machine}" = "${target_machine}" ] && [ "${host_kernel_name}" = "linux" ]; then
     exec "${@}"
-else
-    exec "qemu-${target_machine}" "${@}"
 fi
+
+declare -r qemu="qemu-${target_machine}"
+if ! command -v "${qemu}" > /dev/null; then
+    echo "test-runner.sh: ${qemu} not found on PATH." >&2
+    echo "  Host is ${host_kernel_name}/${host_machine}; target is ${target_machine}." >&2
+    echo "  Inside the nix dev shell qemu-user provides this; outside, install it manually." >&2
+    exit 1
+fi
+exec "${qemu}" "${@}"

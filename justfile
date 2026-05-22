@@ -157,7 +157,24 @@ pre-flight: (check-dependencies) (fmt "--check") (test) (lint) (doctest)
 test package="tests.all" *args: (build (if package == "tests.all" { "tests.all" } else { "tests.pkg." + package }) args)
     {{ _just_debuggable_ }}
     declare -r target="{{ if package == "tests.all" { "tests.all" } else { "tests.pkg." + package } }}"
-    cargo nextest run --archive-file results/${target}/*.tar.zst --workspace-remap $(pwd) {{ filter }}
+    declare target_arch
+    case "{{ platform }}" in
+        aarch64|bluefield2|bluefield3) target_arch=aarch64 ;;
+        x86-64-v3|x86-64-v4|zen3|zen4|zen5) target_arch=x86_64 ;;
+        wasm32-wasip1) target_arch=wasm32 ;;
+        *) target_arch=unknown ;;
+    esac
+    declare -r target_arch
+    declare -a nextest_args=()
+    # When target_arch differs from the host arch, scripts/test-runner.sh
+    # dispatches the binary through qemu-user; nextest's `cross-qemu` profile
+    # raises the slow-timeout + kills runaway tests so a qemu hang surfaces
+    # as a TIMEOUT instead of wedging the run.  wasm tests don't use nextest
+    # archives (they go through the `check`/wasmtime path), so skip them.
+    if [ "$(uname -m)" != "${target_arch}" ] && [ "${target_arch}" != "wasm32" ]; then
+        nextest_args+=("--profile=cross-qemu")
+    fi
+    cargo nextest run "${nextest_args[@]}" --archive-file results/${target}/*.tar.zst --workspace-remap $(pwd) {{ filter }}
 
 [script]
 build-each *args: (build "workspace" args)
