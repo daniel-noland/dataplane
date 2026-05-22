@@ -576,6 +576,8 @@ mod tests {
         // deadline gets passed too. Fixing this would require running on tokio's paused
         // clock, but the per-flow timer task uses tokio::time::Instant::from_std on a
         // wall-clock std deadline; mixing virtual and real instants is messy. Revisit.
+        // qemu-user's slowdown is much smaller than miri's, so the 1s slack between the
+        // 3s deadline and the 4s sleep holds in practice; only miri actually misses it.
         #[cfg_attr(
             miri,
             ignore = "wall-clock sleep + std::Instant deadlines don't survive miri"

@@ -1167,10 +1167,12 @@ mod tests {
 
     // TODO: under cross-aarch64, bindgen sees RESULTS_MULTIPLIER as 1
     // (vs 4 on x86_64), so the "non-multiple" branch is unreachable.
-    // Root cause is in our DPDK binding, not this validator.
+    // Root cause is in our DPDK binding, not this validator.  Scope the
+    // ignore to emulated runs so native aarch64 hosts (when we add them)
+    // still exercise this test.
     #[test]
     #[cfg_attr(
-        target_arch = "aarch64",
+        all(target_arch = "aarch64", emulated),
         ignore = "RESULTS_MULTIPLIER binds to 1 under cross-aarch64; see TODO"
     )]
     fn misaligned_categories_rejected() {
