@@ -70,7 +70,9 @@ pub mod diff_buffer;
 pub mod generation;
 pub mod head;
 pub mod layer;
+pub mod lookup;
 pub mod merge;
+pub mod projection;
 pub mod upsert;
 
 /// Reusable property-test harness for cascade-related traits.
@@ -87,5 +89,7 @@ pub use diff_buffer::DiffBuffer;
 pub use generation::Generation;
 pub use head::MutableHead;
 pub use layer::{Layer, Outcome};
+pub use lookup::Lookup;
 pub use merge::MergeInto;
+pub use projection::Projection;
 pub use upsert::{LastWriteWins, Upsert};
