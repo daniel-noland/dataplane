@@ -44,10 +44,12 @@
 //! # Reader model
 //!
 //! Data-plane readers load `Arc<Head>` once via [`Cascade::head`]
-//! and walk the chain.  Each layer answers with an [`Outcome`]:
-//! [`Match`](Outcome::Match) stops the cascade with a hit,
-//! [`Continue`](Outcome::Continue) falls through, [`Forbid`](Outcome::Forbid)
-//! stops the cascade with no match (the generalised tombstone).
+//! and walk the chain.  Each layer is a [`Lookup`]: it returns
+//! `Some(&a)` to stop the walk with a hit, `None` to fall through to
+//! the next layer.  "Tombstones" -- explicit not-present markers --
+//! live in the [`Action`](MutableHead::Action) type itself (e.g.
+//! wrapping it in [`Option`], or using an enum variant); the cascade
+//! does not interpret them, it just stops on the first `Some`.
 //!
 //! # Writer model
 //!
@@ -69,7 +71,6 @@ pub mod cascade;
 pub mod diff_buffer;
 pub mod generation;
 pub mod head;
-pub mod layer;
 pub mod lookup;
 pub mod merge;
 pub mod projection;
@@ -88,7 +89,6 @@ pub use cascade::{Cascade, DrainEvent, FrozenEntry, Snapshot};
 pub use diff_buffer::DiffBuffer;
 pub use generation::Generation;
 pub use head::MutableHead;
-pub use layer::{Layer, Outcome};
 pub use lookup::Lookup;
 pub use merge::MergeInto;
 pub use projection::Projection;

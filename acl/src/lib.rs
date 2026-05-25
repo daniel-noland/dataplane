@@ -24,7 +24,7 @@
 //!
 //! ```text
 //!   Cascade<H = AclHead, S = AclFrozen, T = AclTail>
-//!     - AclHead   : multi-writer BTreeMap, returns Continue (writes
+//!     - AclHead   : multi-writer BTreeMap, returns None (writes
 //!                   visible after the next rotate)
 //!     - AclFrozen : immutable priority-sorted Vec<AclRule>
 //!     - AclTail   : same shape as AclFrozen for now (DPDK ACL

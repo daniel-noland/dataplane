@@ -3,7 +3,7 @@
 
 //! The mutable head of the cascade.
 //!
-//! [`MutableHead`] extends [`Layer`] with the writer-facing
+//! [`MutableHead`] extends [`Lookup`] with the writer-facing
 //! capabilities: accepting concurrent writes via [`write`], reporting
 //! occupancy for drain-trigger purposes via [`approx_size`], and
 //! converting itself into an immutable frozen layer via [`freeze`].
@@ -11,7 +11,7 @@
 //! The head is the only multi-writer level in the cascade.  Frozen
 //! intermediate layers and the tail are immutable after construction.
 
-use crate::layer::Layer;
+use crate::lookup::Lookup;
 
 /// A cascade level that accepts concurrent writes.
 ///
@@ -40,20 +40,26 @@ use crate::layer::Layer;
 // typestate-parameterised type would force a sum type at every layer
 // position.  Worth revisiting if Frozen ends up structurally
 // identical to Self in practice.
-pub trait MutableHead: Layer {
+pub trait MutableHead: Lookup<<Self as MutableHead>::Key, <Self as MutableHead>::Action> {
+    /// The lookup key type the head, its frozen sibling, and the
+    /// tail all share.
+    type Key;
+    /// The lookup value type the head, its frozen sibling, and the
+    /// tail all share.
+    type Action;
     /// The user's operation type, supplied to [`write`](Self::write).
     type Op;
 
     /// The immutable layer type produced by [`freeze`](Self::freeze).
-    /// Must share the head's [`Input`](Layer::Input) and
-    /// [`Output`](Layer::Output) so the cascade can compose them.
+    /// Must share the head's [`Key`](Self::Key) and
+    /// [`Action`](Self::Action) so the cascade can compose them.
     ///
     /// The associated type is named `Frozen` (rather than the more
     /// common `Sealed`) to avoid overlap with the well-known
     /// "sealed trait" pattern -- `Sealed` is widely used as a
     /// trait name to prevent external implementations, and reusing
     /// it here as an associated type was confusing in practice.
-    type Frozen: Layer<Input = Self::Input, Output = Self::Output>;
+    type Frozen: Lookup<Self::Key, Self::Action>;
 
     /// Apply `op` to the head.  Concurrent writes against the same
     /// key are resolved by the value type's

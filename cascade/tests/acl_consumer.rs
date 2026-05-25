@@ -22,7 +22,7 @@
 //! - Match expressions are minimal: src/dst IPv4 with optional
 //!   single-port match.  Real ACL match expressions are much
 //!   richer; that does not change the cascade trait shape.
-//! - The head's [`Layer::lookup`] always returns `Continue`.  Writes
+//! - The head's [`Lookup::lookup`] always returns `None`.  Writes
 //!   become visible only after a rotation seals the head into a
 //!   sealed layer.  This works for low-rate ACL updates; high-rate
 //!   stateful tables (conntrack) will need a real head-lookup,
@@ -34,7 +34,7 @@ use concurrency::sync::Mutex;
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
-use dataplane_cascade::{Cascade, Generation, Layer, MergeInto, MutableHead, Outcome};
+use dataplane_cascade::{Cascade, Generation, Lookup, MergeInto, MutableHead};
 
 /// Tiny generation allocator for tests.  In production the manager
 /// owns this counter; tests carry their own to avoid pulling in
@@ -119,17 +119,9 @@ impl AclFrozen {
     }
 }
 
-impl Layer for AclFrozen {
-    type Input = Headers;
-    type Output = AclRule;
-
-    fn lookup(&self, headers: &Headers) -> Outcome<&AclRule> {
-        for rule in &self.rules {
-            if rule.matches.matches(headers) {
-                return Outcome::Match(rule);
-            }
-        }
-        Outcome::Continue
+impl Lookup<Headers, AclRule> for AclFrozen {
+    fn lookup(&self, headers: &Headers) -> Option<&AclRule> {
+        self.rules.iter().find(|r| r.matches.matches(headers))
     }
 }
 
@@ -142,7 +134,7 @@ impl Layer for AclFrozen {
 // docs: returning a borrow out of a Mutex<BTreeMap> is awkward and
 // for ACL the head-write -> read latency of "one rotation interval"
 // is acceptable.  Higher-rate consumers will need a Slot-published
-// head and probably a Layer GAT.
+// head and probably a borrowing-aware Lookup variant.
 // ---------------------------------------------------------------------------
 
 struct AclHead {
@@ -157,12 +149,9 @@ impl AclHead {
     }
 }
 
-impl Layer for AclHead {
-    type Input = Headers;
-    type Output = AclRule;
-
-    fn lookup(&self, _headers: &Headers) -> Outcome<&AclRule> {
-        Outcome::Continue
+impl Lookup<Headers, AclRule> for AclHead {
+    fn lookup(&self, _headers: &Headers) -> Option<&AclRule> {
+        None
     }
 }
 
@@ -172,6 +161,8 @@ enum AclOp {
 }
 
 impl MutableHead for AclHead {
+    type Key = Headers;
+    type Action = AclRule;
     type Op = AclOp;
     type Frozen = AclFrozen;
 
@@ -281,8 +272,8 @@ fn install_rule_takes_effect_after_rotation() {
     let mut g_alloc = GenAlloc::new();
     let pkt_22 = pkt("10.0.0.1", "10.0.0.2", 22);
 
-    // Before rotate: head holds the rule but Layer::lookup on the
-    // head always returns Continue.  Classification falls through to
+    // Before rotate: head holds the rule but Lookup::lookup on the
+    // head always returns None.  Classification falls through to
     // the tail (allow_any) and returns Allow.
     c.write(AclOp::Install(rule(
         10,
@@ -429,13 +420,14 @@ fn compact_collapses_layers_preserving_precedence() {
 // Open design questions surfaced by this slice.
 //
 // 1. Tombstones for rule removal.
-//    The cascade's `Outcome::Forbid` tombstone is keyed by the
-//    layer's `Input` type.  For an exact-match map keyed by `K`,
-//    tombstoning key `K` is well-defined: "this key is officially
-//    absent."  For ACL the lookup `Input` is packet headers and
-//    rules are identified by priority -- not by the input.
-//    Tombstoning a rule means "this RULE is gone," not "this PACKET
-//    is forbidden."
+//    Tombstoning lives in the [`Action`] type itself -- the cascade
+//    has no Forbid concept of its own.  For an exact-match map keyed
+//    by `K`, this is `Lookup<K, Option<V>>`-shaped (the head returns
+//    `Some(&None)` for a tombstoned key, which the consumer
+//    interprets as "absent").  For ACL the lookup `Key` is packet
+//    headers and rules are identified by priority -- not by the
+//    input.  Tombstoning a rule means "this RULE is gone," not
+//    "this PACKET is forbidden."
 //
 //    The acl-stack `update.rs` solution: when removing a rule, the
 //    delta layer gets a SHADOW rule with the same match expression
@@ -459,15 +451,14 @@ fn compact_collapses_layers_preserving_precedence() {
 //    Worth a follow-on session.
 //
 // 2. Head readability under high write rate.
-//    The head's `Layer::lookup` returning `Continue` here is acceptable
+//    The head's `Lookup::lookup` returning `None` here is acceptable
 //    for ACL (writes are rare, "becomes visible at next rotation"
 //    is fine).  For conntrack-shaped consumers it is NOT
 //    acceptable -- new flow entries need to be readable
 //    immediately by the same lcore that wrote them.  That probably
 //    means the head's lookup needs to return a borrow into the
-//    head's internal storage, which means Layer::Output needs to
-//    accommodate borrows that are not `&Self::Output`-tied-to-
-//    `&self`.  Hello GAT.
+//    head's internal storage, which means Lookup's value type needs
+//    to accommodate borrows that are not `&'self`-tied.  Hello GAT.
 //
 // 3. The `Op` shape feels right.
 //    `Op::Install(AclRule)` is a single-valued enum here because we

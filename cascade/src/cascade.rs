@@ -40,7 +40,7 @@ use concurrency::sync::Arc;
 
 use crate::generation::Generation;
 use crate::head::MutableHead;
-use crate::layer::{Layer, Outcome};
+use crate::lookup::Lookup;
 use crate::merge::MergeInto;
 
 /// A frozen layer paired with the [`Generation`] it was rotated under.
@@ -126,8 +126,8 @@ impl<F: core::fmt::Debug> core::fmt::Debug for DrainEvent<F> {
 pub struct Snapshot<H, F, T>
 where
     H: MutableHead<Frozen = F>,
-    F: Layer<Input = H::Input, Output = H::Output>,
-    T: Layer<Input = H::Input, Output = H::Output>,
+    F: Lookup<H::Key, H::Action>,
+    T: Lookup<H::Key, H::Action>,
 {
     head: Arc<H>,
     // TODO: there is a real case for making this
@@ -147,52 +147,39 @@ where
 impl<H, F, T> Snapshot<H, F, T>
 where
     H: MutableHead<Frozen = F>,
-    F: Layer<Input = H::Input, Output = H::Output>,
-    T: Layer<Input = H::Input, Output = H::Output>,
+    F: Lookup<H::Key, H::Action>,
+    T: Lookup<H::Key, H::Action>,
 {
     /// Walk head + every frozen layer + tail.  Returns the first
     /// definitive match.
     ///
     /// Order: head, then frozen layers newest-first, then tail.
-    /// Each layer's [`may_contain`](Layer::may_contain) is consulted
-    /// before [`lookup`](Layer::lookup) to skip layers that the
-    /// bloom hint excludes.
+    /// Each layer's [`Lookup::lookup`] is consulted in turn; the
+    /// walk stops on the first `Some`.  Layers that want to encode
+    /// "definitive not-present" do so in their
+    /// [`Action`](MutableHead::Action) type -- e.g. by returning
+    /// `Some(&Tombstone)` for a deleted key, which the consumer
+    /// then interprets as "absent."  The cascade itself does not
+    /// know about tombstones; it just stops on the first hit.
     ///
     /// Use this for software-originated packets that have no
     /// generation tag.  For hardware-classified packets carrying a
     /// generation stamp, use [`lookup_at`](Self::lookup_at) instead.
-    pub fn lookup(&self, input: &H::Input) -> Option<&H::Output> {
-        // Head first.  No bloom (the head is mutable and a filter
-        // would have to be atomic to stay coherent).
-        match self.head.lookup(input) {
-            Outcome::Match(v) => return Some(v),
-            Outcome::Forbid => return None,
-            Outcome::Continue => {}
+    pub fn lookup(&self, input: &H::Key) -> Option<&H::Action> {
+        if let Some(v) = self.head.lookup(input) {
+            return Some(v);
         }
 
         // Frozen layers, newest-first.  `frozen[0]` is the most
         // recently frozen head; `frozen[len-1]` is the oldest
         // frozen layer not yet compacted into the tail.
         for entry in self.frozen.iter() {
-            let layer = entry.layer.as_ref();
-            if !layer.may_contain(input) {
-                continue;
-            }
-            match layer.lookup(input) {
-                Outcome::Match(v) => return Some(v),
-                Outcome::Forbid => return None,
-                Outcome::Continue => {}
+            if let Some(v) = entry.layer.lookup(input) {
+                return Some(v);
             }
         }
 
-        // Tail.
-        if !self.tail.may_contain(input) {
-            return None;
-        }
-        match self.tail.lookup(input) {
-            Outcome::Match(v) => Some(v),
-            Outcome::Forbid | Outcome::Continue => None,
-        }
+        self.tail.lookup(input)
     }
 
     /// Walk frozen layers with `entry.generation <= horizon`, then
@@ -203,7 +190,7 @@ where
     /// stamps packets with the generation it classified them
     /// against, and the slow path consults that generation's view
     /// via this method.
-    pub fn lookup_at(&self, input: &H::Input, horizon: Generation) -> Option<&H::Output> {
+    pub fn lookup_at(&self, input: &H::Key, horizon: Generation) -> Option<&H::Action> {
         // No head consult: head contents are post-rotate writes
         // that are newer than any horizon by construction.
 
@@ -211,24 +198,12 @@ where
             if entry.generation > horizon {
                 continue;
             }
-            let layer = entry.layer.as_ref();
-            if !layer.may_contain(input) {
-                continue;
-            }
-            match layer.lookup(input) {
-                Outcome::Match(v) => return Some(v),
-                Outcome::Forbid => return None,
-                Outcome::Continue => {}
+            if let Some(v) = entry.layer.lookup(input) {
+                return Some(v);
             }
         }
 
-        if !self.tail.may_contain(input) {
-            return None;
-        }
-        match self.tail.lookup(input) {
-            Outcome::Match(v) => Some(v),
-            Outcome::Forbid | Outcome::Continue => None,
-        }
+        self.tail.lookup(input)
     }
 
     /// Borrow the head for direct lookup-or-write access.
@@ -287,8 +262,8 @@ const DEFAULT_DRAIN_CHANNEL_CAPACITY: usize = 16;
 pub struct Cascade<H, F, T>
 where
     H: MutableHead<Frozen = F>,
-    F: Layer<Input = H::Input, Output = H::Output>,
-    T: Layer<Input = H::Input, Output = H::Output>,
+    F: Lookup<H::Key, H::Action>,
+    T: Lookup<H::Key, H::Action>,
 {
     head: Slot<H>,
     frozen: Slot<Vec<FrozenEntry<F>>>,
@@ -303,8 +278,8 @@ where
 impl<H, F, T> Cascade<H, F, T>
 where
     H: MutableHead<Frozen = F>,
-    F: Layer<Input = H::Input, Output = H::Output>,
-    T: Layer<Input = H::Input, Output = H::Output>,
+    F: Lookup<H::Key, H::Action>,
+    T: Lookup<H::Key, H::Action>,
 {
     /// Construct a cascade with the given initial head and tail
     /// and an empty frozen vector.

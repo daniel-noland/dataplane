@@ -17,7 +17,7 @@
 use concurrency::sync::Mutex;
 use std::collections::HashMap;
 
-use dataplane_cascade::{Cascade, Generation, Layer, MergeInto, MutableHead, Outcome, Upsert};
+use dataplane_cascade::{Cascade, Generation, Lookup, MergeInto, MutableHead, Upsert};
 
 /// Tiny generation allocator for tests.  In production the manager
 /// owns this counter; tests carry their own to avoid pulling in
@@ -85,22 +85,21 @@ impl TestHead {
     }
 }
 
-impl Layer for TestHead {
-    type Input = u32;
-    type Output = Entry;
-
-    fn lookup(&self, _input: &u32) -> Outcome<&Entry> {
+impl Lookup<u32, Entry> for TestHead {
+    fn lookup(&self, _input: &u32) -> Option<&Entry> {
         // Borrowing through a Mutex is awkward.  For the smoke test
         // we deliberately defer the read to the sealed/tail path
-        // by always returning Continue.  A real impl would publish an
+        // by always returning None.  A real impl would publish an
         // Arc<HashMap<...>> via concurrency::slot::Slot for the read
         // path so that `lookup` can hand out a borrow without
         // holding the mutex.
-        Outcome::Continue
+        None
     }
 }
 
 impl MutableHead for TestHead {
+    type Key = u32;
+    type Action = Entry;
     type Op = (u32, Op);
     type Frozen = FrozenMap;
 
@@ -142,16 +141,12 @@ impl FrozenMap {
     }
 }
 
-impl Layer for FrozenMap {
-    type Input = u32;
-    type Output = Entry;
-
-    fn lookup(&self, k: &u32) -> Outcome<&Entry> {
-        match self.inner.get(k) {
-            Some(Entry::Value(_)) => Outcome::Match(self.inner.get(k).expect("just checked")),
-            Some(Entry::Tombstone) => Outcome::Forbid,
-            None => Outcome::Continue,
-        }
+impl Lookup<u32, Entry> for FrozenMap {
+    // Returns `Some(&Entry::Tombstone)` for tombstones; the cascade
+    // walk stops on the first `Some` regardless of variant, and
+    // consumers interpret `Entry::Tombstone` as "absent" themselves.
+    fn lookup(&self, k: &u32) -> Option<&Entry> {
+        self.inner.get(k)
     }
 }
 
@@ -214,7 +209,7 @@ fn rotate_seals_head_into_sealed_layer() {
 }
 
 #[test]
-fn rotated_tombstone_in_sealed_suppresses_tail_hit() {
+fn rotated_tombstone_in_sealed_shadows_tail_value() {
     let c = build_cascade([(42, Entry::Value(100))]);
     let mut g_alloc = GenAlloc::new();
     c.write((42, Op::Tombstone));
@@ -223,8 +218,10 @@ fn rotated_tombstone_in_sealed_suppresses_tail_hit() {
     let snap = c.snapshot();
     assert_eq!(snap.frozen_depth(), 1);
     // Frozen layer has a tombstone for 42; tail has a value.
-    // Cascade walk hits the tombstone first -> Forbid -> None.
-    assert_eq!(snap.lookup(&42), None);
+    // The cascade walk stops on the first Some, which is the
+    // tombstone in the frozen layer.  Consumers interpret
+    // Entry::Tombstone as "absent."
+    assert_eq!(snap.lookup(&42), Some(&Entry::Tombstone));
 }
 
 #[test]
@@ -307,7 +304,8 @@ fn compact_applies_tombstones_to_tail() {
     c.write((42, Op::Tombstone));
     c.rotate(g_alloc.next(), TestHead::empty);
 
-    assert_eq!(c.snapshot().lookup(&42), None);
+    // Pre-compact: frozen layer's tombstone shadows the tail value.
+    assert_eq!(c.snapshot().lookup(&42), Some(&Entry::Tombstone));
 
     // Compact the tombstone into the tail.  After compaction the
     // sealed vec is empty and the tail no longer contains 42 at

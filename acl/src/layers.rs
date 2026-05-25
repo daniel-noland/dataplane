@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Open Network Fabric Authors
 
-//! Cascade `Layer` / `MutableHead` impls for the ACL classifier.
+//! Cascade `Lookup` / `MutableHead` impls for the ACL classifier.
 //!
 //! Three concrete types compose the cascade:
 //!
 //! - [`AclHead`] -- a multi-writer buffer of newly-installed rules,
 //!   keyed by priority for per-key dedup on concurrent installs.
-//!   `Layer::lookup` returns [`Outcome::Continue`] -- writes are
-//!   only visible to readers after the next [`Cascade::rotate`].
-//!   This is acceptable because ACL update rates are low and the
-//!   one-rotation visibility latency is much smaller than the
-//!   control-plane reconciliation interval.  See the cascade docs
-//!   on \"head readability under high write rate\" for the rationale.
+//!   `Lookup::lookup` returns `None` -- writes are only visible to
+//!   readers after the next [`Cascade::rotate`].  This is acceptable
+//!   because ACL update rates are low and the one-rotation visibility
+//!   latency is much smaller than the control-plane reconciliation
+//!   interval.  See the cascade docs on "head readability under high
+//!   write rate" for the rationale.
 //!
 //! - [`AclFrozen`] -- an immutable rule list sorted ascending by
-//!   priority.  `Layer::lookup` walks the list in priority order
+//!   priority.  `Lookup::lookup` walks the list in priority order
 //!   and returns the first match.
 //!
 //! - [`AclTail`] -- structurally identical to [`AclFrozen`] in this
@@ -25,15 +25,14 @@
 //!
 //! Compaction via [`MergeInto<AclTail>`] for [`AclFrozen`] dedups
 //! by priority with newer-wins-on-conflict, mirroring the cascade
-//! walk's \"newer shadows older\" semantic.
+//! walk's "newer shadows older" semantic.
 //!
 //! [`Cascade::rotate`]: cascade::Cascade::rotate
-//! [`Outcome::Continue`]: cascade::Outcome::Continue
 
 use concurrency::sync::Mutex;
 use std::collections::BTreeMap;
 
-use cascade::{Layer, MergeInto, MutableHead, Outcome, Upsert};
+use cascade::{Lookup, MergeInto, MutableHead, Upsert};
 
 use crate::types::{AclRule, Headers, Priority};
 
@@ -70,7 +69,7 @@ impl Upsert for AclRule {
 /// Operations that can be applied to an [`AclHead`].
 ///
 /// First slice supports install only.  Removal will be added later
-/// via user-code that synthesises shadow rules using
+/// via user-code that synthesizes shadow rules using
 /// [`Cascade::snapshot`](cascade::Cascade::snapshot) and
 /// [`Cascade::write`](cascade::Cascade::write).  See the design
 /// conversation in the cascade crate's docs on why removal lives
@@ -91,10 +90,10 @@ pub enum AclOp {
 /// concurrent writes (multi-writer scenarios will typically be the
 /// control-plane reconciler thread alone, so contention is minimal).
 ///
-/// `Layer::lookup` always returns `Outcome::Continue`; reading a
-/// borrow out of a Mutex into the cascade walk would require holding
-/// the lock across the entire walk, which we are not willing to do.
-/// Writes become visible to readers after the next
+/// `Lookup::lookup` always returns `None`; reading a borrow out of
+/// a Mutex into the cascade walk would require holding the lock
+/// across the entire walk, which we are not willing to do.  Writes
+/// become visible to readers after the next
 /// [`Cascade::rotate`](cascade::Cascade::rotate) seals this head into
 /// an [`AclFrozen`] layer.
 pub struct AclHead {
@@ -117,16 +116,15 @@ impl Default for AclHead {
     }
 }
 
-impl Layer for AclHead {
-    type Input = Headers;
-    type Output = AclRule;
-
-    fn lookup(&self, _input: &Headers) -> Outcome<&AclRule> {
-        Outcome::Continue
+impl Lookup<Headers, AclRule> for AclHead {
+    fn lookup(&self, _input: &Headers) -> Option<&AclRule> {
+        None
     }
 }
 
 impl MutableHead for AclHead {
+    type Key = Headers;
+    type Action = AclRule;
     type Op = AclOp;
     type Frozen = AclFrozen;
 
@@ -156,7 +154,7 @@ impl MutableHead for AclHead {
 
 /// An immutable, priority-sorted rule list.
 ///
-/// `Layer::lookup` walks the list in ascending priority order and
+/// `Lookup::lookup` walks the list in ascending priority order and
 /// returns the first matching rule.  For very small rule sets this
 /// is the right shape; for large ones we will eventually compile
 /// the rules into a more efficient structure (DPDK ACL context, a
@@ -193,17 +191,9 @@ impl AclFrozen {
     }
 }
 
-impl Layer for AclFrozen {
-    type Input = Headers;
-    type Output = AclRule;
-
-    fn lookup(&self, headers: &Headers) -> Outcome<&AclRule> {
-        for rule in &self.rules {
-            if rule.matches.matches(headers) {
-                return Outcome::Match(rule);
-            }
-        }
-        Outcome::Continue
+impl Lookup<Headers, AclRule> for AclFrozen {
+    fn lookup(&self, headers: &Headers) -> Option<&AclRule> {
+        self.rules.iter().find(|r| r.matches.matches(headers))
     }
 }
 
@@ -246,17 +236,9 @@ impl AclTail {
     }
 }
 
-impl Layer for AclTail {
-    type Input = Headers;
-    type Output = AclRule;
-
-    fn lookup(&self, headers: &Headers) -> Outcome<&AclRule> {
-        for rule in &self.rules {
-            if rule.matches.matches(headers) {
-                return Outcome::Match(rule);
-            }
-        }
-        Outcome::Continue
+impl Lookup<Headers, AclRule> for AclTail {
+    fn lookup(&self, headers: &Headers) -> Option<&AclRule> {
+        self.rules.iter().find(|r| r.matches.matches(headers))
     }
 }
 

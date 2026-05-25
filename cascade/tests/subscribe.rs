@@ -12,7 +12,7 @@
 use concurrency::sync::Mutex;
 use std::collections::HashMap;
 
-use dataplane_cascade::{Cascade, Generation, Layer, MergeInto, MutableHead, Outcome, Upsert};
+use dataplane_cascade::{Cascade, Generation, Lookup, MergeInto, MutableHead, Upsert};
 
 /// Tiny generation allocator for tests.  In production the manager
 /// owns this counter; tests carry their own to avoid pulling in
@@ -75,15 +75,15 @@ impl TestHead {
     }
 }
 
-impl Layer for TestHead {
-    type Input = u32;
-    type Output = Entry;
-    fn lookup(&self, _input: &u32) -> Outcome<&Entry> {
-        Outcome::Continue
+impl Lookup<u32, Entry> for TestHead {
+    fn lookup(&self, _input: &u32) -> Option<&Entry> {
+        None
     }
 }
 
 impl MutableHead for TestHead {
+    type Key = u32;
+    type Action = Entry;
     type Op = (u32, Op);
     type Frozen = FrozenMap;
 
@@ -121,15 +121,9 @@ impl FrozenMap {
     }
 }
 
-impl Layer for FrozenMap {
-    type Input = u32;
-    type Output = Entry;
-    fn lookup(&self, k: &u32) -> Outcome<&Entry> {
-        match self.inner.get(k) {
-            Some(Entry::Value(_)) => Outcome::Match(self.inner.get(k).expect("just checked")),
-            Some(Entry::Tombstone) => Outcome::Forbid,
-            None => Outcome::Continue,
-        }
+impl Lookup<u32, Entry> for FrozenMap {
+    fn lookup(&self, k: &u32) -> Option<&Entry> {
+        self.inner.get(k)
     }
 }
 
