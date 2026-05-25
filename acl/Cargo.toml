@@ -11,6 +11,7 @@ default = []
 [dependencies]
 cascade = { workspace = true, features = [] }
 concurrency = { workspace = true, features = [] }
+net = { workspace = true, features = [] }
 
 [dev-dependencies]
 net = { workspace = true, features = ["test_buffer", "builder"] }

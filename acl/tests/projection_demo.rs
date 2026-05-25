@@ -31,7 +31,7 @@ use net::tcp::{Tcp, TcpPort};
 struct V4TcpSource<'a>(&'a HeadersView<(&'a Eth, &'a Ipv4, &'a Tcp)>);
 
 // 5-tuple projection.
-impl<'a> Projection<(UnicastIpv4Addr, Ipv4Addr, TcpPort, TcpPort)> for &V4TcpSource<'a> {
+impl Projection<(UnicastIpv4Addr, Ipv4Addr, TcpPort, TcpPort)> for &V4TcpSource<'_> {
     fn project(self) -> (UnicastIpv4Addr, Ipv4Addr, TcpPort, TcpPort) {
         let (_eth, ipv4, tcp) = self.0.look();
         (
@@ -44,7 +44,7 @@ impl<'a> Projection<(UnicastIpv4Addr, Ipv4Addr, TcpPort, TcpPort)> for &V4TcpSou
 }
 
 // 2-tuple projection on the same source -- demonstrates multi-impl.
-impl<'a> Projection<(UnicastIpv4Addr, Ipv4Addr)> for &V4TcpSource<'a> {
+impl Projection<(UnicastIpv4Addr, Ipv4Addr)> for &V4TcpSource<'_> {
     fn project(self) -> (UnicastIpv4Addr, Ipv4Addr) {
         let (_eth, ipv4, _tcp) = self.0.look();
         (ipv4.source(), ipv4.destination())

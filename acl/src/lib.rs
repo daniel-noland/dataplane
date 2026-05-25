@@ -36,6 +36,7 @@
 
 pub mod classifier;
 pub mod layers;
+pub mod shaped;
 pub mod types;
 
 pub use cascade::Generation;
