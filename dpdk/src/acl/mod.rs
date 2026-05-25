@@ -85,7 +85,7 @@
 //!     NonZero::new(1024).unwrap(),
 //! )?;
 //! let build_cfg = AclBuildConfig::new(1, field_defs, 0)?;
-//! let mut ctx = AclContext::<NUM_FIELDS>::new(params, build_cfg)?;
+//! let mut ctx = AclContext::new(params, build_cfg)?;
 //!
 //! // 2. Add rules -- Rule<5> is enforced by the type system.
 //! let rule = Rule::new(
@@ -360,7 +360,7 @@ mod tests {
         )
         .expect("create params");
         let mut ctx =
-            AclContext::<NUM_FIELDS>::new(params, standard_build_config()).expect("new context");
+            AclContext::new(params, standard_build_config()).expect("new context");
 
         ctx.add_rules(&[exact_match_rule(0xDEAD_BEEF, 1)])
             .expect("add rules");
@@ -397,7 +397,7 @@ mod tests {
         )
         .expect("create params");
         let mut ctx =
-            AclContext::<NUM_FIELDS>::new(params, original_cfg.clone()).expect("new context");
+            AclContext::new(params, original_cfg.clone()).expect("new context");
 
         // First build cycle: match 0xAAAAAAAA -> userdata 1.
         ctx.add_rules(&[exact_match_rule(0xAAAA_AAAA, 1)])
@@ -456,7 +456,7 @@ mod tests {
         )
         .expect("create params");
         let mut ctx =
-            AclContext::<NUM_FIELDS>::new(params, standard_build_config()).expect("new context");
+            AclContext::new(params, standard_build_config()).expect("new context");
 
         // Field 1 in standard_field_defs is a 4-byte Mask field, so the
         // maximum legal prefix length is 32.  33 is out of range.
@@ -503,7 +503,7 @@ mod tests {
         )
         .expect("create params");
         let mut ctx =
-            AclContext::<NUM_FIELDS>::new(params, standard_build_config()).expect("new context");
+            AclContext::new(params, standard_build_config()).expect("new context");
         ctx.add_rules(&[exact_match_rule(0xCAFE_BABE, 7)])
             .expect("add rules");
         let mut ctx = ctx.build().map_err(|f| f.error).expect("build");
@@ -535,7 +535,7 @@ mod tests {
         )
         .expect("create params");
         let mut ctx =
-            AclContext::<NUM_FIELDS>::new(params, standard_build_config()).expect("new context");
+            AclContext::new(params, standard_build_config()).expect("new context");
         ctx.add_rules(&[exact_match_rule(0xAAAA_AAAA, 1)])
             .expect("add rules");
         let ctx = ctx.build().map_err(|f| f.error).expect("build");
@@ -578,7 +578,7 @@ mod tests {
         )
         .expect("create params");
         let _ctx_a =
-            AclContext::<NUM_FIELDS>::new(params_a, standard_build_config()).expect("first new");
+            AclContext::new(params_a, standard_build_config()).expect("first new");
 
         let params_b = AclCreateParams::<NUM_FIELDS>::new(
             "dup_name",
@@ -586,7 +586,7 @@ mod tests {
             NonZero::new(16).unwrap(),
         )
         .expect("create params (dup)");
-        let err = AclContext::<NUM_FIELDS>::new(params_b, standard_build_config())
+        let err = AclContext::new(params_b, standard_build_config())
             .expect_err("second new with same name must fail");
         assert!(
             matches!(err, AclCreateError::AlreadyExists { ref name } if name == "dup_name"),
@@ -611,7 +611,7 @@ mod tests {
         )
         .expect("create params");
         let mut ctx =
-            AclContext::<NUM_FIELDS>::new(params, standard_build_config()).expect("new context");
+            AclContext::new(params, standard_build_config()).expect("new context");
 
         ctx.add_rules(&[exact_match_rule(0x1111_1111, 1)])
             .expect("first add_rules should succeed");
@@ -660,7 +660,7 @@ mod tests {
         )
         .expect("create params");
         let ctx =
-            AclContext::<NUM_FIELDS>::new(params, standard_build_config()).expect("new context");
+            AclContext::new(params, standard_build_config()).expect("new context");
 
         // First build with zero rules must fail.
         let failure = ctx.build().expect_err("build() with no rules must fail");
@@ -704,7 +704,7 @@ mod tests {
         // standard_build_config uses num_categories = 1, so only bit 0 is
         // legal.  Build a rule with bit 1 also set.
         let mut ctx =
-            AclContext::<NUM_FIELDS>::new(params, standard_build_config()).expect("new context");
+            AclContext::new(params, standard_build_config()).expect("new context");
 
         let bad_rule: Rule<NUM_FIELDS> = Rule::new(
             RuleData {
@@ -758,7 +758,7 @@ mod tests {
         )
         .expect("create params");
         let mut ctx =
-            AclContext::<NUM_FIELDS>::new(params, standard_build_config()).expect("new context");
+            AclContext::new(params, standard_build_config()).expect("new context");
         ctx.add_rules(&[exact_match_rule(0xDEAD_BEEF, 1)])
             .expect("add rules");
         let ctx: Arc<AclContext<NUM_FIELDS, Built<NUM_FIELDS>>> =
@@ -808,7 +808,7 @@ mod tests {
         )
         .expect("create params");
         let mut ctx =
-            AclContext::<NUM_FIELDS>::new(params, standard_build_config()).expect("new context");
+            AclContext::new(params, standard_build_config()).expect("new context");
         ctx.add_rules(&[exact_match_rule(0xFEED_FACE, 9)])
             .expect("add rules");
         let ctx = ctx.build().map_err(|f| f.error).expect("build");

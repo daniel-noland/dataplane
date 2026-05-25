@@ -923,7 +923,7 @@ impl<const N: usize> AclBuildConfig<N> {
     /// ```ignore
     /// const FIELD_DEFS: [FieldDef; 5] = [/* ... */];
     /// const MIN_INPUT_SIZE: usize =
-    ///     AclBuildConfig::<5>::compute_min_input_size(&FIELD_DEFS);
+    ///     AclBuildConfig::compute_min_input_size(&FIELD_DEFS);
     /// type MyLookup = DpdkAclLookup<5, MIN_INPUT_SIZE, Action>;
     /// ```
     ///
@@ -1460,7 +1460,7 @@ mod tests {
             FieldDef::new(FieldType::Bitmask, FieldSize::One, 0, 0, 0),
             FieldDef::new(FieldType::Mask, FieldSize::Four, 1, 9, 100),
         ];
-        const MIN_INPUT_SIZE: usize = AclBuildConfig::<2>::compute_min_input_size(&DEFS);
+        const MIN_INPUT_SIZE: usize = AclBuildConfig::compute_min_input_size(&DEFS);
         assert_eq!(MIN_INPUT_SIZE, 104);
 
         // And the runtime path returns the same value.
