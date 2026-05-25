@@ -7,10 +7,15 @@ version.workspace = true
 
 [features]
 default = []
+# Enables the DPDK `rte_acl` backend for `cascade::Lookup`.  Pulls in
+# the `dpdk` crate (and transitively `dpdk-sys`), so off by default;
+# only the production binary / DPDK-bound consumers turn it on.
+dpdk = ["dep:dpdk"]
 
 [dependencies]
 cascade = { workspace = true, features = [] }
 concurrency = { workspace = true, features = [] }
+dpdk = { workspace = true, optional = true }
 net = { workspace = true, features = [] }
 
 [dev-dependencies]

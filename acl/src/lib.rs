@@ -35,6 +35,8 @@
 //! [`Classifier`]: crate::Classifier
 
 pub mod classifier;
+#[cfg(feature = "dpdk")]
+pub mod dpdk_lookup;
 pub mod layers;
 pub mod shaped;
 pub mod types;
