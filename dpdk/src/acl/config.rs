@@ -905,34 +905,60 @@ impl<const N: usize> AclBuildConfig<N> {
         })
     }
 
-    /// Compute the buffer-size requirement at construction time.
+    /// Compute the buffer-size requirement from a set of field
+    /// definitions.
     ///
     /// See [`min_input_size`][AclBuildConfig::min_input_size] for the
     /// formula and rationale.  Factored out so that `new` can call it
     /// once and cache the result; the public accessor returns the cached
     /// value.
     ///
-    /// Precondition: all fields' `offset + 4` fit in `u32`.  This is
-    /// guaranteed by the `FieldExtentOverflow` check in
-    /// [`new`][AclBuildConfig::new], so the plain `+` below cannot
-    /// overflow.
-    fn compute_min_input_size(field_defs: &[FieldDef; N]) -> usize {
+    /// # Const context
+    ///
+    /// This function is `const fn` so callers with `const` field
+    /// definitions can derive the required input buffer size at
+    /// compile time -- for example, to feed it as the `STRIDE` const
+    /// generic on a DPDK-backed [`Lookup`][cascade::Lookup]:
+    ///
+    /// ```ignore
+    /// const FIELD_DEFS: [FieldDef; 5] = [/* ... */];
+    /// const MIN_INPUT_SIZE: usize =
+    ///     AclBuildConfig::<5>::compute_min_input_size(&FIELD_DEFS);
+    /// type MyLookup = DpdkAclLookup<5, MIN_INPUT_SIZE, Action>;
+    /// ```
+    ///
+    /// # Preconditions
+    ///
+    /// All fields' `offset + 4` must fit in `u32`.  When called from
+    /// [`new`][AclBuildConfig::new] this is guaranteed by the
+    /// `FieldExtentOverflow` check that runs first; when called
+    /// directly in a const context, an overflow becomes a
+    /// compile-time error rather than UB.
+    #[must_use]
+    pub const fn compute_min_input_size(field_defs: &[FieldDef; N]) -> usize {
         let mut max_load_end: u32 = 0;
-        for def in field_defs {
+        let mut i = 0;
+        while i < N {
+            let def = &field_defs[i];
             let ii = def.input_index();
             let mut group_offset = def.offset();
-            for other in field_defs {
+            let mut j = 0;
+            while j < N {
+                let other = &field_defs[j];
                 if other.input_index() == ii && other.offset() < group_offset {
                     group_offset = other.offset();
                 }
+                j += 1;
             }
             // No saturation: `new`'s FieldExtentOverflow check has
             // already verified `def.offset() + 4 <= u32::MAX` for every
-            // def, and `group_offset <= def.offset()`.
+            // def, and `group_offset <= def.offset()`.  In a const
+            // context an overflow here is a compile error.
             let load_end = group_offset + 4;
             if load_end > max_load_end {
                 max_load_end = load_end;
             }
+            i += 1;
         }
         max_load_end as usize
     }
@@ -1423,6 +1449,23 @@ mod tests {
             104,
             "DPDK loads 4 bytes from group_offset = 100, so min_input_size = 104"
         );
+    }
+
+    #[test]
+    fn compute_min_input_size_works_in_const_context() {
+        // Same defs as `min_input_size_uses_group_offsets`, exercised
+        // through the const-fn path.  This is what callers will use to
+        // derive a `STRIDE` const generic from `const FIELD_DEFS`.
+        const DEFS: [FieldDef; 2] = [
+            FieldDef::new(FieldType::Bitmask, FieldSize::One, 0, 0, 0),
+            FieldDef::new(FieldType::Mask, FieldSize::Four, 1, 9, 100),
+        ];
+        const MIN_INPUT_SIZE: usize = AclBuildConfig::<2>::compute_min_input_size(&DEFS);
+        assert_eq!(MIN_INPUT_SIZE, 104);
+
+        // And the runtime path returns the same value.
+        let cfg = AclBuildConfig::new(1, DEFS, 0).expect("config should validate");
+        assert_eq!(cfg.min_input_size(), MIN_INPUT_SIZE);
     }
 
     /// Property: `AclCreateParams::new` accepts a name iff it is non-empty
