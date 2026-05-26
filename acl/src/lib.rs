@@ -27,4 +27,3 @@
 
 #[cfg(feature = "dpdk")]
 pub mod dpdk_lookup;
-pub mod shaped;
