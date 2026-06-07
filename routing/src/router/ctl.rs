@@ -3,9 +3,9 @@
 
 //! Control channel for the router
 
-use config::{GwConfig, GwConfigMeta};
+use concurrency::sync::Arc;
+use config::{GwConfigMeta, ValidatedGwConfig};
 use mio::Interest;
-use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::oneshot;
@@ -45,13 +45,12 @@ impl Drop for LockGuard {
 }
 
 pub(crate) enum RouterCtlMsg {
-    Finish,
     Lock(RouterCtlReplyTx),
     Unlock(RouterCtlReplyTx),
     GuardedUnlock,
     Configure(RouterConfig, RouterCtlReplyTx),
     GetFrrAppliedConfig(RouterCtlReplyTx),
-    Config(Arc<GwConfig>),
+    Config(Arc<ValidatedGwConfig>),
     ConfigHistory(Arc<Vec<GwConfigMeta>>),
 }
 
@@ -136,12 +135,12 @@ impl RouterCtlSender {
         };
         Ok(frr_cfg)
     }
-    pub async fn send_config(&mut self, config: Arc<GwConfig>) -> Result<(), RouterError> {
+    pub async fn send_config(&mut self, config: Arc<ValidatedGwConfig>) -> Result<(), RouterError> {
         let msg = RouterCtlMsg::Config(config);
         self.0
             .send(msg)
             .await
-            .map_err(|_| RouterError::Internal("Failed to send GwConfig"))?;
+            .map_err(|_| RouterError::Internal("Failed to send ValidatedGwConfig"))?;
         Ok(())
     }
     pub async fn send_config_history(
@@ -231,7 +230,7 @@ fn handle_get_frr_applied_config(rio: &Rio, reply_to: RouterCtlReplyTx) {
         });
 }
 
-fn handle_config(rio: &mut Rio, config: Arc<GwConfig>) {
+fn handle_config(rio: &mut Rio, config: Arc<ValidatedGwConfig>) {
     rio.gwconfig = Some(config);
 }
 fn handle_config_history(rio: &mut Rio, history: Arc<Vec<GwConfigMeta>>) {
@@ -241,10 +240,6 @@ fn handle_config_history(rio: &mut Rio, history: Arc<Vec<GwConfigMeta>>) {
 /// Handle a request from the control channel
 pub(crate) fn handle_ctl_msg(rio: &mut Rio, db: &mut RoutingDb) {
     match rio.ctl_rx.try_recv() {
-        Ok(RouterCtlMsg::Finish) => {
-            info!("Got request to shutdown. Au revoir ...");
-            rio.run = false;
-        }
         Ok(RouterCtlMsg::Lock(reply_to)) => handle_lock(rio, true, Some(reply_to)),
         Ok(RouterCtlMsg::Unlock(reply_to)) => handle_lock(rio, false, Some(reply_to)),
         Ok(RouterCtlMsg::GuardedUnlock) => handle_lock(rio, false, None),

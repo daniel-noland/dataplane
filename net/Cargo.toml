@@ -22,15 +22,20 @@ arrayvec = { workspace = true, features = ["serde", "std"] }
 bitflags = { workspace = true }
 bolero = { workspace = true, features = ["std"], optional = true }
 bytecheck = { workspace = true }
+common = { workspace = true }
 concurrency = { workspace = true }
 derive_builder = { workspace = true, features = ["alloc"] }
 downcast-rs = { workspace = true, features = ["sync"] }
 etherparse = { workspace = true, features = ["std"] }
+fixed-size = { workspace = true, features = [] }
 id = { workspace = true }
 multi_index_map = { workspace = true, default-features = false, features = ["serde"] }
 rapidhash = { workspace = true }
 rkyv = { workspace = true, features = ["alloc", "bytecheck"]}
 serde = { workspace = true, features = ["derive", "std"] }
+static_assertions = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

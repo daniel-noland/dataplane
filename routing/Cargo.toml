@@ -6,6 +6,9 @@ publish.workspace = true
 version.workspace = true
 
 [features]
+loom = ["concurrency/loom"]
+shuttle = ["concurrency/shuttle"]
+shuttle_dfs = ["concurrency/shuttle_dfs", "shuttle"]
 testing = []
 
 [dependencies]
@@ -17,6 +20,7 @@ config = { workspace = true }
 concurrency = { workspace = true }
 dplane-rpc = { workspace = true }
 left-right-tlcache = { workspace = true }
+lifecycle = { workspace = true }
 lpm = { workspace = true }
 net = { workspace = true }
 tracectl = { workspace = true }
@@ -35,7 +39,7 @@ left-right = { workspace = true }
 linkme = { workspace = true }
 mio = { workspace = true, features = ["os-ext", "net"] }
 netgauze-bgp-pkt = { workspace = true }
-netgauze-bmp-pkt = { workspace = true }
+netgauze-bmp-pkt = { workspace = true, features = ["codec"] }
 nix = { workspace = true, features = ["socket"] }
 serde = { workspace = true, features = ["derive"] }
 strum =  { workspace = true }

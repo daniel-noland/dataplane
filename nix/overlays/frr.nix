@@ -5,6 +5,7 @@
   sanitizers,
   platform,
   profile,
+  libc,
   ...
 }:
 final: prev:
@@ -39,11 +40,36 @@ let
             (orig.LDFLAGS or "")
             + " -L${final.fancy.readline}/lib -lreadline "
             + " -L${final.fancy.json_c}/lib -ljson-c "
-            + " -Wl,--push-state,--as-needed,--no-whole-archive,-Bstatic "
+            # libatomic must end up as a single dynamic dep in the process:
+            # libatomic's lock_for_pointer state is per-image, so a static
+            # copy inside libfrr.so cannot synchronize with any other
+            # consumer that picks up libatomic.so dynamically.  Path differs
+            # by libc because the libatomic.so that pairs with the chosen
+            # cross-compiler stdenv lives in a different store path:
+            #
+            #   glibc: `${fancy.libgccjit}/lib/libatomic.so.1`
+            #     The libgccjit overlay is currently built with the host
+            #     stdenv (see TODO note on the libgccjit override below), so
+            #     the libatomic next to it is glibc-targeted -- safe to link
+            #     against a glibc FRR.
+            #
+            #   musl: `${stdenv.cc.cc.lib}/${triple}/lib/libatomic.so.1`
+            #     This is the gcc-libs output of the cross-musl gcc that
+            #     backs the cross-musl clang stdenv (note: stdenv, not
+            #     stdenv' -- the prime is the clang stdenv whose cc.cc is
+            #     clang and contains no libatomic at all).
+            + (
+              if libc == "musl" then
+                " -L${final.stdenv.cc.cc.lib}/${final.stdenv.hostPlatform.config}/lib -latomic "
+              else if libc == "gnu" then
+                " -L${final.fancy.libgccjit}/lib -latomic "
+              else
+                throw "unhandled libc=${libc} for FRR -latomic LDFLAGS"
+            )
             + " -L${final.fancy.libxcrypt}/lib -lcrypt "
+            + " -Wl,--push-state,--as-needed,--no-whole-archive,-Bstatic "
             + " -L${final.fancy.pcre2}/lib -lpcre2-8 "
-            + " -L${final.fancy.xxHash}/lib -lxxhash "
-            + " -L${final.fancy.libgccjit}/lib -latomic "
+            + " -L${final.fancy.xxhash}/lib -lxxhash "
             + " -Wl,--pop-state";
           configureFlags = orig.configureFlags ++ [
             "--enable-shared"
@@ -52,7 +78,16 @@ let
             # this overrides the base package's --enable-static-bin.
             "--disable-static-bin"
           ];
-          nativeBuildInputs = (orig.nativeBuildInputs or [ ]) ++ [ prev.nukeReferences ];
+          # `buildPackages.nukeReferences` rather than `prev.nukeReferences`:
+          # the `nuke-refs` script substitutes a perl path at build time, and
+          # under a cross pkgset `prev.nukeReferences` picks up target-arch
+          # perl.  The script is executed during this derivation's build
+          # phase on the build host, so the target-arch perl interpreter is
+          # unrunnable ("Exec format error").  `buildPackages` resolves to
+          # the build-host variant.  `removeReferencesTo` is shell-only and
+          # picks up build-host bash via `stdenvNoCC.shell` regardless of
+          # which pkgset it came from, so no equivalent fix is needed there.
+          nativeBuildInputs = (orig.nativeBuildInputs or [ ]) ++ [ final.buildPackages.nukeReferences ];
           # disallowedReferences = (orig.disallowedReferences or []) ++ [ final.stdenv'.cc ];
           preFixup = ''
             find "$out" \
@@ -62,8 +97,10 @@ let
                 -e ${final.stdenv'.cc.libc} \
                 -e ${final.python3Minimal} \
                 -e ${final.fancy.readline} \
-                -e ${final.fancy.libgccjit} \
+                -e ${final.fancy.libxcrypt} \
                 -e ${final.fancy.json_c} \
+                ${if libc == "gnu" then "-e ${final.fancy.libgccjit}" else ""} \
+                ${if libc == "musl" then "-e ${final.stdenv.cc.cc.lib}" else ""} \
                 '{}' +;
           '';
         })
@@ -72,7 +109,7 @@ in
 {
   fancy = prev.fancy // {
     inherit sources;
-    xxHash = (dep prev.xxHash).overrideAttrs (orig: {
+    xxhash = (dep prev.xxhash).overrideAttrs (orig: {
       cmakeFlags = (orig.cmakeFlags or [ ]) ++ [
         "-DBUILD_SHARED_LIBS=OFF"
         "-DXXH_STATIC_LINKING_ONLY=ON"
@@ -82,13 +119,13 @@ in
       (prev.libyang.override {
         stdenv = final.stdenv';
         pcre2 = final.fancy.pcre2;
-        xxHash = final.fancy.xxHash;
+        xxhash = final.fancy.xxhash;
       }).overrideAttrs
         (orig: {
           cmakeFlags = (orig.cmakeFlags or [ ]) ++ [ "-DBUILD_SHARED_LIBS=OFF" ];
           propagatedBuildInputs = [
             final.fancy.pcre2
-            final.fancy.xxHash
+            final.fancy.xxhash
           ];
         })
     );
@@ -105,7 +142,11 @@ in
           makeFlags = [
             "lib=lib"
             "PAM_CAP=no"
-            "CC:=clang"
+            "CC:=${final.stdenv'.cc.targetPrefix}clang"
+            # _makenames is a build-host helper run during the build; pin it to
+            # a build-host clang so cross-arch builds (e.g. bluefield3) don't
+            # produce an aarch64 binary the build host cannot execute.
+            "BUILD_CC:=${final.pkgsBuildBuild.llvmPackages'.clang}/bin/clang"
             "SHARED=no"
             "LIBCSTATIC=no"
             "GOLANG=no"
@@ -206,7 +247,42 @@ in
         ];
       })
     );
-    frr-agent = dep (final.callPackage ../pkgs/frr-agent final.fancy);
+    frr-agent = dep (
+      (final.callPackage ../pkgs/frr-agent final.fancy).overrideAttrs (orig: {
+        # See `nukeReferences` note in `frr-build` above: must be the
+        # build-host variant so the `nuke-refs` script's substituted perl is
+        # runnable on the build host under cross compilation.
+        nativeBuildInputs = (orig.nativeBuildInputs or [ ]) ++ [ final.buildPackages.nukeReferences ];
+        # On musl, force `+crt-static` so the C runtime and libgcc_eh
+        # are linked statically.  Without this, nixpkgs' musl
+        # `rustPlatform` (which `frr-agent` is built with) emits a
+        # binary with `DT_NEEDED libgcc_s.so.1` and `_Unwind_*@GCC_*`
+        # references -- there's no `libgcc_s.so.1` in the musl image
+        # and the loader bails before `main`.  TODO: switch
+        # `frr-agent` to the same crane/`system-llvm-libunwind` path
+        # the rest of the workspace uses so we get a proper LLVM
+        # libunwind link instead of pulling in libgcc_eh.
+        env = (orig.env or { }) // (
+          if libc == "musl" then {
+            RUSTFLAGS = ((orig.env or { }).RUSTFLAGS or "") + " -C target-feature=+crt-static";
+          } else { }
+        );
+        # Keep refs to libc and (on glibc only) the libgcc path the
+        # ld-linux search list points at -- that's where glibc-dynamic
+        # Rust binaries find `libgcc_s.so.1` for unwinding.  On musl
+        # we've forced `+crt-static` above, so there's no `libgcc_s`
+        # consumer at runtime and we deliberately don't bake the
+        # glibc-targeted libgcc into the image.
+        fixupPhase = ''
+          find "$out" \
+              -exec nuke-refs \
+              -e "$out" \
+              -e ${final.stdenv.cc.libc} \
+              ${if libc == "gnu" then "-e ${final.pkgsHostHost.glibc.libgcc}" else ""} \
+              '{}' +;
+        '';
+      })
+    );
     frr-config = dep (final.callPackage ../pkgs/frr-config final.fancy);
     dplane-rpc = dep (final.callPackage ../pkgs/dplane-rpc final.fancy);
     dplane-plugin = dep (final.callPackage ../pkgs/dplane-plugin final.fancy);

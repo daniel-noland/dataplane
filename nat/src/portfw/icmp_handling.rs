@@ -39,22 +39,21 @@ use net::flows::ExtractRef;
 use net::flows::FlowInfo;
 use net::packet::{DoneReason, Packet};
 
-use crate::icmp_handler::icmp_error_msg::nat_translate_icmp_inner;
-use crate::portfw::packet::nat_packet;
-use crate::{NatPort, NatTranslationData};
-
 use super::flow_state::PortFwState;
-use crate::portfw::flow_state::PortFwAction;
+use super::packet::nat_packet;
+use crate::common::{NatAction, NatFlowStatus};
+use crate::icmp_handler::icmp_error_msg::nat_translate_icmp_inner;
+use crate::{NatPort, NatTranslationData};
 
 use tracing::debug;
 
 // Build `NatTranslationData` from `PortFwState` to translate the packet embedded in the ICMP error
 fn as_nat_translation(pfw_state: &PortFwState) -> NatTranslationData {
     match pfw_state.action {
-        PortFwAction::SrcNat => NatTranslationData::new()
+        NatAction::SrcNat => NatTranslationData::default()
             .dst_addr(pfw_state.use_ip().inner())
             .dst_port(NatPort::Port(pfw_state.use_port())),
-        PortFwAction::DstNat => NatTranslationData::new()
+        NatAction::DstNat => NatTranslationData::default()
             .src_addr(pfw_state.use_ip().inner())
             .src_port(NatPort::Port(pfw_state.use_port())),
     }
@@ -63,48 +62,29 @@ fn as_nat_translation(pfw_state: &PortFwState) -> NatTranslationData {
 pub(crate) fn handle_icmp_error_port_forwarding<Buf: PacketBufferMut>(
     packet: &mut Packet<Buf>,
     flow_info: &FlowInfo,
-) {
-    let flow_info_locked = flow_info.locked.read().unwrap();
-    let pfw_state = flow_info_locked
+) -> Result<NatFlowStatus, DoneReason> {
+    let src_vpcd = packet.meta().src_vpcd.unwrap_or_else(|| unreachable!());
+    let f = flow_info.logfmt();
+    debug!("(port-forwarding): Processing ICMP error packet from {src_vpcd} using flow {f}");
+
+    let flow_info_locked = flow_info.locked.read();
+    let state = flow_info_locked
         .port_fw_state
         .extract_ref::<PortFwState>()
         .unwrap_or_else(|| unreachable!());
 
-    let src_vpcd = packet.meta().src_vpcd.unwrap_or_else(|| unreachable!());
-    let flow_key = flow_info.flowkey().unwrap_or_else(|| unreachable!());
-    debug!("Processing ICMP error packet from {src_vpcd} using flow {flow_key} {flow_info}");
-
-    // this is informational and to drop ICMP errors that need not be processed: if the flow for the offending
-    // packet is no longer valid, no need to process the ICMP error.
-    if let Some(related) = flow_info
-        .related
-        .as_ref()
-        .and_then(std::sync::Weak::upgrade)
-    {
-        debug!(
-            "The flow for the offending packet is {} {related}",
-            related.flowkey().unwrap_or_else(|| unreachable!())
-        );
-        if !related.is_valid() {
-            packet.done(DoneReason::Filtered);
-            return;
-        }
-    }
-
     // translate the inner packet depending on the port-forwarding state associated to the
     // reverse flow of the offending packet.
-    let translation_data = as_nat_translation(pfw_state);
+    let translation_data = as_nat_translation(state);
     if let Err(e) = nat_translate_icmp_inner(packet, &translation_data) {
-        debug!("Translation of inner packet failed: {e}\n{packet}");
-        packet.done(DoneReason::InternalFailure);
-        return;
+        debug!("(port-forwarding): Translation of ICMP error inner packet failed: {e}");
+        return Err(DoneReason::InternalFailure);
     }
 
     // NAT the ICMP packet according to the port-fw state of the reverse flow of the offending packet
-    if !nat_packet(packet, pfw_state) {
-        debug!("Failed to NAT ICMP error packet: {packet}");
-        packet.done(DoneReason::InternalFailure);
-        return;
+    if let Err(e) = nat_packet(packet, state) {
+        debug!("(port-forwarding): Failed to NAT ICMP error packet: {e}");
+        return Err(DoneReason::InternalFailure);
     }
-    debug!("Successfully NATed ICMP error packet");
+    Ok(state.status.load())
 }

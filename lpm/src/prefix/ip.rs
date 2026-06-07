@@ -59,6 +59,8 @@ pub trait IpPrefix: Debug + Clone + From<Self::Addr> + PartialEq {
 
     fn network(&self) -> Self::Addr;
 
+    fn parent(&self) -> Option<Self>;
+
     fn last_address(&self) -> Self::Addr;
 
     fn len(&self) -> u8;
@@ -92,14 +94,14 @@ pub trait IpPrefix: Debug + Clone + From<Self::Addr> + PartialEq {
             Self::new(split_address, self.len() + 1).unwrap_or_else(|_| unreachable!()),
         ))
     }
-}
 
-pub trait IpPrefixCovering<Other> {
-    fn covers(&self, other: &Other) -> bool;
-}
+    fn covers(&self, other: &Self) -> bool;
 
-pub trait IpPrefixColliding<Other> {
-    fn collides_with(&self, other: &Other) -> bool;
+    fn covers_addr(&self, other: &Self::Addr) -> bool;
+
+    fn collides_with(&self, other: &Self) -> bool {
+        self.covers(other) || other.covers(self)
+    }
 }
 
 ////////////////////////////////////////////////////////////
@@ -165,6 +167,9 @@ impl IpPrefix for Ipv4Prefix {
     fn network(&self) -> Self::Addr {
         self.0.network()
     }
+    fn parent(&self) -> Option<Self> {
+        self.0.supernet().map(Self)
+    }
     fn last_address(&self) -> Self::Addr {
         self.0.broadcast()
     }
@@ -174,23 +179,11 @@ impl IpPrefix for Ipv4Prefix {
     fn size(&self) -> PrefixSize {
         PrefixSize::U128(2u128.pow(32 - u32::from(self.len())))
     }
-}
-
-impl IpPrefixCovering<Ipv4Addr> for Ipv4Prefix {
-    fn covers(&self, other: &Ipv4Addr) -> bool {
-        self.0.contains(other)
-    }
-}
-
-impl IpPrefixCovering<Ipv4Prefix> for Ipv4Prefix {
-    fn covers(&self, other: &Ipv4Prefix) -> bool {
+    fn covers(&self, other: &Self) -> bool {
         self.0.contains(&other.0)
     }
-}
-
-impl IpPrefixColliding<Ipv4Prefix> for Ipv4Prefix {
-    fn collides_with(&self, other: &Ipv4Prefix) -> bool {
-        self.covers(other) || other.covers(self)
+    fn covers_addr(&self, other: &Self::Addr) -> bool {
+        self.0.contains(other)
     }
 }
 
@@ -305,6 +298,9 @@ impl IpPrefix for Ipv6Prefix {
     fn network(&self) -> Self::Addr {
         self.0.network()
     }
+    fn parent(&self) -> Option<Self> {
+        self.0.supernet().map(Self)
+    }
     fn last_address(&self) -> Self::Addr {
         self.0.broadcast()
     }
@@ -318,23 +314,11 @@ impl IpPrefix for Ipv6Prefix {
             PrefixSize::U128(2u128.pow(128 - u32::from(self.len())))
         }
     }
-}
-
-impl IpPrefixCovering<Ipv6Addr> for Ipv6Prefix {
-    fn covers(&self, other: &Ipv6Addr) -> bool {
-        self.0.contains(other)
-    }
-}
-
-impl IpPrefixCovering<Ipv6Prefix> for Ipv6Prefix {
-    fn covers(&self, other: &Ipv6Prefix) -> bool {
+    fn covers(&self, other: &Self) -> bool {
         self.0.contains(&other.0)
     }
-}
-
-impl IpPrefixColliding<Ipv6Prefix> for Ipv6Prefix {
-    fn collides_with(&self, other: &Ipv6Prefix) -> bool {
-        self.covers(other) || other.covers(self)
+    fn covers_addr(&self, other: &Self::Addr) -> bool {
+        self.0.contains(other)
     }
 }
 
@@ -387,50 +371,34 @@ impl TryFrom<Prefix> for Ipv6Prefix {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, feature = "bolero"))]
 mod contract {
-    use crate::prefix::{IpPrefix, Ipv4Prefix, Ipv6Prefix, Prefix};
+    use crate::prefix::{IpPrefix, Ipv4Prefix, Ipv6Prefix};
     use bolero::{Driver, TypeGenerator};
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::ops::Bound;
 
     impl TypeGenerator for Ipv4Prefix {
         fn generate<D: Driver>(driver: &mut D) -> Option<Self> {
-            let addr = Ipv4Addr::from_bits(driver.produce()?);
-            let len = Ipv4Prefix::MAX_LEN
-                - driver.gen_u8(
-                    Bound::Included(&0),
-                    Bound::Included(
-                        &u8::try_from(addr.to_bits().trailing_zeros())
-                            .unwrap_or_else(|_| unreachable!()),
-                    ),
-                )?;
+            let mut bits = driver.produce()?;
+            let len = driver.gen_u8(Bound::Included(&0), Bound::Included(&Self::MAX_LEN))?;
+            bits &= u32::MAX
+                .checked_shl(u32::from(Self::MAX_LEN - len))
+                .unwrap_or(0);
+            let addr = Ipv4Addr::from_bits(bits);
             Some(Ipv4Prefix::new(addr, len).unwrap_or_else(|_| unreachable!()))
         }
     }
 
     impl TypeGenerator for Ipv6Prefix {
         fn generate<D: Driver>(driver: &mut D) -> Option<Self> {
-            let addr = Ipv6Addr::from_bits(driver.produce()?);
-            let len = Ipv6Prefix::MAX_LEN
-                - driver.gen_u8(
-                    Bound::Included(&0),
-                    Bound::Included(
-                        &u8::try_from(addr.to_bits().trailing_zeros())
-                            .unwrap_or_else(|_| unreachable!()),
-                    ),
-                )?;
+            let mut bits = driver.produce()?;
+            let len = driver.gen_u8(Bound::Included(&0), Bound::Included(&Self::MAX_LEN))?;
+            bits &= u128::MAX
+                .checked_shl(u32::from(Self::MAX_LEN - len))
+                .unwrap_or(0);
+            let addr = Ipv6Addr::from_bits(bits);
             Some(Ipv6Prefix::new(addr, len).unwrap_or_else(|_| unreachable!()))
-        }
-    }
-
-    impl TypeGenerator for Prefix {
-        fn generate<D: Driver>(driver: &mut D) -> Option<Self> {
-            Some(if driver.gen_bool(None)? {
-                Prefix::IPV4(driver.produce()?)
-            } else {
-                Prefix::IPV6(driver.produce()?)
-            })
         }
     }
 }
@@ -450,8 +418,8 @@ mod tests {
     fn test_ipv4_covers() {
         // IP Address is covered by prefix
         let prefix = "192.168.1.0/24".parse::<Ipv4Prefix>().unwrap();
-        assert!(prefix.covers(&Ipv4Addr::new(192, 168, 1, 1)));
-        assert!(!prefix.covers(&Ipv4Addr::new(192, 168, 2, 1)));
+        assert!(prefix.covers_addr(&Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(!prefix.covers_addr(&Ipv4Addr::new(192, 168, 2, 1)));
 
         // Prefix is covered by prefix
         assert!(prefix.covers(&prefix));
@@ -483,9 +451,9 @@ mod tests {
     fn test_ipv6_covers() {
         // IP Address is covered by prefix
         let prefix = "2001:db8::/32".parse::<Ipv6Prefix>().unwrap();
-        assert!(prefix.covers(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
-        assert!(prefix.covers(&Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0, 0, 0, 0, 0)));
-        assert!(!prefix.covers(&Ipv6Addr::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 0)));
+        assert!(prefix.covers_addr(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
+        assert!(prefix.covers_addr(&Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0, 0, 0, 0, 0)));
+        assert!(!prefix.covers_addr(&Ipv6Addr::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 0)));
 
         // Prefix is covered by prefix
         assert!(prefix.covers(&prefix));
@@ -512,7 +480,7 @@ mod tests {
         assert!(!p2.covers(&p1));
     }
 
-    fn prefix_contract<P: IpPrefix + IpPrefixCovering<P>>(prefix: &P) {
+    fn prefix_contract<P: IpPrefix>(prefix: &P) {
         assert!(P::ROOT.covers(prefix));
         let len = prefix.len();
         if len > 0 {

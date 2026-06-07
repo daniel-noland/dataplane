@@ -12,9 +12,9 @@ use crate::vxlan::Vni;
 use bitflags::bitflags;
 use concurrency::sync::Arc;
 use serde::Serialize;
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::net::IpAddr;
+use strum_macros::{EnumCount, FromRepr};
 use tracing::error;
 
 /// Every VRF is univocally identified with a numerical VRF id
@@ -77,36 +77,41 @@ impl Display for VpcDiscriminant {
     }
 }
 
+#[repr(u8)]
 #[allow(unused)]
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, EnumCount, FromRepr)]
 pub enum DoneReason {
     InternalFailure,      /* catch-all for internal issues */
-    NotEthernet,          /* could not get eth header */
-    NotIp,                /* could not get IP header - maybe it's not ip */
-    UnsupportedTransport, /* unsupported transport layer */
-    MacNotForUs,          /* frame is not broadcast nor for us */
+    InterfaceUnknown,     /* the interface cannot be found */
     InterfaceDetached,    /* interface has not been attached to any VRF */
     InterfaceAdmDown,     /* interface is admin down */
     InterfaceOperDown,    /* interface is oper down : no link */
-    InterfaceUnknown,     /* the interface cannot be found */
     InterfaceUnsupported, /* the operation is not supported on the interface */
-    NatOutOfResources,    /* can't do NAT due to lack of resources */
+    NotEthernet,          /* could not get eth header */
+    Unhandled,            /* there exists no support to handle this type of packet */
+    MacNotForUs,          /* frame is not broadcast nor for us */
+    InvalidDstMac,        /* dropped the packet since it had to have an invalid destination mac */
+    MissingEtherType,     /* couldn't determine ethertype to use */
+    NotIp,                /* could not get IP header or packet is not IP */
     RouteFailure,         /* missing routing information */
     RouteDrop,            /* routing explicitly requests pkts to be dropped */
     HopLimitExceeded,     /* TTL / Hop count was exceeded */
-    Filtered,             /* The packet was administratively filtered */
-    Unhandled,            /* there exists no support to handle this type of packet */
     MissL2resolution,     /* adjacency failure: we don't know mac of some ip next-hop */
-    InvalidDstMac,        /* dropped the packet since it had to have an invalid destination mac */
-    Malformed,            /* the packet does not conform / is malformed */
-    MissingEtherType,     /* can't determine ethertype to use */
-    Unroutable,           /* we don't have state to forward the packet */
+    VxlanDecapFailure,    /* Failed to decap a Vxlan packet */
+    VxlanEncapFailure,    /* Failed to encap a packet in vxlan */
+    Filtered,             /* The packet was administratively filtered */
+    NatOutOfResources,    /* can't do NAT due to lack of resources */
+    FlowCapacityExceeded, /* could not create flow state: flow table capacity exceeded */
+    NatUnsupportedProto,  /* unsupported transport protocol for NATing */
     NatFailure,           /* It was not possible to NAT the packet */
-    Local,                /* the packet has to be locally consumed by kernel */
-    Delivered,            /* the packet buffer was delivered by the NF - e.g. for xmit */
-    InternalDrop,         /* the packet was dropped internally due to a queue being full */
+    NatNotPortForwarded,  /* Packet was sent to port forwarder and it rejected it */
+    Malformed,            /* the packet does not conform / is malformed */
+    Unroutable,           /* we don't have state to forward the packet */
     InvalidChecksum,      /* the validation of a checksum for this packet failed */
     IcmpErrorIncomplete,  /* the packet is an ICMP error but it does not contain data it should */
+    InternalDrop,         /* the packet was dropped internally due to a queue being full */
+    Local,                /* the packet has to be locally consumed by kernel */
+    Delivered,            /* the packet buffer was delivered by the NF - e.g. for xmit */
 }
 
 bitflags! {
@@ -254,65 +259,5 @@ impl Drop for PacketMeta {
         if self.done.is_none() && self.is_initialized() {
             error!("Attempted to drop packet with unspecified verdict!");
         }
-    }
-}
-
-#[derive(Default, Debug)]
-#[allow(unused)]
-pub struct PacketDropStats {
-    pub name: String,
-    reasons: HashMap<DoneReason, u64>,
-    //Fredi: Todo: replace by ahash or use a small vec indexed by the DropReason value
-}
-
-impl PacketDropStats {
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: name.to_owned(),
-            reasons: HashMap::default(),
-        }
-    }
-    #[allow(dead_code)]
-    pub fn incr(&mut self, reason: DoneReason, value: u64) {
-        self.reasons
-            .entry(reason)
-            .and_modify(|counter| *counter += value)
-            .or_insert(value);
-    }
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn get_stat(&self, reason: DoneReason) -> Option<u64> {
-        self.reasons.get(&reason).copied()
-    }
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn get_stats(&self) -> &HashMap<DoneReason, u64> {
-        &self.reasons
-    }
-}
-
-#[cfg(test)]
-pub mod test {
-    use super::DoneReason;
-    use super::PacketDropStats;
-
-    #[test]
-    fn test_packet_drop_stats() {
-        let mut stats = PacketDropStats::new("Stats:pipeline-FOO-stage-BAR");
-        stats.incr(DoneReason::InterfaceAdmDown, 10);
-        stats.incr(DoneReason::InterfaceAdmDown, 1);
-        stats.incr(DoneReason::RouteFailure, 9);
-        stats.incr(DoneReason::Unroutable, 13);
-
-        // look up some particular stats
-        assert_eq!(stats.get_stat(DoneReason::InterfaceAdmDown), Some(11));
-        assert_eq!(stats.get_stat(DoneReason::Unroutable), Some(13));
-        assert_eq!(stats.get_stat(DoneReason::InterfaceUnsupported), None);
-
-        // access the whole stats map
-        let read = stats.get_stats();
-        assert_eq!(read.get(&DoneReason::InterfaceAdmDown), Some(11).as_ref());
     }
 }

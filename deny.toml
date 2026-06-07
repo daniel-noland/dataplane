@@ -1,6 +1,15 @@
 # see https://github.com/EmbarkStudios/cargo-deny for docs
 [graph]
-targets = []
+# We only ship on Linux, so scope the dependency graph to the Linux targets we
+# actually build for. This keeps Windows/macOS-only crates (e.g. windows-sys,
+# winapi) out of advisory/license/ban checks, where they are dangerous noise.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "wasm32-wasip1",
+]
 #exclude = []
 all-features = false
 no-default-features = false
@@ -12,15 +21,8 @@ feature-depth = 1
 
 [advisories]
 ignore = [
+    # paste is unmaintained but is needed by netlink-packet-core.  We should submit a patch when possible.
     "RUSTSEC-2024-0436",
-    # this relates to the use of abandoned "safemem" crate in cloud-hypervisor.
-    # Since cloud-hypervisor is only a dev-dependency, we can safely ignore this.
-    "RUSTSEC-2023-0081",
-    # instant is unmaintained but is needed by afpacket with the tokio feature, remove when we stop using this crate in favor of our own
-    "RUSTSEC-2024-0384",
-    # rustls_pemfile is unmaintained, but we aren't actually even using it.  We don't enable the feature of bollard
-    # which would pull this in.
-    "RUSTSEC-2025-0134"
 ]
 
 [licenses]
@@ -196,39 +198,6 @@ deny = [
 # If true, the allowed features must exactly match the enabled feature set. If
 # this is set there is no point setting `deny`
 #exact = true
-
-# Similarly to `skip` allows you to skip certain crates during duplicate
-# detection. Unlike skip, it also includes the entire tree of transitive
-# dependencies starting at the specified crate, up to a certain depth, which is
-# by default infinite.
-
-[[bans.skip-tree]]
-name = "cbindgen"
-version = "*"
-reason = "cbindgen is always a dev dependency for us and we don't care if it pulls in other versions of things"
-
-[[bans.skip]]
-name = "thiserror"
-version = "1.0.69"
-reason = "temporarily allowing this. Remove when default-net is updated"
-
-[[bans.skip]]
-name = "thiserror-impl"
-version = "1.0.69"
-reason = "temporarily allowing this. Remove when default-net is updated"
-
-[[bans.skip]]
-name = "regex-automata"
-reason = "needed for test tracing.  Remove this exception when https://github.com/tokio-rs/tracing/pull/3033 lands"
-
-[[bans.skip]]
-name = "regex-syntax"
-reason = "needed for test tracing.  Remove this exception when https://github.com/tokio-rs/tracing/pull/3033 lands"
-
-[[bans.skip-tree]]
-name = "rustyline"
-version = "*"
-reason = "Only used by cli"
 
 # This section is considered when running `cargo deny check sources`.
 # More documentation about the 'sources' section can be found here:

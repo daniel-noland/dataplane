@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Open Network Fabric Authors
 
+// Required for `self: Arc<Self>` methods under loom's Arc newtype.
+#![cfg_attr(feature = "loom", feature(arbitrary_self_types))]
 #![deny(clippy::all, clippy::pedantic)]
 #![deny(rustdoc::all)]
 #![allow(clippy::missing_errors_doc)]
@@ -21,6 +23,7 @@
 //! - The total number of available (not excluded) private addresses used in an "Expose" object must
 //!   be equal to the total number of publicly exposed addresses in this object.
 
+mod common;
 mod icmp_handler;
 mod port;
 pub mod portfw;
@@ -34,7 +37,7 @@ pub use stateful::StatefulNat;
 pub use stateless::StatelessNat;
 use std::net::IpAddr;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct NatTranslationData {
     src_addr: Option<IpAddr>,
     dst_addr: Option<IpAddr>,
@@ -43,8 +46,18 @@ struct NatTranslationData {
 }
 impl NatTranslationData {
     #[must_use]
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(
+        src_addr: Option<IpAddr>,
+        dst_addr: Option<IpAddr>,
+        src_port: Option<NatPort>,
+        dst_port: Option<NatPort>,
+    ) -> Self {
+        Self {
+            src_addr,
+            dst_addr,
+            src_port,
+            dst_port,
+        }
     }
     #[must_use]
     pub(crate) fn src_addr(mut self, address: IpAddr) -> Self {

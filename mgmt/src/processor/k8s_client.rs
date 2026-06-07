@@ -3,7 +3,7 @@
 
 //! K8s client that glues the gateway to k8s
 
-use std::sync::Arc;
+use concurrency::sync::Arc;
 use std::time::SystemTime;
 
 use chrono::{TimeZone, Utc};
@@ -50,7 +50,7 @@ pub(crate) async fn build_gateway_status(
     let (last_applied_gen, last_applied_time) = match config_client.get_current_config().await {
         Ok(config) => (
             config.genid(),
-            to_datetime(config.meta.load().apply_t.as_ref()),
+            to_datetime(config.meta().load().apply_t.as_ref()),
         ),
         Err(e) => {
             error!("Failed to get current config, skipping status update: {e}");

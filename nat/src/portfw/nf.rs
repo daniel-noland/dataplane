@@ -4,26 +4,25 @@
 //! Port forwarding stage
 
 use crate::portfw::{PortFwEntry, PortFwKey, PortFwState, PortFwTable, PortFwTableReader};
-use flow_entry::flow_table::FlowTable;
+use concurrency::sync::{Arc, Weak};
+use flow_entry::flow_table::table::FlowTable;
 
 use net::buffer::PacketBufferMut;
-use net::flows::{ExtractMut, FlowInfo};
-use net::headers::{TryIp, TryTcp, TryTransport};
-use net::ip::{NextHeader, UnicastIpAddr};
+use net::flows::{ExtractMut, ExtractRef, FlowInfo};
+use net::headers::{Transport, TryHeaders, TryIp};
+use net::ip::UnicastIpAddr;
 use net::packet::{DoneReason, Packet, VpcDiscriminant};
 use pipeline::{NetworkFunction, PipelineData};
 use std::num::NonZero;
-use std::sync::Arc;
 use std::time::Instant;
 
-use crate::portfw::flow_state::PortFwAction;
+use crate::common::NatAction;
 use crate::portfw::flow_state::build_portfw_flow_keys;
 use crate::portfw::flow_state::get_packet_port_fw_state;
-use crate::portfw::flow_state::invalidate_flow_state;
 use crate::portfw::flow_state::refresh_port_fw_entry;
 use crate::portfw::flow_state::setup_forward_flow;
 use crate::portfw::flow_state::setup_reverse_flow;
-use crate::portfw::packet::{dnat_packet, nat_packet};
+use crate::portfw::packet::nat_packet;
 
 #[allow(unused)]
 use tracing::{debug, error, trace, warn};
@@ -49,8 +48,9 @@ impl PortForwarder {
     }
 
     /// Tell if a packet can be port-forwarded. For that to happen, a packet must be
-    /// unicast Ipv4 or IPv6 and carry UDP/TCP payload. If a packet can be port-forwarded,
-    /// a `PortFwKey` is returned, along with the destination address and port to translate.
+    /// unicast Ipv4 or IPv6 and carry UDP/TCP payload. In case of TCP, it must be the first segment.
+    /// If a packet can be port-forwarded, a `PortFwKey` is returned, along with the
+    /// destination address and port.
     fn can_be_port_forwarded<Buf: PacketBufferMut>(
         packet: &mut Packet<Buf>,
     ) -> Option<(PortFwKey, UnicastIpAddr, NonZero<u16>)> {
@@ -61,39 +61,36 @@ impl PortForwarder {
             packet.done(DoneReason::InternalFailure);
             return None;
         };
-        let Some(net) = packet.try_ip() else {
-            debug!("packet is not ipv4/ipv6: will ignore");
-            return None;
-        };
-        let proto = net.next_header();
-        if proto != NextHeader::TCP && proto != NextHeader::UDP {
-            debug!("packet is not tcp/udp: will ignore");
-            return None;
-        }
-        let dst_ip = net.dst_addr();
-        let Ok(dst_ip) = UnicastIpAddr::try_from(dst_ip) else {
-            debug!("Packet destination is not unicast: will ignore");
-            return None;
-        };
-        let Some(transport) = packet.try_transport() else {
-            error!("can't get packet transport headers: will drop");
-            packet.done(DoneReason::InternalFailure);
-            return None;
-        };
-        if let Some(tcp) = packet.try_tcp()
-            && (!tcp.syn() || tcp.ack())
+
+        if let Some((dst_ip, dst_port, proto)) =
+            match packet.headers().pat().eth().net().transport().done() {
+                Some((_, _net, Transport::Tcp(tcp))) if !tcp.is_first_segment() => {
+                    debug!("Ignoring TCP packet: it has no SYN and we have no state for it");
+                    None
+                }
+                Some((_, net, tp))
+                    if let Some(dst_port) = tp.dst_port()
+                        && let dst_ip = net.dst_addr() =>
+                {
+                    if let Ok(dst_ip) = UnicastIpAddr::try_from(dst_ip) {
+                        debug!("Packet qualifies for port-forwarding");
+                        Some((dst_ip, dst_port, net.next_header()))
+                    } else {
+                        debug!("Ignoring packet: destination IP is not unicast");
+                        None
+                    }
+                }
+                _ => {
+                    debug!("Ignoring packet: packet type does not qualify");
+                    None
+                }
+            }
         {
-            debug!("Dropping TCP segment: it has no SYN (or ack) and we have no state for it");
-            packet.done(DoneReason::Filtered);
-            return None;
+            let key = PortFwKey::new(src_vpcd, proto);
+            Some((key, dst_ip, dst_port))
+        } else {
+            None
         }
-        let Some(dst_port) = transport.dst_port() else {
-            error!("can't get dst port from {proto} header: will drop");
-            packet.done(DoneReason::InternalFailure);
-            return None;
-        };
-        let key = PortFwKey::new(src_vpcd, proto);
-        Some((key, dst_ip, dst_port))
     }
 
     fn do_port_forwarding<Buf: PacketBufferMut>(
@@ -122,19 +119,39 @@ impl PortForwarder {
         let status = setup_forward_flow(&fw_key, &fw_flow, entry, new_dst_ip, new_dst_port);
         setup_reverse_flow(&rev_key, &rev_flow, entry, dst_ip, dst_port, status);
 
-        // translate destination according to the rule matched. If this fails, no state will be created
-        if !dnat_packet(packet, new_dst_ip.inner(), new_dst_port) {
+        // get the state we just created for the FORWARD direction
+        let locked = fw_flow.locked.read();
+        let pfw_state = locked
+            .port_fw_state
+            .extract_ref::<PortFwState>()
+            .unwrap_or_else(|| unreachable!());
+
+        // translate destination according to the rule. If this fails, no state will be created
+        if let Err(e) = nat_packet(packet, pfw_state) {
+            debug!("Failed to port-forward packet (initial):{e}");
             packet.done(DoneReason::InternalFailure);
             return;
         }
 
         // insert the two related flows
-        if let Some(prior) = self.flow_table.insert_from_arc(fw_key, &fw_flow) {
-            debug!("Replaced flow entry: {prior}");
+        if let Err(e) = self.flow_table.insert_from_arc(&fw_flow) {
+            warn!("Failed to insert flow (forward) in the flow table: {e}");
+            packet.done(DoneReason::FlowCapacityExceeded);
+            return;
         }
-        if let Some(prior) = self.flow_table.insert_from_arc(rev_key, &rev_flow) {
-            debug!("Replaced flow entry: {prior}");
+
+        // The reverse insert is expected to always succeed: capacity enforcement
+        // recognises that rev_flow has a related flow (fw_flow) already in the table
+        // and admits it unconditionally.  Remove the forward entry on the unlikely
+        // event of failure to avoid leaving a one-sided flow.
+        if let Err(e) = self.flow_table.insert_from_arc(&rev_flow) {
+            fw_flow.invalidate();
+            warn!("Failed to insert flow (reverse) in the flow table: {e}");
+            packet.done(DoneReason::FlowCapacityExceeded);
+            debug_assert!(false, "reverse port-forwarding flow insert failed: {e:?}");
+            return;
         }
+        debug!("Inserted forward and reverse port-forwarding flow entries");
     }
 
     fn try_port_forwarding<Buf: PacketBufferMut>(
@@ -146,24 +163,23 @@ impl PortForwarder {
 
         // check if the packet can be port forwarded at all
         let Some((key, dst_ip, dst_port)) = Self::can_be_port_forwarded(packet) else {
-            packet.done(DoneReason::Filtered);
-            let reason = packet.get_done().unwrap_or_else(|| unreachable!());
-            debug!("{nfi}: packet cannot be port-forwarded. Dropping it (reason:{reason})");
+            packet.done(DoneReason::NatNotPortForwarded);
+            debug!("{nfi}: packet cannot be port-forwarded. Dropping...");
             return;
         };
 
         // lookup the port-forwarding rule, using the given key, that contains the destination port
         let Some(entry) = pfwtable.lookup_matching_rule(key, dst_ip.inner(), dst_port) else {
-            debug!("{nfi}: no rule found for port-forwarding key {key}. Dropping packet.");
-            packet.done(DoneReason::Filtered);
+            debug!("{nfi}: no rule found for port-forwarding key {key}. Dropping packet...");
+            packet.done(DoneReason::NatNotPortForwarded);
             return;
         };
 
         // map the destination address and port
         let Some((new_dst_ip, new_dst_port)) = entry.map_address_port(dst_ip.inner(), dst_port)
         else {
-            debug!("{nfi}: Unable to build usable address and port"); // FIXME:
-            packet.done(DoneReason::Filtered);
+            debug!("{nfi}: Unable to build usable address or port");
+            packet.done(DoneReason::InternalFailure);
             return;
         };
 
@@ -255,7 +271,7 @@ impl PortForwarder {
     }
 
     fn reassign_port_fw_rule(flow_info: &FlowInfo, entry: &Arc<PortFwEntry>) {
-        let mut flow_info_locked = flow_info.locked.write().unwrap();
+        let mut flow_info_locked = flow_info.locked.write();
         if let Some(state) = flow_info_locked.port_fw_state.extract_mut::<PortFwState>() {
             state.rule = Arc::downgrade(entry);
         }
@@ -271,10 +287,8 @@ impl PortForwarder {
 
         // find compatible rule depending on the path this packet lives, forward or reverse
         let entry = match state.action() {
-            PortFwAction::DstNat => {
-                Self::get_rule_from_pkt_fw_path(packet, dst_vpcd, state, pfwtable)
-            }
-            PortFwAction::SrcNat => {
+            NatAction::DstNat => Self::get_rule_from_pkt_fw_path(packet, dst_vpcd, state, pfwtable),
+            NatAction::SrcNat => {
                 Self::get_rule_from_pkt_rev_path(packet, dst_vpcd, state, pfwtable)
             }
         };
@@ -283,11 +297,7 @@ impl PortForwarder {
         // point to it so that subsequent packets are fast-forwarded.
         if let Some(entry) = entry.as_ref() {
             Self::reassign_port_fw_rule(flow_info, entry);
-            if let Some(related) = flow_info
-                .related
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-            {
+            if let Some(related) = flow_info.related.as_ref().and_then(Weak::upgrade) {
                 Self::reassign_port_fw_rule(&related, entry);
             }
         }
@@ -318,9 +328,9 @@ impl PortForwarder {
             } else {
                 debug!("Packet hit Active flow referring to STALE port-forwarding rule.");
                 let Some(entry) = Self::get_rule_from_pkt(packet, pfwtable, &state) else {
-                    debug!("Packet should no longer be forwarded. Will drop and invalidate state");
-                    packet.done(DoneReason::Filtered);
-                    invalidate_flow_state(packet);
+                    debug!("Packet should no longer be forwarded. Will drop and invalidate flows");
+                    packet.done(DoneReason::NatNotPortForwarded);
+                    packet.invalidate_flows();
                     return;
                 };
                 /* we found a port-forwarding rule that grants access to this packet */
@@ -328,8 +338,8 @@ impl PortForwarder {
             };
 
             // nat the packet
-            if !nat_packet(packet, &state) {
-                error!("Failed to nat port-forwarded packet");
+            if let Err(e) = nat_packet(packet, &state) {
+                error!("Failed to port-forward packet:{e}");
                 packet.done(DoneReason::InternalFailure);
                 return;
             }

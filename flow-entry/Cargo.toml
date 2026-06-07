@@ -6,7 +6,9 @@ publish.workspace = true
 version.workspace = true
 
 [features]
+loom = ["concurrency/loom"]
 shuttle = ["concurrency/shuttle"]
+shuttle_dfs = ["concurrency/shuttle_dfs", "shuttle"]
 std = []
 testing = []
 bolero = ["dep:bolero", "net/bolero"]
@@ -29,6 +31,8 @@ tracing = { workspace = true }
 [dev-dependencies]
 bolero = { workspace = true, default-features = false }
 net = { workspace = true, features = ["bolero"] }
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 tracing-test = { workspace = true, features = [] }
+
+[target.'cfg(not(miri))'.dev-dependencies]
 shuttle = { workspace = true }

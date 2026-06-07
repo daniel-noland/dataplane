@@ -15,21 +15,29 @@ use crate::headers::{
     TryIp, TryTransport,
 };
 use crate::icmp_any::TruncatedIcmpAny;
+use crate::icmp4::Icmp4Type;
 use crate::icmp4::{Icmp4, TruncatedIcmp4};
+use crate::icmp6::Icmp6Type;
 use crate::icmp6::{Icmp6, TruncatedIcmp6};
 use crate::ip::NextHeader;
 use crate::packet::Packet;
 use crate::packet::VpcDiscriminant;
 use crate::tcp::{TcpPort, TcpPortError};
 use crate::udp::{UdpPort, UdpPortError};
-use etherparse::{Icmpv4Type, Icmpv6Type};
 
 #[derive(Debug, thiserror::Error)]
 /// Errors that may occur when building a `FlowKey`
 pub enum FlowKeyError {
-    #[error("Flow key data not found in packet")]
-    /// No key data found
+    #[error("Failed to build flow key")]
     NoFlowKeyData,
+    #[error("Failed to access embedded headers")]
+    NoEmbeddedHeaders,
+    #[error("Failed to build key for embedded: packet is not icmp error message")]
+    NotIcmpError,
+    #[error("Failed to build key for embedded: embedded packet has no {0} header")]
+    EmbeddedMissingHeader(&'static str),
+    #[error("Failed to build key for embedded: inner icmp has no identifier")]
+    EmbeddedMissingIcmpId,
 }
 
 trait HashSrc {
@@ -308,10 +316,9 @@ pub enum IcmpProtoKey {
 impl IcmpProtoKey {
     fn new_icmp_v4<Buf: PacketBufferMut>(packet: &Packet<Buf>, icmp: &Icmp4) -> Self {
         match icmp.icmp_type() {
-            Icmpv4Type::EchoRequest(echo_header) | Icmpv4Type::EchoReply(echo_header) => {
-                IcmpProtoKey::QueryMsgData(echo_header.id)
-            }
-            Icmpv4Type::TimeExceeded(_) | Icmpv4Type::DestinationUnreachable(_) => {
+            Icmp4Type::EchoRequest(v) => IcmpProtoKey::QueryMsgData(v.id),
+            Icmp4Type::EchoReply(v) => IcmpProtoKey::QueryMsgData(v.id),
+            _ if icmp.is_error_message() => {
                 IcmpProtoKey::ErrorMsgData(EmbeddedPacketData::try_from_packet(packet))
             }
             _ => IcmpProtoKey::Unsupported,
@@ -319,12 +326,10 @@ impl IcmpProtoKey {
     }
 
     fn new_icmp_v6<Buf: PacketBufferMut>(packet: &Packet<Buf>, icmp: &Icmp6) -> Self {
-        #[allow(clippy::match_single_binding)]
         match icmp.icmp_type() {
-            Icmpv6Type::EchoRequest(echo_header) | Icmpv6Type::EchoReply(echo_header) => {
-                IcmpProtoKey::QueryMsgData(echo_header.id)
-            }
-            Icmpv6Type::TimeExceeded(_) | Icmpv6Type::DestinationUnreachable(_) => {
+            Icmp6Type::EchoRequest(v) => IcmpProtoKey::QueryMsgData(v.id),
+            Icmp6Type::EchoReply(v) => IcmpProtoKey::QueryMsgData(v.id),
+            _ if icmp.is_error_message() => {
                 IcmpProtoKey::ErrorMsgData(EmbeddedPacketData::try_from_packet(packet))
             }
             _ => IcmpProtoKey::Unsupported,
@@ -566,28 +571,6 @@ impl FlowKeyData {
     }
 }
 
-pub struct ExtendedFlowKey {
-    flow_key: FlowKey,
-    dst_vpcd: Option<VpcDiscriminant>,
-}
-impl ExtendedFlowKey {
-    #[must_use]
-    pub fn flow_key(&self) -> &FlowKey {
-        &self.flow_key
-    }
-    #[must_use]
-    pub fn dst_vpcd(&self) -> Option<VpcDiscriminant> {
-        self.dst_vpcd
-    }
-    #[must_use]
-    pub fn reverse(&self) -> Self {
-        Self {
-            flow_key: self.flow_key.reverse(self.dst_vpcd),
-            dst_vpcd: self.flow_key.data().src_vpcd,
-        }
-    }
-}
-
 impl Hash for FlowKeyData {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.src_vpcd.hash(state);
@@ -614,14 +597,6 @@ impl FlowKey {
     pub fn data_mut(&mut self) -> &mut FlowKeyData {
         match self {
             FlowKey::Unidirectional(data) => data,
-        }
-    }
-
-    #[must_use]
-    pub fn extend_with_dst_vpcd(&self, dst_vpcd: VpcDiscriminant) -> ExtendedFlowKey {
-        ExtendedFlowKey {
-            flow_key: *self,
-            dst_vpcd: Some(dst_vpcd),
         }
     }
 
@@ -665,17 +640,6 @@ impl Hash for FlowKey {
 }
 
 /// Wrapper to specify unidirectional `FlowKey` creation
-///
-/// Example:
-/// ```
-/// # use dataplane_net::FlowKey;
-/// # use dataplane_net::flow_key::{Uni};
-/// # use dataplane_net::ip::NextHeader;
-/// # use dataplane_net::packet::test_utils::build_test_ipv4_packet_with_transport;
-/// # let packet = build_test_ipv4_packet_with_transport(100, Some(NextHeader::TCP)).unwrap();
-/// let flow_key = FlowKey::try_from(Uni(&packet));
-/// # assert!(flow_key.is_ok());
-/// ```
 #[repr(transparent)]
 #[derive(Debug)]
 pub struct Uni<T>(pub T);
@@ -718,6 +682,64 @@ impl<Buf: PacketBufferMut> TryFrom<Uni<&Packet<Buf>>> for FlowKey {
 
         Ok(FlowKey::uni(src_vpcd, src_ip, dst_ip, proto_key_info))
     }
+}
+
+/// Build a `FlowKey` for the inner packet embedded in `packet` if it is an ICMP error packet.
+/// This function does not set any `VpcDiscriminant` and will fail if:
+///    * the packet is not an ICMP error packet
+///    * the headers for the embedded packet are not accessible as a whole
+///    * the ip or transport header is not readable
+///    * if the embedded packet is ICMP but has no identifier (is not an Echo Request / Echo Reply)
+///
+/// # Errors
+///
+/// This function returns a `FlowKey` on success and `FlowKeyError` otherwise.
+///
+pub fn flowkey_embedded_in_icmp_error<Buf: PacketBufferMut>(
+    packet: &mut Packet<Buf>,
+) -> Result<FlowKey, FlowKeyError> {
+    // we currently restrict this to ICMP error packets
+    if !packet.is_icmp_error() {
+        return Err(FlowKeyError::NotIcmpError);
+    }
+
+    // access embedded packet fragment
+    let inner = packet
+        .embedded_headers()
+        .ok_or(FlowKeyError::NoEmbeddedHeaders)?;
+
+    // get data from embedded
+    let net = inner
+        .try_inner_ip()
+        .ok_or(FlowKeyError::EmbeddedMissingHeader("ip"))?;
+
+    let src_ip = net.src_addr();
+    let dst_ip = net.dst_addr();
+    let embedded_transport = inner
+        .try_embedded_transport()
+        .ok_or(FlowKeyError::EmbeddedMissingHeader("transport"))?;
+
+    // build the protocol key
+    let proto_key = match embedded_transport {
+        EmbeddedTransport::Tcp(tcp) => {
+            IpProtoKey::Tcp(TcpProtoKey::from((tcp.source(), tcp.destination())))
+        }
+        EmbeddedTransport::Udp(udp) => {
+            IpProtoKey::Udp(UdpProtoKey::from((udp.source(), udp.destination())))
+        }
+        EmbeddedTransport::Icmp4(icmp) if let Some(icmp_id) = icmp.identifier() => {
+            IpProtoKey::Icmp(IcmpProtoKey::QueryMsgData(icmp_id))
+        }
+        EmbeddedTransport::Icmp6(icmp6) if let Some(icmp_id) = icmp6.identifier() => {
+            IpProtoKey::Icmp(IcmpProtoKey::QueryMsgData(icmp_id))
+        }
+        EmbeddedTransport::Icmp4(_) | EmbeddedTransport::Icmp6(_) => {
+            // we can only get an id if the packet is echo request / echo reply.
+            // that's fine because ICMP errors should not be sent for ICMP errors.
+            return Err(FlowKeyError::EmbeddedMissingIcmpId);
+        }
+    };
+    Ok(FlowKey::uni(None, src_ip, dst_ip, proto_key))
 }
 
 #[cfg(any(test, feature = "bolero"))]
@@ -871,11 +893,11 @@ mod contract {
 mod tests {
     use super::*;
     use crate::buffer::TestBuffer;
-    use crate::headers::TryIpv6;
+    use crate::headers::{EmbeddedTransport, TryInnerIpMut, TryIpv6};
     use crate::ip::UnicastIpAddr;
     use crate::ipv4::addr::UnicastIpv4Addr;
     use crate::ipv6::addr::UnicastIpv6Addr;
-    use crate::packet::contract::CommonPacket;
+    use crate::packet::contract::{CommonPacket, IcmpErrorMsg};
     use crate::packet::{Packet, VpcDiscriminant};
     use crate::vxlan::Vni;
     use ahash::AHasher;
@@ -953,10 +975,6 @@ mod tests {
                     packet.set_icmp_query_identifier(id).unwrap();
                 }
                 IcmpProtoKey::ErrorMsgData(Some(data)) => {
-                    // FIXME: This code is never exercised.
-                    // This is because we never produce packets with non-empty embedded headers from
-                    // the packet generator. As a result, we never have embedded headers to pass to
-                    // the IcmpProtoKey::ErrorMsgData().
                     match data.proto_key_info() {
                         InnerIpProtoKey::Tcp(tcp) => {
                             packet
@@ -988,7 +1006,14 @@ mod tests {
                                     )
                                     .unwrap();
                             }
-                            InnerIcmpProtoKey::Unsupported => {}
+                            InnerIcmpProtoKey::Unsupported => {
+                                // Still need to set inner IPs so extraction
+                                // finds the addresses we expect.
+                                let ip = packet.try_inner_ip_mut().unwrap();
+                                ip.try_set_source(UnicastIpAddr::try_from(*data.src_ip()).unwrap())
+                                    .unwrap();
+                                ip.try_set_destination(*data.dst_ip()).unwrap();
+                            }
                         },
                     }
                 }
@@ -998,10 +1023,73 @@ mod tests {
     }
 
     struct FlowKeyAndPacket;
+    impl FlowKeyAndPacket {
+        /// Build the expected [`EmbeddedPacketData`] by inspecting the
+        /// packet's embedded transport and generating matching inner
+        /// addresses and proto-key values.
+        fn embedded_data_for<D: Driver>(
+            packet: &Packet<TestBuffer>,
+            v6: bool,
+            driver: &mut D,
+        ) -> Option<EmbeddedPacketData> {
+            let headers = packet.embedded_headers()?;
+            let transport = headers.try_embedded_transport()?;
+            let proto_key_info = match transport {
+                EmbeddedTransport::Tcp(_) => InnerIpProtoKey::Tcp(TcpProtoKey {
+                    src_port: driver.produce()?,
+                    dst_port: driver.produce()?,
+                }),
+                EmbeddedTransport::Udp(_) => InnerIpProtoKey::Udp(UdpProtoKey {
+                    src_port: driver.produce()?,
+                    dst_port: driver.produce()?,
+                }),
+                EmbeddedTransport::Icmp4(icmp) => {
+                    // Must mirror InnerIcmpProtoKey::new_icmp_v4: check
+                    // both is_query AND that the identifier is accessible
+                    // (truncated headers might lack the id field).
+                    if icmp.is_query_message() && icmp.identifier().is_some() {
+                        InnerIpProtoKey::Icmp(InnerIcmpProtoKey::QueryMsgData(driver.produce()?))
+                    } else {
+                        InnerIpProtoKey::Icmp(InnerIcmpProtoKey::Unsupported)
+                    }
+                }
+                EmbeddedTransport::Icmp6(icmp) => {
+                    if icmp.is_query_message() && icmp.identifier().is_some() {
+                        InnerIpProtoKey::Icmp(InnerIcmpProtoKey::QueryMsgData(driver.produce()?))
+                    } else {
+                        InnerIpProtoKey::Icmp(InnerIcmpProtoKey::Unsupported)
+                    }
+                }
+            };
+            let (src_ip, dst_ip) = if v6 {
+                (
+                    UnicastIpAddr::from(driver.produce::<UnicastIpv6Addr>()?).into(),
+                    UnicastIpAddr::from(driver.produce::<UnicastIpv6Addr>()?).into(),
+                )
+            } else {
+                (
+                    UnicastIpAddr::from(driver.produce::<UnicastIpv4Addr>()?).into(),
+                    UnicastIpAddr::from(driver.produce::<UnicastIpv4Addr>()?).into(),
+                )
+            };
+            Some(EmbeddedPacketData {
+                src_ip,
+                dst_ip,
+                proto_key_info,
+            })
+        }
+    }
     impl ValueGenerator for FlowKeyAndPacket {
         type Output = (Option<FlowKey>, Packet<TestBuffer>);
         fn generate<D: Driver>(&self, driver: &mut D) -> Option<Self::Output> {
-            let packet = CommonPacket.generate(driver)?;
+            // Half the time, generate an ICMP error packet with embedded
+            // headers so the ErrorMsgData(Some(..)) path is exercised.
+            let use_icmp_error = driver.produce::<bool>()?;
+            let packet = if use_icmp_error {
+                IcmpErrorMsg.generate(driver)?
+            } else {
+                CommonPacket.generate(driver)?
+            };
             let v6 = packet.headers().try_ipv6().is_some();
             let (src_ip, dst_ip) = if v6 {
                 (
@@ -1027,23 +1115,23 @@ mod tests {
                     src_port: driver.produce()?,
                     dst_port: driver.produce()?,
                 })),
-                // To keep in sync with IcmpProtoKey::new_icmp_v4()
                 Transport::Icmp4(icmp) => match icmp.icmp_type() {
-                    Icmpv4Type::EchoRequest(_) | Icmpv4Type::EchoReply(_) => Some(
-                        IpProtoKey::Icmp(IcmpProtoKey::QueryMsgData(driver.produce()?)),
-                    ),
-                    Icmpv4Type::DestinationUnreachable(_) | Icmpv4Type::TimeExceeded(_) => {
-                        Some(IpProtoKey::Icmp(IcmpProtoKey::ErrorMsgData(None)))
+                    Icmp4Type::EchoRequest(_) | Icmp4Type::EchoReply(_) => Some(IpProtoKey::Icmp(
+                        IcmpProtoKey::QueryMsgData(driver.produce()?),
+                    )),
+                    _ if icmp.is_error_message() => {
+                        let embedded = Self::embedded_data_for(&packet, v6, driver);
+                        Some(IpProtoKey::Icmp(IcmpProtoKey::ErrorMsgData(embedded)))
                     }
                     _ => Some(IpProtoKey::Icmp(IcmpProtoKey::Unsupported)),
                 },
-                // To keep in sync with IcmpProtoKey::new_icmp_v6()
                 Transport::Icmp6(icmp) => match icmp.icmp_type() {
-                    Icmpv6Type::EchoRequest(_) | Icmpv6Type::EchoReply(_) => Some(
-                        IpProtoKey::Icmp(IcmpProtoKey::QueryMsgData(driver.produce()?)),
-                    ),
-                    Icmpv6Type::DestinationUnreachable(_) | Icmpv6Type::TimeExceeded(_) => {
-                        Some(IpProtoKey::Icmp(IcmpProtoKey::ErrorMsgData(None)))
+                    Icmp6Type::EchoRequest(_) | Icmp6Type::EchoReply(_) => Some(IpProtoKey::Icmp(
+                        IcmpProtoKey::QueryMsgData(driver.produce()?),
+                    )),
+                    _ if icmp.is_error_message() => {
+                        let embedded = Self::embedded_data_for(&packet, v6, driver);
+                        Some(IpProtoKey::Icmp(IcmpProtoKey::ErrorMsgData(embedded)))
                     }
                     _ => Some(IpProtoKey::Icmp(IcmpProtoKey::Unsupported)),
                 },

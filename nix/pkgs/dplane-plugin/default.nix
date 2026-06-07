@@ -8,7 +8,6 @@
   frr,
   libyang,
   pcre2,
-  protobufc,
   json_c,
 
   # args
@@ -25,8 +24,6 @@ stdenv.mkDerivation (finalAttrs: {
   doFixup = false;
   enableParallelBuilding = true;
 
-  dontUnpack = true;
-
   nativeBuildInputs = [
     cmake
   ];
@@ -37,7 +34,6 @@ stdenv.mkDerivation (finalAttrs: {
     json_c
     libyang
     pcre2
-    protobufc
   ];
 
   configurePhase = ''
@@ -51,7 +47,7 @@ stdenv.mkDerivation (finalAttrs: {
       -DHH_FRR_SRC=${frr.dataplane.build}/src/frr \
       -DHH_FRR_INCLUDE=${frr.dataplane}/include/frr \
       -DCMAKE_C_STANDARD=23 \
-      -S "$src"
+      -S .
   '';
 
   buildPhase = ''

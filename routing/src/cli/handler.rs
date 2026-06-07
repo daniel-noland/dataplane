@@ -22,11 +22,11 @@ use crate::routingdb::RoutingDb;
 
 use chrono::Local;
 use cli::cliproto::{CliAction, CliError, CliRequest, CliResponse, RequestArgs, RouteProtocol};
-use config::{ConfigSummary, GwConfig, GwConfigMeta};
+use concurrency::sync::Arc;
+use config::{ConfigSummary, GwConfigMeta, ValidatedGwConfig};
 use lpm::prefix::{Ipv4Prefix, Ipv6Prefix};
 use net::vxlan::Vni;
 use std::os::unix::net::SocketAddr;
-use std::sync::Arc;
 
 use common::cliprovider::{CliDataProvider, Heading};
 use strum::IntoEnumIterator;
@@ -125,7 +125,7 @@ fn show_ipv6_routes_multi(
 fn route_filter_v4(request: &CliRequest) -> RouteV4Filter {
     let filter: RouteV4Filter = if let Some(protocol) = &request.args.protocol {
         let origin = RouteOrigin::from(protocol);
-        Box::new(move |(_, route): &(&Ipv4Prefix, &Route)| route.origin == origin)
+        Box::new(move |(_, route): &(Ipv4Prefix, &Route)| route.origin == origin)
     } else {
         Box::new(|(_, _)| true)
     };
@@ -134,7 +134,7 @@ fn route_filter_v4(request: &CliRequest) -> RouteV4Filter {
 fn route_filter_v6(request: &CliRequest) -> RouteV6Filter {
     let filter: RouteV6Filter = if let Some(protocol) = &request.args.protocol {
         let origin = RouteOrigin::from(protocol);
-        Box::new(move |(_, route): &(&Ipv6Prefix, &Route)| route.origin == origin)
+        Box::new(move |(_, route): &(Ipv6Prefix, &Route)| route.origin == origin)
     } else {
         Box::new(|(_, _)| true)
     };
@@ -384,19 +384,19 @@ fn show_provider(
     CliResponse::from_request_ok(request, data)
 }
 
-fn show_config(request: CliRequest, config: Option<&Arc<GwConfig>>) -> CliResponse {
+fn show_config(request: CliRequest, config: Option<&Arc<ValidatedGwConfig>>) -> CliResponse {
     let Some(config) = config else {
         return CliResponse::from_request_ok(request, "No configuration is applied".to_string());
     };
-    let vpc_table = &config.external.overlay.vpc_table;
+    let vpc_table = &config.external().overlay().vpc_table();
     let contents = match request.action {
         CliAction::ShowVpc => vpc_table.as_summary().to_string(),
         CliAction::ShowVpcPeerings => vpc_table.as_peerings().to_string(),
-        CliAction::ShowGatewayGroups => config.external.gwgroups.to_string(),
-        CliAction::ShowGatewayCommunities => config.external.communities.to_string(),
+        CliAction::ShowGatewayGroups => config.external().gwgroups().to_string(),
+        CliAction::ShowGatewayCommunities => config.external().communities().to_string(),
         CliAction::ShowConfigInternal => {
             let heading = Heading("Internal configuration").to_string();
-            format!("{heading}{:#?}", config.internal)
+            format!("{heading}{:#?}", config.internal())
         }
         _ => unreachable!(),
     };
@@ -524,6 +524,7 @@ fn do_handle_cli_request(
         CliAction::ShowPortForwarding => show_provider(request, sources.portfw_table.as_deref()),
         CliAction::ShowStaticNat => show_provider(request, sources.nat_tables.as_deref()),
         CliAction::ShowMasquerading => show_provider(request, sources.masquerade_state.as_deref()),
+        CliAction::ShowPacketStats => show_provider(request, sources.pkt_stats.as_deref()),
         _ => Err(CliError::NotSupported("Not implemented yet".to_string()))?,
     };
     Ok(response)

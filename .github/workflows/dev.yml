@@ -14,6 +14,7 @@ on:
   push:
     branches:
       - "main"
+      - "release/v*"
     tags:
       - "v*"
   merge_group:
@@ -143,8 +144,7 @@ jobs:
             profile: "debug"
             sanitize: ""
             instrument: "none"
-          - &release-build
-            name: "release"
+          - name: "release"
             profile: "release"
             sanitize: "" # TODO: enable cfi and safe-stack when possible
             instrument: "none"
@@ -200,7 +200,6 @@ jobs:
         || github.event_name == 'workflow_dispatch'
       }}
     name: "${{matrix.nix-target}}/${{matrix.build.name}}"
-    continue-on-error: ${{ matrix.build.optional || false }}
     runs-on: lab
     needs:
       - check_changes
@@ -231,28 +230,33 @@ jobs:
       - *checkout
       - *nix-setup
       - *check-dependencies
+
       - name: "push container"
+        env:
+          VERSION: "${{ needs.version.outputs.version }}"
+          PROFILE: "${{ matrix.build.profile }}"
+          NIX_TARGET: "${{ matrix.nix-target }}"
+          SANITIZE: "${{ matrix.build.sanitize }}"
+          INSTRUMENT: "${{ matrix.build.instrument }}"
+          DEBUG_JUSTFILE: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug_justfile || false }}"
         run: |
-          nix-shell --run '
-            set -euo pipefail;
-            for v in "" "version=${{ needs.version.outputs.version }}-${{ matrix.build.profile }}"; do
-              if [ "${{ matrix.nix-target }}" = "validator" ]; then
-                platform="wasm32-wasip1"
-              else
-                platform="x86-64-v3"
-              fi
-              just \
-                  docker_sock=/run/docker/docker.sock \
-                  debug_justfile=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug_justfile || false }} \
-                  profile=${{ matrix.build.profile }} \
-                  platform=${platform} \
-                  sanitize=${{ matrix.build.sanitize }} \
-                  instrument=${{ matrix.build.instrument }} \
-                  oci_repo=ghcr.io \
-                  $v \
-                  push-container ${{ matrix.nix-target }}
-            done
-          '
+          set -euo pipefail
+          if [ "${NIX_TARGET}" = "validator" ]; then
+            platform="wasm32-wasip1"
+          else
+            platform="x86-64-v3"
+          fi
+          base_args=(
+            docker_sock=/run/docker/docker.sock
+            debug_justfile="${DEBUG_JUSTFILE}"
+            profile="${PROFILE}"
+            platform="${platform}"
+            sanitize="${SANITIZE}"
+            instrument="${INSTRUMENT}"
+            oci_repo=ghcr.io
+          )
+          just "${base_args[@]}" push-container "${NIX_TARGET}"
+          just "${base_args[@]}" "version=${VERSION}-${PROFILE}" push-container "${NIX_TARGET}"
       - *tmate
 
   sanitize:
@@ -263,7 +267,6 @@ jobs:
         || github.event_name == 'workflow_dispatch'
       }}
     name: "sanitize/${{ matrix.build.profile }}/${{ matrix.build.sanitize }}"
-    continue-on-error: true
     runs-on: "lab"
     needs:
       - check_changes
@@ -275,13 +278,13 @@ jobs:
       max-parallel: 1
       matrix:
         build:
-          - name: "address"
-            profile: "debug"
-            sanitize: "address"
-            instrument: "none"
           - name: "thread"
             profile: "fuzz"
             sanitize: "thread"
+            instrument: "none"
+          - name: "address"
+            profile: "debug"
+            sanitize: "address"
             instrument: "none"
     steps:
       - *checkout
@@ -321,32 +324,238 @@ jobs:
           recipe: "test-each"
       - *tmate
 
-  features:
+  miri:
     if: >-
       ${{
         needs.check_changes.outputs.devfiles == 'true'
         || startsWith(github.event.ref, 'refs/tags/v')
         || github.event_name == 'workflow_dispatch'
       }}
-    name: "features/${{ matrix.build.name }}/${{ matrix.features }}"
+    name: "check/miri/${{ matrix.cpu }}"
+    runs-on: "lab"
+    needs:
+      - check_changes
+    permissions:
+      checks: "write"
+      pull-requests: "read"
+      contents: "read"
+      packages: "read"
+      id-token: "write"
+    env:
+      USER: "runner"
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - cpu: "powerpc64" # ideal for testing concurrency due to very weak memory model (and is big endian)
+          # Disabled to save time in CI.  Enable if you are debugging memory issues and wish to bisect
+          # why something might pass on one CPU model but fail on another.
+          # Otherwise there is little benefit to enabling these CPUs in spite of their objectively more important
+          # support story.  They just don't really stress test endianness or memory model issues, and they don't
+          # meaningfully improve borrow check violation detection either.
+          # - cpu: "aarch64"
+          # - cpu: "x86_64"
+          # - cpu: "s390x" # this is miri's big endian CPU of choice, but it has a stronger memory model than powerpc64
+    steps:
+      - *checkout
+      - *nix-setup
+      - name: "all packages"
+        uses: *just
+        env:
+          JUST_VARS: >-
+            miri::cpu=${{ matrix.cpu }}
+        with:
+          recipe: "miri::test"
+      # The quiescent code is especially sensitive to concurrency violations
+      # and memory-model issues so we run it again with and without strict
+      # provenance enabled and on many different random schedules.  The
+      # permissive-provenance build runs with real arc-swap and could
+      # therefore catch issues which the strict run can't.  We run under
+      # extra schedules to make that effect stand out as much as possible
+      # (shuttle/loom can't test with arc-swap in place either, so this is
+      # the closest we can get to fixing that coverage gap).
+      - name: "concurrency/permissive"
+        uses: *just
+        env:
+          JUST_VARS: >-
+            miri::seeds=8
+            miri::cpu=${{ matrix.cpu }}
+            miri::provenance=permissive
+        with:
+          recipe: "miri::test"
+          recipe_args: "--package=dataplane-concurrency"
+      - name: "concurrency/strict"
+        uses: *just
+        env:
+          JUST_VARS: >-
+            miri::cpu=${{ matrix.cpu }}
+            miri::provenance=strict
+        with:
+          recipe: "miri::test"
+          recipe_args: "--package=dataplane-concurrency --features=_strict_provenance"
+      - *tmate
+
+  wasm:
+    if: >-
+      ${{
+        needs.check_changes.outputs.devfiles == 'true'
+        || startsWith(github.event.ref, 'refs/tags/v')
+        || github.event_name == 'workflow_dispatch'
+      }}
+    name: "${{ matrix.platform }}/${{ matrix.libc }}/${{ matrix.profile }}"
+    runs-on: "lab"
+    needs:
+      - check_changes
+    permissions:
+      checks: "write"
+      pull-requests: "read"
+      contents: "read"
+      packages: "read"
+      id-token: "write"
+    env:
+      USER: "runner"
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - platform: "wasm32-wasip1"
+            profile: "release"
+            libc: "none"
+            recipe:
+              name: "check"
+              args: ""
+    steps:
+      - *checkout
+      - *nix-setup
+      - name: "${{ matrix.platform }}/${{ matrix.libc }}/${{ matrix.profile }}"
+        uses: *just
+        env:
+          JUST_VARS: >-
+            platform=${{ matrix.platform }}
+            profile=${{ matrix.profile }}
+            libc=${{ matrix.libc }}
+        with:
+          recipe: "${{ matrix.recipe.name }}"
+          recipe_args: "${{ matrix.recipe.args }}"
+      - *tmate
+
+  cross:
+    if: >-
+      ${{
+        github.event_name == 'pull_request'
+        && (
+          contains(github.event.pull_request.labels.*.name, 'ci:+cross')
+          || contains(github.event.pull_request.labels.*.name, 'ci:+cross/full')
+        )
+        || (github.event_name == 'push' || github.event_name == 'merge_group')
+      }}
+    name: "${{ matrix.recipe.name }}/${{ matrix.recipe.args }}/${{ matrix.platform }}/${{ matrix.libc }}"
+    runs-on: "lab"
+    needs:
+      - check_changes
+      - check
+      - miri
+      - wasm
+    permissions:
+      checks: "write"
+      pull-requests: "read"
+      contents: "read"
+      packages: "read"
+      id-token: "write"
+    env:
+      USER: "runner"
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        platform:
+          - "aarch64"
+          - "bluefield3"
+        libc:
+          - "gnu"
+          - "musl"
+        profile:
+          - "debug"
+        recipe:
+          - name: "build-container"
+            args: "dataplane"
+          - name: "build-container"
+            args: "frr.dataplane"
+    steps:
+      - *checkout
+      - *nix-setup
+      - name: "test"
+        if: >-
+          ${{
+            matrix.recipe.args == 'dataplane'
+            && matrix.libc == 'musl'
+            && github.event_name == 'pull_request'
+            && contains(github.event.pull_request.labels.*.name, 'ci:+cross/full')
+          }}
+        uses: *just
+        env:
+          JUST_VARS: >-
+            platform=${{ matrix.platform }}
+            profile=${{ matrix.profile }}
+            libc=${{ matrix.libc }}
+        with:
+          recipe: "test"
+      - name: "${{ matrix.platform }}/${{ matrix.libc }}/${{ matrix.profile }}/${{ matrix.recipe.args }}"
+        uses: *just
+        env:
+          JUST_VARS: >-
+            platform=${{ matrix.platform }}
+            profile=${{ matrix.profile }}
+            libc=${{ matrix.libc }}
+        with:
+          recipe: "${{ matrix.recipe.name }}"
+          recipe_args: "${{ matrix.recipe.args }}"
+      - *tmate
+
+  concurrency:
+    if: >-
+      ${{
+        needs.check_changes.outputs.devfiles == 'true'
+        || startsWith(github.event.ref, 'refs/tags/v')
+        || github.event_name == 'workflow_dispatch'
+      }}
+    name: "concurrency"
     runs-on: "lab"
     needs:
       - check_changes
       - check
     permissions: *check-perms
-    env: *check-env
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        build:
-          - *release-build
-        features:
-          - "shuttle"
+    # This job doesn't use the `*check-env` anchor: that anchor's
+    # `JUST_VARS` references `matrix.build.*`, and this job has no
+    # matrix. Each step below sets `JUST_VARS` itself, inlining the
+    # docker_sock / debug_justfile / oci_repo settings that the
+    # anchor would have provided.
+    env:
+      USER: "runner"
     steps:
       - *checkout
       - *nix-setup
-      - name: "test/${{ matrix.features }}"
+      - name: "shuttle"
+        env:
+          JUST_VARS: >-
+            docker_sock=/run/docker/docker.sock
+            debug_justfile=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug_justfile || false }}
+            profile=release
+            features=shuttle
+            oci_repo=ghcr.io
+        uses: *just
+        with:
+          recipe: "test"
+      - name: "loom"
+        env:
+          JUST_VARS: >-
+            docker_sock=/run/docker/docker.sock
+            debug_justfile=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug_justfile || false }}
+            profile=release
+            features=loom
+            oci_repo=ghcr.io
         uses: *just
         with:
           recipe: "test"
@@ -416,6 +625,7 @@ jobs:
         upgradefrom:
           - ""
           - "26.01"
+          - "26.02"
         include:
           # gateway l3vni
           - fabricmode: spine-leaf
@@ -441,10 +651,12 @@ jobs:
     needs:
       - check
       - sanitize
-      - features
+      - concurrency
       - build
       - vlab
       - test_each
+      - miri
+      - wasm
     # Run always so this job can aggregate results even when one of its
     # dependencies failed or was skipped.
     #
@@ -458,10 +670,10 @@ jobs:
         run: |
           echo '::error:: Some check job(s) failed'
           exit 1
-      - name: "Flag any features matrix failures"
-        if: ${{ needs.features.result != 'success' && needs.features.result != 'skipped' }}
+      - name: "Flag any concurrency job failures"
+        if: ${{ needs.concurrency.result != 'success' && needs.concurrency.result != 'skipped' }}
         run: |
-          echo '::error:: Some features job(s) failed'
+          echo '::error:: concurrency job failed'
           exit 1
       - name: "Flag any test_each matrix failures"
         if: ${{ needs.test_each.result != 'success' && needs.test_each.result != 'skipped' }}
@@ -470,14 +682,23 @@ jobs:
           exit 1
       - name: "Flag any sanitize matrix failures"
         if: ${{ needs.sanitize.result != 'success' && needs.sanitize.result != 'skipped' }}
-        continue-on-error: true
         run: |
-          echo '::warning:: Some sanitize job(s) failed'
+          echo '::error:: Some sanitize job(s) failed'
+          exit 1
+      - name: "Flag any miri matrix failures"
+        if: ${{ needs.miri.result != 'success' && needs.miri.result != 'skipped' }}
+        run: |
+          echo '::error:: Some miri job(s) failed'
           exit 1
       - name: "Flag any build matrix failures"
         if: ${{ needs.build.result != 'success' && needs.build.result != 'skipped' }}
         run: |
           echo '::error:: Some build job(s) failed'
+          exit 1
+      - name: "Flag any wasm failures"
+        if: ${{ needs.wasm.result != 'success' && needs.wasm.result != 'skipped' }}
+        run: |
+          echo '::error:: Some wasm job(s) failed'
           exit 1
       - name: "Flag any vlab matrix failures"
         if: ${{ needs.vlab.result != 'success' && needs.vlab.result != 'skipped' }}
@@ -490,6 +711,7 @@ jobs:
     if: startsWith(github.event.ref, 'refs/tags/v') && github.event_name == 'push'
     needs:
       - build
+      - sanitize
       - vlab
 
     permissions:
@@ -513,36 +735,27 @@ jobs:
           cache: false
 
       - name: Login to ghcr.io
-        uses: docker/login-action@v4
+        uses: docker/login-action@v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: "Install nix"
-        uses: cachix/install-nix-action@v31
+      - uses: "./.github/actions/nix-shell"
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-          nix_path: nixpkgs=channel:nixpkgs-unstable
-
-      - uses: "cachix/cachix-action@v17"
-        with:
-          name: "hedgehog"
-          # prettier-ignore
-          signingKey: '${{ secrets.CACHIX_SIGNING_KEY }}'
-          # prettier-ignore
-          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+          cachix_signing_key: "${{ secrets.CACHIX_SIGNING_KEY }}"
+          cachix_auth_token: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
       - name: "push containers"
+        env:
+          ref_name: ${{ github.ref_name }}
         run: |
-          nix-shell --run "
-            set -euo pipefail;
-            just \
-              docker_sock=/run/docker/docker.sock \
-              oci_repo=ghcr.io \
-              version=${{ github.ref_name }} \
-              push
-          "
+          set -euo pipefail;
+          just \
+            docker_sock=/run/docker/docker.sock \
+            oci_repo=ghcr.io \
+            version="${ref_name}" \
+            push
 
       # Bump dataplane in the fabricator repository
 
@@ -555,9 +768,12 @@ jobs:
 
       - name: Bump dataplane+frr in fabricator
         working-directory: fab-repo
+        env:
+          ref_name: ${{ github.ref_name }}
         run: |
-          sed -i "s/^\tDataplaneVersion.*/\tDataplaneVersion=meta.Version(\"${{ github.ref_name }}\")/" pkg/fab/versions.go
-          sed -i "s/^\tFRRVersion.*/\tFRRVersion=meta.Version(\"${{ github.ref_name }}\")/" pkg/fab/versions.go
+          set -euo pipefail;
+          sed -i "s/^\tDataplaneVersion.*/\tDataplaneVersion=meta.Version(\"${ref_name}\")/" pkg/fab/versions.go
+          sed -i "s/^\tFRRVersion.*/\tFRRVersion=meta.Version(\"${ref_name}\")/" pkg/fab/versions.go
           go fmt pkg/fab/versions.go
 
       - name: Generate token for the fabricator repository

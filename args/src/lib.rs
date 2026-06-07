@@ -51,8 +51,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub use clap::Parser;
-use hardware::pci::address::InvalidPciAddress;
-use hardware::pci::address::PciAddress;
 use miette::{Context, IntoDiagnostic};
 use net::interface::IllegalInterfaceName;
 use net::interface::InterfaceName;
@@ -70,8 +68,8 @@ use std::time::Duration;
 )]
 #[rkyv(attr(derive(PartialEq, Eq, Debug)))]
 pub enum PortArg {
-    PCI(PciAddress),       // DPDK driver
-    KERNEL(InterfaceName), // kernel driver
+    PCI(net::pci::PciEbdf), // DPDK driver
+    KERNEL(InterfaceName),  // kernel driver
 }
 
 #[derive(
@@ -84,6 +82,23 @@ pub struct InterfaceArg {
     pub port: Option<PortArg>,
 }
 
+#[derive(
+    Debug,
+    PartialEq,
+    Eq,
+    Clone,
+    serde::Serialize,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    rkyv::Archive,
+    CheckBytes,
+)]
+#[rkyv(attr(derive(PartialEq, Eq, Debug)))]
+pub struct TracingRateLimit {
+    pub burst: u32,
+    pub replenish_per_second: u32,
+}
+
 impl FromStr for PortArg {
     type Err = String;
     fn from_str(input: &str) -> Result<Self, Self::Err> {
@@ -93,7 +108,8 @@ impl FromStr for PortArg {
 
         match disc {
             "pci" => {
-                let pciaddr = PciAddress::try_from(value).map_err(|e| e.to_string())?;
+                let pciaddr =
+                    net::pci::PciEbdf::try_new(value.to_string()).map_err(|e| e.to_string())?;
                 Ok(PortArg::PCI(pciaddr))
             }
             "kernel" => {
@@ -128,6 +144,34 @@ impl FromStr for InterfaceArg {
                 port: None,
             })
         }
+    }
+}
+
+impl FromStr for TracingRateLimit {
+    type Err = String;
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let (burst, replenish_per_second) = input
+            .split_once(':')
+            .ok_or("Bad syntax: missing :".to_string())?;
+
+        let burst = burst
+            .parse::<u32>()
+            .map_err(|e| format!("Bad burst value: {e}"))?;
+        let replenish_per_second = replenish_per_second
+            .parse::<u32>()
+            .map_err(|e| format!("Bad replenish-per-second value: {e}"))?;
+
+        if burst == 0 {
+            return Err("Burst must be greater than 0".to_string());
+        }
+        if replenish_per_second == 0 {
+            return Err("Replenish-per-second must be greater than 0".to_string());
+        }
+
+        Ok(Self {
+            burst,
+            replenish_per_second,
+        })
     }
 }
 
@@ -463,6 +507,8 @@ pub struct TracingConfigSection {
     pub show: TracingShowSection,
     /// Tracing configuration string (e.g., "default=info,nat=debug")
     pub config: Option<String>, // TODO: stronger typing on this config?
+    /// Optional rate limit for lower-severity tracing output
+    pub rate_limit: Option<TracingRateLimit>,
 }
 
 /// Display option for trace metadata elements.
@@ -1050,7 +1096,7 @@ pub enum InvalidCmdArguments {
     /// PCI addresses must follow the format: `domain:bus:device.function`
     /// (e.g., `0000:01:00.0`)
     #[error(transparent)]
-    InvalidPciAddress(#[from] InvalidPciAddress),
+    InvalidPciAddress(#[from] net::pci::PciEbdfError),
 
     /// Invalid network interface name.
     ///
@@ -1078,7 +1124,7 @@ pub enum UnsupportedByDriver {
     #[error(
         "Kernel driver does not support interfaces specified by their dpdk driver name; {0} given"
     )]
-    Kernel(PciAddress),
+    Kernel(net::pci::PciEbdf),
 }
 
 impl TryFrom<CmdArgs> for LaunchConfiguration {
@@ -1146,6 +1192,7 @@ impl TryFrom<CmdArgs> for LaunchConfiguration {
                     },
                 },
                 config: value.tracing.clone(),
+                rate_limit: value.tracing_rate_limit.clone(),
             },
             metrics: MetricsConfigSection {
                 address: value.metrics_address(),
@@ -1266,6 +1313,16 @@ E.g. default=error,all=info,nat=debug will set the default target to error, and 
     )]
     tracing: Option<String>,
 
+    #[arg(
+        long,
+        value_name = "BURST:REPLENISH_PER_SECOND",
+        value_parser=TracingRateLimit::from_str,
+        help = "Optional rate limit for lower-severity tracing output. Syntax: BURST:REPLENISH_PER_SECOND.
+Example: --tracing-rate-limit 50:5 allows bursts up to 50 repeated messages and replenishes 5 messages per second.
+If omitted, tracing output is not rate-limited."
+    )]
+    tracing_rate_limit: Option<TracingRateLimit>,
+
     #[arg(long, help = "Set the name of this gateway")]
     name: Option<String>,
 
@@ -1361,6 +1418,11 @@ impl CmdArgs {
     #[must_use]
     pub fn tracing(&self) -> Option<&String> {
         self.tracing.as_ref()
+    }
+
+    #[must_use]
+    pub fn tracing_rate_limit(&self) -> Option<&TracingRateLimit> {
+        self.tracing_rate_limit.as_ref()
     }
 
     /// Get the number of worker threads for the kernel driver.
@@ -1471,13 +1533,9 @@ impl CmdArgs {
 
 #[cfg(test)]
 mod tests {
-    use hardware::pci::address::PciAddress;
-    use hardware::pci::bus::Bus;
-    use hardware::pci::device::Device;
-    use hardware::pci::domain::Domain;
-    use hardware::pci::function::Function;
     use net::interface::InterfaceName;
 
+    use super::TracingRateLimit;
     use crate::{InterfaceArg, PortArg};
     use std::str::FromStr;
 
@@ -1488,12 +1546,9 @@ mod tests {
         assert_eq!(spec.interface.as_ref(), "GbEth1.9000");
         assert_eq!(
             spec.port,
-            Some(PortArg::PCI(PciAddress::new(
-                Domain::from(0),
-                Bus::new(2),
-                Device::try_from(1).unwrap(),
-                Function::try_from(7).unwrap()
-            )))
+            Some(PortArg::PCI(
+                net::pci::PciEbdf::try_new("0000:02:01.7".into()).unwrap()
+            ))
         );
 
         // interface + port as kernel interface
@@ -1519,5 +1574,30 @@ mod tests {
 
         // bad discriminant
         assert!(InterfaceArg::from_str("GbEth1.9000=foo@0000:02:01.7").is_err());
+    }
+    #[test]
+    fn tracing_rate_limit_parses_valid_values() {
+        let rate_limit = TracingRateLimit::from_str("10:20").unwrap();
+        assert_eq!(rate_limit.burst, 10);
+        assert_eq!(rate_limit.replenish_per_second, 20);
+    }
+    #[test]
+    fn tracing_rate_limit_rejects_missing_separator() {
+        let err = TracingRateLimit::from_str("10").unwrap_err();
+        assert_eq!(err, "Bad syntax: missing :");
+    }
+    #[test]
+    fn tracing_rate_limit_rejects_non_numeric_values() {
+        let err = TracingRateLimit::from_str("abc:20").unwrap_err();
+        assert!(err.starts_with("Bad burst value:"));
+        let err = TracingRateLimit::from_str("10:def").unwrap_err();
+        assert!(err.starts_with("Bad replenish-per-second value:"));
+    }
+    #[test]
+    fn tracing_rate_limit_rejects_zero_values() {
+        let err = TracingRateLimit::from_str("0:20").unwrap_err();
+        assert_eq!(err, "Burst must be greater than 0");
+        let err = TracingRateLimit::from_str("10:0").unwrap_err();
+        assert_eq!(err, "Replenish-per-second must be greater than 0");
     }
 }

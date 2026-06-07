@@ -327,6 +327,9 @@ pub enum CliAction {
     // NF: flow filter
     ShowFlowFilter,
 
+    // NF: Packet stats
+    ShowPacketStats,
+
     // internal config
     ShowConfigInternal,
 
@@ -434,6 +437,10 @@ mod tests {
     /// Open 2 sockets, one for dataplane and one for cli. Spawn a thread representing dataplane.
     /// Send dataplane a request and receive a big response from it.
     #[test]
+    #[cfg_attr(
+        emulated,
+        ignore = "Unix sockets unsupported under miri / flaky under qemu-user"
+    )]
     fn test_communications() {
         const DP_PATH: &str = "/tmp/dpsock";
         const CLI_PATH: &str = "/tmp/clisock";

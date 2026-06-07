@@ -23,7 +23,8 @@ use std::collections::HashSet;
 use std::fmt::Display;
 use std::net::IpAddr;
 use std::num::NonZero;
-use std::sync::Arc;
+
+use concurrency::sync::Arc;
 use tracing::{debug, error};
 
 mod display;
@@ -57,15 +58,6 @@ impl FlowFilter {
         }
     }
 
-    /// Invalidate the flow that a packet refers to if any
-    fn invalidate_packet_flow<Buf: PacketBufferMut>(packet: &Packet<Buf>) {
-        if let Some(flow_info) = packet.meta().flow_info.as_ref() {
-            let flow_key = flow_info.flowkey().unwrap_or_else(|| unreachable!());
-            debug!("Invalidating flow {flow_key}:{flow_info}");
-            flow_info.invalidate_pair();
-        }
-    }
-
     /// Once a packet has been validated, if it refers to a flow, check that the flow
     /// is consistent with the annotations set for the packet. This is needed to invalidate
     /// flows on configuration changes since the flow a packet refers to may have been created with
@@ -87,10 +79,10 @@ impl FlowFilter {
         if flow_info.genid() == genid {
             return false;
         }
-        let locked_info = flow_info.locked.read().unwrap();
+        let locked_info = flow_info.locked.read();
         let flow_port_fw = locked_info.port_fw_state.is_some();
         let flow_masquerade = locked_info.nat_state.is_some();
-        let flowkey = flow_info.flowkey().unwrap_or_else(|| unreachable!());
+        let flowkey = flow_info.flowkey();
         if locked_info.dst_vpcd != Some(dst_vpcd) {
             debug!("Flow-info is out-dated. New dst VPC is {dst_vpcd}");
             return true;
@@ -136,9 +128,12 @@ impl FlowFilter {
             debug!("{nfi}: Packet has flow-info but from a prior config ({flow_genid} < {genid})");
             return false;
         }
-        // The flow has the same generation id as the current config. Small transient state aside
+        // The flow has the same generation id as the current config. Small transient period aside,
         // this means that the flow is up-to-date and we can bypass the filter
-        debug!("{nfi}: Packet can bypass flow filter due to flow {flow_info}");
+        debug!(
+            "{nfi}: Packet can bypass flow filter due to flow {}",
+            flow_info.logfmt()
+        );
         if Self::set_nat_requirements_from_flow_info(packet).is_err() {
             debug!("{nfi}: Failed to set nat requirements");
             return false;
@@ -324,14 +319,7 @@ impl FlowFilter {
     fn set_nat_requirements_from_flow_info<Buf: PacketBufferMut>(
         packet: &mut Packet<Buf>,
     ) -> Result<(), ()> {
-        let locked_info = packet
-            .meta()
-            .flow_info
-            .as_ref()
-            .ok_or(())?
-            .locked
-            .read()
-            .map_err(|_| ())?;
+        let locked_info = packet.meta().flow_info.as_ref().ok_or(())?.locked.read();
         let needs_stateful_nat = locked_info.nat_state.is_some();
         let needs_port_forwarding = locked_info.port_fw_state.is_some();
         drop(locked_info);
@@ -400,7 +388,7 @@ impl FlowFilter {
                     debug!(
                         "{nfi}: Invalid NAT requirements found for flow {tuple}, dropping packet"
                     );
-                    Self::invalidate_packet_flow(packet);
+                    packet.invalidate_flows();
                     packet.done(DoneReason::Filtered);
                     return;
                 }
@@ -429,7 +417,7 @@ impl FlowFilter {
                     }
                     Err(reason) => {
                         debug!("Will drop packet. Reason: {reason}");
-                        Self::invalidate_packet_flow(packet);
+                        packet.invalidate_flows();
                         packet.done(reason);
                         return;
                     }
@@ -437,22 +425,10 @@ impl FlowFilter {
             }
         };
 
-        // At this point, we may have determined the destination VPC for a packet or not. If we haven't, we
-        // should drop the packet. However, if it is an ICMP error packet, let the icmp-error handler deal with it.
-        // Now, the icmp-error handler works for masquerading and port-forwarding, but not stateless NAT,
-        // nor the absence of NAT, and here we don't know if the icmp error corresponds to traffic that
-        // was masqueraded, port-forwarded, statically nated or neither of the previous. If the dst-vpcd
-        // for an icmp error packet is known, the icmp handler will transparently let the static NAT NF deal with it.
-        if packet.is_icmp_error() {
-            debug!("Letting ICMP error handler process this packet. dst-vpcd is {dst_vpcd:?}");
-            packet.meta_mut().dst_vpcd = dst_vpcd; // whether we discovered the vpcd or not
-            return;
-        }
-
-        // Drop the packet since we don't know destination and it is not an icmp error
+        // Drop the packet since we don't know destination
         let Some(dst_vpcd) = dst_vpcd else {
             debug!("Could not determine dst vpcd for packet. Dropping it...");
-            Self::invalidate_packet_flow(packet);
+            packet.invalidate_flows();
             packet.done(DoneReason::Filtered);
             return;
         };
@@ -464,7 +440,7 @@ impl FlowFilter {
         // to do so. Therefore, it should not upgrade flow to newer gen ids. However, it can (and must) invalidate
         // flows in some cases, because no other NF would do so otherwise.
         if Self::should_invalidate_flow(packet, dst_vpcd, genid) {
-            Self::invalidate_packet_flow(packet);
+            packet.invalidate_flows();
         }
     }
 }
@@ -476,7 +452,10 @@ impl<Buf: PacketBufferMut> NetworkFunction<Buf> for FlowFilter {
     ) -> impl Iterator<Item = Packet<Buf>> + 'a {
         input.filter_map(|mut packet| {
             if let Some(tablesr) = &self.tablesr.enter() {
-                if !packet.is_done() && packet.meta().is_overlay() {
+                if !packet.is_done()
+                    && packet.meta().is_overlay()
+                    && packet.meta().dst_vpcd.is_none()
+                {
                     self.process_packet(tablesr, &mut packet);
                 }
             } else {

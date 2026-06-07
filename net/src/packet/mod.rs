@@ -8,6 +8,10 @@
 mod display;
 mod hash;
 mod meta;
+mod stats;
+mod stats_display;
+
+pub use stats::PacketStats;
 
 #[cfg(any(test, feature = "bolero"))]
 pub use contract::*;
@@ -20,9 +24,8 @@ use crate::eth::Eth;
 use crate::eth::EthError;
 use crate::flows::{FlowInfo, FlowStatus};
 use crate::headers::{
-    AbstractEmbeddedHeaders, AbstractEmbeddedHeadersMut, AbstractHeaders, AbstractHeadersMut,
-    Headers, Net, Transport, TryEmbeddedHeaders, TryEmbeddedHeadersMut, TryHeaders, TryHeadersMut,
-    TryIpMut, TryVxlan,
+    EmbeddedHeaders, Headers, Net, Transport, TryEmbeddedHeaders, TryEmbeddedHeadersMut,
+    TryHeaders, TryHeadersMut, TryIpMut, TryVxlan,
 };
 use crate::ip::{dscp::Dscp, ecn::Ecn};
 use crate::parse::{DeParse, Parse, ParseError};
@@ -126,6 +129,13 @@ impl<Buf: PacketBufferMut> Packet<Buf> {
             return None;
         }
         Some(flow_info)
+    }
+
+    /// Invalidate the flow that a packet refers to if any, and the related flow
+    pub fn invalidate_flows(&self) {
+        if let Some(flow_info) = self.meta().flow_info.as_ref() {
+            flow_info.invalidate_pair();
+        }
     }
 
     #[inline]
@@ -328,25 +338,25 @@ impl<Buf: PacketBufferMut> Packet<Buf> {
 }
 
 impl<Buf: PacketBufferMut> TryHeaders for Packet<Buf> {
-    fn headers(&self) -> &impl AbstractHeaders {
+    fn headers(&self) -> &Headers {
         &self.headers
     }
 }
 
 impl<Buf: PacketBufferMut> TryHeadersMut for Packet<Buf> {
-    fn headers_mut(&mut self) -> &mut impl AbstractHeadersMut {
+    fn headers_mut(&mut self) -> &mut Headers {
         &mut self.headers
     }
 }
 
 impl<Buf: PacketBufferMut> TryEmbeddedHeaders for Packet<Buf> {
-    fn embedded_headers(&self) -> Option<&impl AbstractEmbeddedHeaders> {
+    fn embedded_headers(&self) -> Option<&EmbeddedHeaders> {
         self.headers.embedded_ip.as_ref()
     }
 }
 
 impl<Buf: PacketBufferMut> TryEmbeddedHeadersMut for Packet<Buf> {
-    fn embedded_headers_mut(&mut self) -> Option<&mut impl AbstractEmbeddedHeadersMut> {
+    fn embedded_headers_mut(&mut self) -> Option<&mut EmbeddedHeaders> {
         self.headers.embedded_ip.as_mut()
     }
 }

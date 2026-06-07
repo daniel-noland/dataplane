@@ -5,12 +5,9 @@
 //! bitmap-based NAT allocator requires this trait to be implementated for the type parameters
 //! (`Ipv4Addr` and `Ipv6Addr`) that it works with.
 
-use super::super::NatIp;
-use super::super::allocator::{AllocationResult, AllocatorError, NatAllocator};
-use super::AllocatedIpPort;
-use crate::stateful::apalloc::alloc::{map_address, map_offset};
-use concurrency::sync::Arc;
-use net::ExtendedFlowKey;
+use super::super::allocation::AllocatorError;
+use super::alloc::{map_address, map_offset};
+use crate::stateful::natip::NatIp;
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -27,12 +24,6 @@ pub trait NatIpWithBitmap: NatIp {
         address: Self,
         bitmap_mapping: &BTreeMap<u128, u32>,
     ) -> Result<u32, AllocatorError>;
-
-    // Allocate a new IP address from the allocator
-    fn allocate<A: NatAllocator<AllocatedIpPort<Ipv4Addr>, AllocatedIpPort<Ipv6Addr>>>(
-        allocator: Arc<A>,
-        eflow_key: &ExtendedFlowKey,
-    ) -> Result<AllocationResult<AllocatedIpPort<Self>>, AllocatorError>;
 }
 
 impl NatIpWithBitmap for Ipv4Addr {
@@ -48,13 +39,6 @@ impl NatIpWithBitmap for Ipv4Addr {
         _bitmap_mapping: &BTreeMap<u128, u32>,
     ) -> Result<u32, AllocatorError> {
         Ok(u32::from(address))
-    }
-
-    fn allocate<A: NatAllocator<AllocatedIpPort<Ipv4Addr>, AllocatedIpPort<Ipv6Addr>>>(
-        allocator: Arc<A>,
-        eflow_key: &ExtendedFlowKey,
-    ) -> Result<AllocationResult<AllocatedIpPort<Self>>, AllocatorError> {
-        allocator.allocate_v4(eflow_key)
     }
 }
 
@@ -76,13 +60,6 @@ impl NatIpWithBitmap for Ipv6Addr {
         bitmap_mapping: &BTreeMap<u128, u32>,
     ) -> Result<u32, AllocatorError> {
         // Reverse operation of map_offset()
-        map_address(address, bitmap_mapping)
-    }
-
-    fn allocate<A: NatAllocator<AllocatedIpPort<Ipv4Addr>, AllocatedIpPort<Ipv6Addr>>>(
-        allocator: Arc<A>,
-        eflow_key: &ExtendedFlowKey,
-    ) -> Result<AllocationResult<AllocatedIpPort<Self>>, AllocatorError> {
-        allocator.allocate_v6(eflow_key)
+        Ok(map_address(address, bitmap_mapping))
     }
 }

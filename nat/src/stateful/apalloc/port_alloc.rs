@@ -11,13 +11,17 @@
 use super::NatIpWithBitmap;
 use super::alloc::AllocatedIp;
 use crate::port::NatPort;
-use crate::stateful::allocator::AllocatorError;
+use crate::stateful::allocation::AllocatorError;
 use concurrency::concurrency_mode;
 use concurrency::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize};
 use concurrency::sync::{Arc, Mutex, RwLock, Weak};
+use concurrency::thread::ThreadId;
+use config::GenId;
 use lpm::prefix::PortRange;
 use std::collections::{BTreeSet, HashMap};
-use std::thread::ThreadId;
+use std::fmt::Display;
+
+use tracing::debug;
 
 #[concurrency_mode(std)]
 use rand::seq::SliceRandom;
@@ -82,42 +86,64 @@ pub(crate) struct PortAllocator<I: NatIpWithBitmap> {
     thread_blocks: ThreadPortMap,
     allocated_blocks: AllocatedPortBlockMap<I>,
     reserved_port_range: Option<PortRange>,
+    exclude_wellknown_ports: bool,
 }
 
+/// Ports 0..=1023 cover the IANA system/well-known range and should not be
+/// allocated by masquerade NAT for TCP or UDP.
+const IANA_WELLKNOWN_PORT_LIMIT: u16 = 1024;
+
+/// Number of 256-port blocks covering the IANA well-known port range (0-1023).
+const IANA_WELLKNOWN_BLOCKS: u16 = IANA_WELLKNOWN_PORT_LIMIT / 256;
+
 impl<I: NatIpWithBitmap> PortAllocator<I> {
-    pub(crate) fn new(reserved_port_range: Option<PortRange>) -> Self {
+    pub(crate) fn new(
+        reserved_port_range: Option<PortRange>,
+        randomize: bool,
+        exclude_wellknown_ports: bool,
+    ) -> Self {
         let mut base_ports = (0..=255).collect::<Vec<_>>();
 
         // Shuffle the list of port blocks for the port allocator. This way, we can pick blocks in a
         // "random" order when allocating them, and have ports allocated in a "random" order. The
         // quotes denote that this is not completely random: ports are allocated sequentially within
         // a 256-port block.
-        Self::shuffle_slice(&mut base_ports);
-        let blocks = std::array::from_fn(|i| AllocatorPortBlock::new(base_ports[i]));
-
+        if randomize {
+            Self::shuffle_slice(&mut base_ports);
+        }
+        let blocks = std::array::from_fn(|i| {
+            let block = AllocatorPortBlock::new(base_ports[i]);
+            // Pre-mark IANA well-known port blocks (0-1023) as permanently non-free so they are
+            // never handed out by masquerade NAT for TCP or UDP.
+            if exclude_wellknown_ports && block.to_port_number() < IANA_WELLKNOWN_PORT_LIMIT {
+                block
+                    .free
+                    .store(false, concurrency::sync::atomic::Ordering::Relaxed);
+            }
+            block
+        });
+        let usable_blocks = if exclude_wellknown_ports {
+            256 - IANA_WELLKNOWN_BLOCKS
+        } else {
+            256
+        };
         Self {
             blocks,
-            usable_blocks: AtomicU16::new(256),
+            usable_blocks: AtomicU16::new(usable_blocks),
             current_alloc_index: AtomicUsize::new(0),
             thread_blocks: ThreadPortMap::new(),
             allocated_blocks: AllocatedPortBlockMap::new(),
             reserved_port_range,
+            exclude_wellknown_ports,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn new_no_randomness(reserved_port_range: Option<PortRange>) -> Self {
-        let base_ports = (0..=255).collect::<Vec<_>>();
-        // Do not shuffle
-        let blocks = std::array::from_fn(|i| AllocatorPortBlock::new(base_ports[i]));
-        Self {
-            blocks,
-            usable_blocks: AtomicU16::new(256),
-            current_alloc_index: AtomicUsize::new(0),
-            thread_blocks: ThreadPortMap::new(),
-            allocated_blocks: AllocatedPortBlockMap::new(),
-            reserved_port_range,
-        }
+    pub(crate) fn new_no_randomness(
+        reserved_port_range: Option<PortRange>,
+        exclude_wellknown_ports: bool,
+    ) -> Self {
+        Self::new(reserved_port_range, false, exclude_wellknown_ports)
     }
 
     #[concurrency_mode(std)]
@@ -133,6 +159,11 @@ impl<I: NatIpWithBitmap> PortAllocator<I> {
             let index = rng.r#gen::<usize>() % slice.len();
             slice.swap(i, index);
         }
+    }
+
+    #[concurrency_mode(loom)]
+    fn shuffle_slice<T>(_slice: &mut [T]) {
+        // Deterministic replay matters more than allocation-order randomization.
     }
 
     // Iterate over the slice of all blocks, but starting from a given offset (and looping at the
@@ -349,6 +380,16 @@ impl<I: NatIpWithBitmap> PortAllocator<I> {
         ip: Arc<AllocatedIp<I>>,
         port: NatPort,
     ) -> Result<AllocatedPort<I>, AllocatorError> {
+        // Reject explicit reservations into the IANA system/well-known range up front so callers
+        // get a policy-oriented error rather than a misleading resource-exhaustion error from the
+        // pre-excluded low-port blocks.
+        if self.exclude_wellknown_ports && port.as_u16() < IANA_WELLKNOWN_PORT_LIMIT {
+            debug!(
+                "Explicit reservation for well-known port {} denied by allocator policy",
+                port.as_u16()
+            );
+            return Err(AllocatorError::Denied);
+        }
         let block = self.find_block_for_port(ip, port)?;
         block.reserve_port_from_block(port)
     }
@@ -402,7 +443,7 @@ impl<I: NatIpWithBitmap> AllocatedPortBlock<I> {
         let reserve_zero = !allow_null && block.base_port_idx == 0;
         let reserve_range = reserved_port_range.is_some();
         if reserve_zero || reserve_range {
-            let mut mutex_guard = block.usage_bitmap.lock().unwrap();
+            let mut mutex_guard = block.usage_bitmap.lock();
             if reserve_zero {
                 mutex_guard.reserve_port_from_bitmap(0).map_err(|()| {
                     AllocatorError::InternalIssue(
@@ -431,7 +472,7 @@ impl<I: NatIpWithBitmap> AllocatedPortBlock<I> {
     }
 
     fn is_full(&self) -> bool {
-        self.usage_bitmap.lock().unwrap().bitmap_full()
+        self.usage_bitmap.lock().bitmap_full()
     }
 
     fn covers(&self, port: NatPort) -> bool {
@@ -443,7 +484,6 @@ impl<I: NatIpWithBitmap> AllocatedPortBlock<I> {
     fn deallocate_port_from_block(&self, port: NatPort) -> Result<(), AllocatorError> {
         self.usage_bitmap
             .lock()
-            .unwrap()
             .deallocate_port_from_bitmap(
                 u8::try_from(port.as_u16().checked_sub(self.base_port_idx).ok_or(
                     AllocatorError::InternalIssue(
@@ -466,7 +506,6 @@ impl<I: NatIpWithBitmap> AllocatedPortBlock<I> {
         let bitmap_offset = self
             .usage_bitmap
             .lock()
-            .unwrap()
             .allocate_port_from_bitmap()
             .map_err(|()| AllocatorError::NoFreePort(self.base_port_idx))?;
 
@@ -490,7 +529,6 @@ impl<I: NatIpWithBitmap> AllocatedPortBlock<I> {
     ) -> Result<AllocatedPort<I>, AllocatorError> {
         self.usage_bitmap
             .lock()
-            .unwrap()
             .reserve_port_from_bitmap(
                 u8::try_from(port.as_u16().checked_sub(self.base_port_idx).ok_or(
                     AllocatorError::InternalIssue(
@@ -503,7 +541,7 @@ impl<I: NatIpWithBitmap> AllocatedPortBlock<I> {
                     )
                 })?,
             )
-            .map_err(|()| AllocatorError::NoFreePort(port.as_u16()))?;
+            .map_err(|()| AllocatorError::PortReservationFailed(port.as_u16()))?;
 
         Ok(AllocatedPort::new(port, self.clone()))
     }
@@ -512,7 +550,6 @@ impl<I: NatIpWithBitmap> AllocatedPortBlock<I> {
     fn allocated_port_ranges(&self) -> BTreeSet<PortRange> {
         self.usage_bitmap
             .lock()
-            .unwrap()
             .allocated_port_ranges()
             .iter()
             .map(|range| {
@@ -544,29 +581,40 @@ impl<I: NatIpWithBitmap> Drop for AllocatedPortBlock<I> {
 /// the [`AllocatedPort`] is dropped.
 #[derive(Debug, Clone)]
 pub struct AllocatedPort<I: NatIpWithBitmap> {
-    port: NatPort,
-    block_allocator: Arc<AllocatedPortBlock<I>>,
+    port: NatPort,                               // the actual allocated value
+    block_allocator: Arc<AllocatedPortBlock<I>>, // block/IP the allocated value belongs to
+    genid: GenId,                                // the generation id of the allocator (late set)
 }
 
 impl<I: NatIpWithBitmap> AllocatedPort<I> {
+    #[must_use]
     fn new(port: NatPort, block_allocator: Arc<AllocatedPortBlock<I>>) -> Self {
         Self {
             port,
             block_allocator,
+            genid: 0, // initially zero
         }
     }
-
+    #[must_use]
     pub fn port(&self) -> NatPort {
         self.port
     }
-
+    #[must_use]
     pub fn ip(&self) -> I {
         self.block_allocator.ip()
+    }
+    #[must_use]
+    pub fn genid(&self) -> GenId {
+        self.genid
+    }
+    pub fn set_genid(&mut self, genid: GenId) {
+        self.genid = genid;
     }
 }
 
 impl<I: NatIpWithBitmap> Drop for AllocatedPort<I> {
     fn drop(&mut self) {
+        debug!("Dropping allocated port {self}...");
         let _ = self.block_allocator.deallocate_port_from_block(self.port);
     }
 }
@@ -593,8 +641,7 @@ impl ThreadPortMap {
     fn get(&self) -> Option<usize> {
         self.0
             .read()
-            .unwrap()
-            .get(&std::thread::current().id())
+            .get(&concurrency::thread::current().id())
             .copied()
             .unwrap_or(None)
     }
@@ -602,8 +649,7 @@ impl ThreadPortMap {
     fn set(&self, index: Option<usize>) {
         self.0
             .write()
-            .unwrap()
-            .insert(std::thread::current().id(), index);
+            .insert(concurrency::thread::current().id(), index);
     }
 }
 
@@ -623,17 +669,23 @@ struct AllocatedPortBlockMap<I: NatIpWithBitmap>(
     RwLock<HashMap<usize, Weak<AllocatedPortBlock<I>>>>,
 );
 
+impl<I: NatIpWithBitmap> Display for AllocatedPort<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{} (genid: {})", self.ip(), self.port(), self.genid())
+    }
+}
+
 impl<I: NatIpWithBitmap> AllocatedPortBlockMap<I> {
     fn new() -> Self {
         Self(RwLock::new(HashMap::new()))
     }
 
     fn get_weak(&self, index: usize) -> Option<Weak<AllocatedPortBlock<I>>> {
-        self.0.read().unwrap().get(&index).cloned()
+        self.0.read().get(&index).cloned()
     }
 
     fn remove(&self, index: usize) {
-        self.0.write().unwrap().remove(&index);
+        self.0.write().remove(&index);
     }
 
     fn get(&self, index: usize) -> Option<Arc<AllocatedPortBlock<I>>> {
@@ -644,19 +696,18 @@ impl<I: NatIpWithBitmap> AllocatedPortBlockMap<I> {
     }
 
     fn insert(&self, index: usize, block: Weak<AllocatedPortBlock<I>>) {
-        self.0.write().unwrap().insert(index, block);
+        self.0.write().insert(index, block);
     }
 
     fn has_entries_with_free_ports(&self) -> bool {
         self.0
             .read()
-            .unwrap()
             .values()
             .any(|block| block.upgrade().is_some_and(|block| !block.is_full()))
     }
 
     fn search_for_block(&self, port: NatPort) -> Option<Arc<AllocatedPortBlock<I>>> {
-        let blocks = self.0.read().unwrap();
+        let blocks = self.0.read();
         blocks
             .values()
             .find(|block| block.upgrade().is_some_and(|block| block.covers(port)))?
@@ -665,9 +716,9 @@ impl<I: NatIpWithBitmap> AllocatedPortBlockMap<I> {
 
     // Used for Display
     fn allocated_port_ranges(&self) -> BTreeSet<PortRange> {
-        let blocks = self.0.read().unwrap();
+        let blocks = self.0.read();
         let mut ranges = BTreeSet::<PortRange>::new();
-        for (_, block) in blocks.iter() {
+        for block in blocks.values() {
             if let Some(block) = block.upgrade() {
                 merge_ranges(&mut ranges, block.allocated_port_ranges());
             }
@@ -1106,7 +1157,7 @@ mod tests {
 
     #[test]
     fn pick_available_block_no_reserved_range() {
-        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(None);
+        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(None, false);
         let (index, base_port) = allocator.pick_available_block().unwrap();
         assert_eq!(index, 0);
         assert_eq!(base_port, 0);
@@ -1116,7 +1167,7 @@ mod tests {
     fn pick_available_block_reserved_range_covers_first_block() {
         // Reserve 0..=255 (entire first block) → should skip to block 1 (ports 256-511)
         let reserved = PortRange::new(0, 255).unwrap();
-        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved));
+        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved), false);
         let (index, base_port) = allocator.pick_available_block().unwrap();
         assert_eq!(index, 1);
         assert_eq!(base_port, 256);
@@ -1128,7 +1179,7 @@ mod tests {
         // be allocated anyway, so the block is effectively unusable. The code adjusts the
         // reserved range to start at 0, causing the block to be skipped.
         let reserved = PortRange::new(1, 255).unwrap();
-        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved));
+        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved), false);
         let (index, base_port) = allocator.pick_available_block().unwrap();
         assert_eq!(index, 1);
         assert_eq!(base_port, 256);
@@ -1138,7 +1189,7 @@ mod tests {
     fn pick_available_block_reserved_range_covers_multiple_blocks() {
         // Reserve 0..=511 (first two blocks) → should skip to block 2 (ports 512-767)
         let reserved = PortRange::new(0, 511).unwrap();
-        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved));
+        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved), false);
         let (index, base_port) = allocator.pick_available_block().unwrap();
         assert_eq!(index, 2);
         assert_eq!(base_port, 512);
@@ -1148,7 +1199,7 @@ mod tests {
     fn pick_available_block_reserved_range_does_not_cover_other_blocks() {
         // Reserve 0..=255 only covers block 0, block 1 is unaffected
         let reserved = PortRange::new(0, 255).unwrap();
-        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved));
+        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved), false);
         // First pick skips block 0, gets block 1
         let (_, base_port1) = allocator.pick_available_block().unwrap();
         assert_eq!(base_port1, 256);
@@ -1162,7 +1213,7 @@ mod tests {
         // Reserve 1..=200 (len 200 < 255) → block is NOT skipped entirely, individual ports
         // are reserved within the block instead
         let reserved = PortRange::new(1, 200).unwrap();
-        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved));
+        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved), false);
         let (index, base_port) = allocator.pick_available_block().unwrap();
         assert_eq!(index, 0);
         assert_eq!(base_port, 0);
@@ -1172,7 +1223,7 @@ mod tests {
     fn pick_available_block_reserved_middle_block() {
         // Reserve 256..=511 (block 1 only) → block 0 is fine, block 1 is skipped
         let reserved = PortRange::new(256, 511).unwrap();
-        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved));
+        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved), false);
         // First pick: block 0
         let (_, base_port1) = allocator.pick_available_block().unwrap();
         assert_eq!(base_port1, 0);
@@ -1185,7 +1236,7 @@ mod tests {
     fn pick_available_block_all_blocks_reserved() {
         // Reserve 0..=65535 (all blocks) → NoPortBlock error
         let reserved = PortRange::new(0, 65535).unwrap();
-        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved));
+        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved), false);
         assert!(allocator.pick_available_block().is_err());
     }
 
@@ -1310,5 +1361,58 @@ mod tests {
                 port_range(400, 700)
             ])
         );
+    }
+
+    #[test]
+    fn exclude_wellknown_ports_first_available_block_is_1024() {
+        // With no randomness and IANA exclusion, blocks 0-3 (ports 0-1023) are pre-marked
+        // non-free, so the first block handed out should start at port 1024.
+        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(None, true);
+        let (_, base_port) = allocator.pick_available_block().unwrap();
+        assert_eq!(base_port, 1024);
+    }
+
+    #[test]
+    fn exclude_wellknown_ports_all_252_blocks_are_above_1023() {
+        // Exactly 252 blocks (256 - 4 IANA blocks) should be allocatable; every one should
+        // start at port >= 1024. The 253rd attempt should fail with NoPortBlock.
+        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(None, true);
+        for _ in 0..252 {
+            let (_, base_port) = allocator.pick_available_block().unwrap();
+            assert!(
+                base_port >= 1024,
+                "expected base_port >= 1024, got {base_port}"
+            );
+        }
+        assert!(allocator.pick_available_block().is_err());
+    }
+
+    #[test]
+    fn exclude_wellknown_ports_disabled_starts_at_port_zero() {
+        // Sanity check: without the flag, block 0 (port 0) is returned first.
+        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(None, false);
+        let (_, base_port) = allocator.pick_available_block().unwrap();
+        assert_eq!(base_port, 0);
+    }
+
+    #[test]
+    fn exclude_wellknown_ports_combined_with_reserved_range() {
+        let reserved = PortRange::new(2048, 2303).unwrap(); // entire block 8
+        let allocator = PortAllocator::<Ipv4Addr>::new_no_randomness(Some(reserved), true);
+
+        let (_, b0) = allocator.pick_available_block().unwrap();
+        assert_eq!(b0, 1024); // block 4
+
+        let (_, b1) = allocator.pick_available_block().unwrap();
+        assert_eq!(b1, 1280); // block 5
+
+        let (_, b2) = allocator.pick_available_block().unwrap();
+        assert_eq!(b2, 1536); // block 6
+
+        let (_, b3) = allocator.pick_available_block().unwrap();
+        assert_eq!(b3, 1792); // block 7
+
+        let (_, b4) = allocator.pick_available_block().unwrap();
+        assert_eq!(b4, 2304); // block 9 — block 8 (2048-2303) was skipped
     }
 }

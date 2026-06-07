@@ -23,7 +23,7 @@ where
 }
 
 #[must_use]
-pub fn ppsize_zero() -> PrefixWithPortsSize {
+pub const fn ppsize_zero() -> PrefixWithPortsSize {
     n!(0)
 }
 
@@ -62,6 +62,7 @@ pub trait IpRangeWithPorts {
 
 /// A structure containing a prefix and a port range.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(any(test, feature = "bolero"), derive(bolero::TypeGenerator))]
 pub struct PrefixWithPorts {
     prefix: Prefix,
     ports: PortRange,
@@ -148,6 +149,7 @@ impl IpRangeWithPorts for PrefixWithPorts {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(any(test, feature = "bolero"), derive(bolero::TypeGenerator))]
 pub struct PrefixPortsSet(BTreeSet<PrefixWithOptionalPorts>);
 
 impl PrefixPortsSet {
@@ -178,6 +180,18 @@ impl PrefixPortsSet {
             }
         }
         result
+    }
+
+    /// Return the total "size" of all prefixes in the set.
+    ///
+    /// The "size" is the number of IP addresses in the IP prefix, multiplied by the number of ports
+    /// in the associated port range, if any.
+    #[must_use]
+    pub fn total_prefixes_size(&self) -> PrefixWithPortsSize {
+        self.0
+            .iter()
+            .map(PrefixWithOptionalPorts::size)
+            .sum::<PrefixWithPortsSize>()
     }
 }
 
@@ -220,6 +234,7 @@ impl std::ops::DerefMut for PrefixPortsSet {
 
 /// A structure containing a prefix and an optional port range.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(any(test, feature = "bolero"), derive(bolero::TypeGenerator))]
 pub enum PrefixWithOptionalPorts {
     Prefix(Prefix),
     PrefixPorts(PrefixWithPorts),
@@ -254,6 +269,19 @@ impl PrefixWithOptionalPorts {
             PrefixWithOptionalPorts::PrefixPorts(prefix_with_ports) => {
                 Some(prefix_with_ports.ports())
             }
+        }
+    }
+
+    /// Change variant from `PrefixPorts` to `Prefix` if the port range is the full range.
+    #[must_use]
+    pub fn simplify(&self) -> Self {
+        match self {
+            PrefixWithOptionalPorts::PrefixPorts(prefix_with_ports)
+                if prefix_with_ports.ports().is_max_range() =>
+            {
+                PrefixWithOptionalPorts::Prefix(prefix_with_ports.prefix())
+            }
+            _ => *self,
         }
     }
 }
@@ -710,6 +738,20 @@ impl L4Protocol {
             (self_proto, L4Protocol::Any) => Some(*self_proto),
             (self_proto, other_proto) if self_proto == other_proto => Some(*self_proto),
             _ => None,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "bolero"))]
+mod contract {
+    use super::PortRange;
+    use bolero::{Driver, TypeGenerator};
+
+    impl TypeGenerator for PortRange {
+        fn generate<D: Driver>(driver: &mut D) -> Option<Self> {
+            let start: u16 = driver.produce()?;
+            let end: u16 = driver.produce()?;
+            Some(PortRange::new(start.min(end), start.max(end)).unwrap_or_else(|_| unreachable!()))
         }
     }
 }

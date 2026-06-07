@@ -3,24 +3,37 @@
 
 //! Tracing runtime control.
 
+use arc_swap::ArcSwap;
+use concurrency::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use ordermap::OrderMap;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock, Mutex};
-use std::{collections::HashSet, sync::MutexGuard};
+use std::{any::TypeId, collections::HashSet, time::Duration};
 use thiserror::Error;
+use tracing::{Event, Metadata, span, subscriber::Interest};
 #[allow(unused)]
-use tracing::{debug, error, info, warn};
-use tracing_subscriber::{EnvFilter, Registry, filter::LevelFilter, prelude::*, reload};
+use tracing::{Level, Subscriber, callsite, debug, error, info, warn};
+use tracing_subscriber::{
+    EnvFilter,
+    filter::{FilterExt, LevelFilter, filter_fn},
+    layer::{Context, Filter, Layer},
+    prelude::*,
+    registry::LookupSpan,
+};
+use tracing_throttle::{Policy, TracingRateLimitLayer};
 
 use crate::display::TargetCfgDbByTag;
 use crate::targets::{TRACING_TAG_ALL, TRACING_TARGETS};
 use crate::trace_target;
 trace_target!("tracectl", LevelFilter::INFO, &[]);
 
+#[derive(Copy, Clone, Debug)]
+pub struct TracingRateLimitConfig {
+    pub burst: u32,
+    pub replenish_per_second: u32,
+}
+
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum TraceCtlError {
-    #[error("Reload tracing failure: {0}")]
-    ReloadFailure(String),
     #[error("Unknown tag {0}")]
     UnknownTag(String),
     #[error("Lock failure: {0}")]
@@ -278,50 +291,232 @@ impl TargetCfgDb {
     }
 }
 
+/// `AtomicEnvFilter` wraps an `EnvFilter` in an `ArcSwap` to allow atomic
+/// swapping of the filter. The type is `Clone`-able: the original instance
+/// is moved into the subscriber as a `Layer`, while a clone is kept on
+/// `TracingControl` to push reloads from the outside. Both clones share the
+/// same `Arc<ArcSwap<EnvFilter>>` so an update from one is visible to the other.
+#[derive(Clone)]
+struct AtomicEnvFilter {
+    inner: Arc<ArcSwap<EnvFilter>>,
+}
+
+impl AtomicEnvFilter {
+    fn new(initial: EnvFilter) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(initial)),
+        }
+    }
+
+    fn reload(&self, new: EnvFilter) {
+        self.inner.store(std::sync::Arc::new(new)); // nosemgrep: rust-no-direct-std-sync-import
+        callsite::rebuild_interest_cache();
+    }
+}
+
+// Forward every `Layer<S>` method to the currently-swapped-in `EnvFilter`.
+// Verbose but mechanical: `EnvFilter` overrides several `Layer` hooks
+// (`on_new_span`, `on_record`, `on_enter`, `on_exit`, `on_close`) to
+// support span-based directives like `target[span_name]=level`. This
+// codebase doesn't use those, but the forwarding is here for behavioral
+// equivalence with `reload::Layer<EnvFilter>`.
+impl<S> Layer<S> for AtomicEnvFilter
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn register_callsite(&self, meta: &'static Metadata<'static>) -> Interest {
+        Layer::<S>::register_callsite(&**self.inner.load(), meta)
+    }
+
+    fn enabled(&self, meta: &Metadata<'_>, ctx: Context<'_, S>) -> bool {
+        Layer::<S>::enabled(&**self.inner.load(), meta, ctx)
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Layer::<S>::max_level_hint(&**self.inner.load())
+    }
+
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+        Layer::<S>::on_new_span(&**self.inner.load(), attrs, id, ctx);
+    }
+
+    fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+        Layer::<S>::on_record(&**self.inner.load(), id, values, ctx);
+    }
+
+    fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
+        Layer::<S>::on_enter(&**self.inner.load(), id, ctx);
+    }
+
+    fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
+        Layer::<S>::on_exit(&**self.inner.load(), id, ctx);
+    }
+
+    fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
+        Layer::<S>::on_close(&**self.inner.load(), id, ctx);
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        Layer::<S>::on_event(&**self.inner.load(), event, ctx);
+    }
+
+    // `downcast_raw` is how the layered subscriber probes a layer for
+    // per-layer-filter participation (via the `MagicPlfDowncastMarker` type
+    // id) and other capabilities. `EnvFilter` used as a `Layer` is not a
+    // per-layer filter, so reporting "no match" for anything but our own
+    // type id is correct. We deliberately do *not* expose the inner
+    // `EnvFilter`'s address — its identity can change at any time via
+    // `ArcSwap::store`.
+    #[doc(hidden)]
+    unsafe fn downcast_raw(&self, id: TypeId) -> Option<*const ()> {
+        if id == TypeId::of::<Self>() {
+            Some(std::ptr::from_ref::<Self>(self).cast::<()>())
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TracingControl
+// ---------------------------------------------------------------------------
+
+type BoxedTracingLayer<S> = Box<dyn Layer<S> + Send + Sync>;
+
 pub struct TracingControl {
     db: Arc<Mutex<TargetCfgDb>>,
-    reload_filter: Arc<reload::Handle<EnvFilter, Registry>>,
+    reload_filter: AtomicEnvFilter,
 }
 impl TracingControl {
-    fn new() -> Self {
-        let db = TargetCfgDb::new();
-        let (filter, reload_filter) = reload::Layer::new(db.env_filter());
-
-        // formatting layer
-        let fmt_layer = tracing_subscriber::fmt::layer()
+    fn fmt_layer<S>() -> impl Layer<S> + Send + Sync
+    where
+        S: Subscriber + for<'span> LookupSpan<'span>,
+    {
+        tracing_subscriber::fmt::layer()
             .with_line_number(true)
             .with_target(true)
             .with_thread_ids(false)
             .with_thread_names(true)
-            .with_level(true);
+            .with_level(true)
+    }
 
-        // we should not be initializing the subscriber here, but that's fine atm
+    // To get rid of spaghetti filters in the layers, we split the fmt layer into two:
+    // one for unthrottled levels and one for throttled levels.
+
+    // `DEBUG` level remains unthrottled if we assume that it is the most verbose level
+    // that users would want to enable while digging into particular issues.
+    fn unthrottled_level_filter<S>() -> impl Filter<S> + Send + Sync
+    where
+        S: Subscriber + for<'span> LookupSpan<'span>,
+    {
+        filter_fn(|meta| matches!(*meta.level(), Level::DEBUG))
+    }
+
+    fn throttled_level_filter<S>() -> impl Filter<S> + Send + Sync
+    where
+        S: Subscriber + for<'span> LookupSpan<'span>,
+    {
+        filter_fn(|meta| {
+            matches!(
+                *meta.level(),
+                Level::INFO | Level::TRACE | Level::ERROR | Level::WARN
+            )
+        })
+    }
+
+    fn unthrottled_fmt_layer<S>() -> BoxedTracingLayer<S>
+    where
+        S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync + 'static,
+    {
+        Self::fmt_layer()
+            .with_filter(Self::unthrottled_level_filter())
+            .boxed()
+    }
+
+    fn throttled_fmt_layer<S>(
+        rate_limit_config: Option<TracingRateLimitConfig>,
+    ) -> BoxedTracingLayer<S>
+    where
+        S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync + 'static,
+    {
+        if let Some(rate_limit) = Self::build_rate_limit_layer(rate_limit_config) {
+            Self::fmt_layer()
+                .with_filter(Self::throttled_level_filter().and(rate_limit))
+                .boxed()
+        } else {
+            Self::fmt_layer()
+                .with_filter(Self::throttled_level_filter())
+                .boxed()
+        }
+    }
+
+    fn build_rate_limit_layer(
+        rate_limit_config: Option<TracingRateLimitConfig>,
+    ) -> Option<TracingRateLimitLayer> {
+        let rate_limit_config = rate_limit_config?;
+
+        let policy = match Policy::token_bucket(
+            f64::from(rate_limit_config.burst),
+            f64::from(rate_limit_config.replenish_per_second),
+        ) {
+            Ok(policy) => policy,
+            Err(e) => {
+                eprintln!(
+                    "Failed to create tracing throttle policy: {e}; falling back to unthrottled logging"
+                );
+                return None;
+            }
+        };
+
+        match TracingRateLimitLayer::builder()
+            .with_policy(policy)
+            .with_summary_interval(Duration::from_secs(30))
+            .build()
+        {
+            Ok(rate_limit) => Some(rate_limit),
+            Err(e) => {
+                eprintln!(
+                    "Failed to create tracing throttle layer: {e}; falling back to unthrottled logging"
+                );
+                None
+            }
+        }
+    }
+
+    fn init_subscriber(filter: AtomicEnvFilter, rate_limit_config: Option<TracingRateLimitConfig>) {
         if let Err(e) = tracing_subscriber::registry()
             .with(filter)
-            .with(fmt_layer)
+            .with(Self::unthrottled_fmt_layer())
+            .with(Self::throttled_fmt_layer(rate_limit_config))
             .with(tracing_error::ErrorLayer::default())
             .try_init()
         {
             eprintln!("Failed to set global tracing subscriber: {e} !!");
         }
+    }
+
+    fn new(rate_limit_config: Option<TracingRateLimitConfig>) -> Self {
+        let db = TargetCfgDb::new();
+        let filter = AtomicEnvFilter::new(db.env_filter());
+        let reload_filter = filter.clone();
+
+        Self::init_subscriber(filter, rate_limit_config);
+
         if let Err(e) = color_eyre::install() {
             eprintln!("Failed to initialize color_eyre:\n{e}");
         }
         Self {
             db: Arc::new(Mutex::new(db)),
-            reload_filter: Arc::new(reload_filter),
+            reload_filter,
         }
     }
-    /// This method should remain private and never be used other than from methods of `TracingControl`
-    fn lock(&self) -> Result<MutexGuard<'_, TargetCfgDb>, TraceCtlError> {
-        self.db
-            .lock()
-            .map_err(|e| TraceCtlError::LockFailure(e.to_string()))
+    fn lock(&self) -> MutexGuard<'_, TargetCfgDb> {
+        self.db.lock()
     }
-    fn reload(&self, filter: EnvFilter) -> Result<(), TraceCtlError> {
-        self.reload_filter
-            .reload(filter)
-            .map_err(|e| TraceCtlError::ReloadFailure(e.to_string()))
+    /// Reload the active `EnvFilter`. Infallible: the `ArcSwap`-based handle
+    /// has no lock to poison and no subscriber-gone case.
+    fn reload(&self, filter: EnvFilter) {
+        self.reload_filter.reload(filter);
     }
     #[cfg(test)]
     fn register(
@@ -332,45 +527,63 @@ impl TracingControl {
         tags: &'static [&'static str],
         custom: bool,
     ) {
-        let mut db = self.lock().unwrap();
+        let mut db = self.lock();
         db.register(target, name, level, tags, custom);
-        self.reload(db.env_filter()).unwrap();
+        self.reload(db.env_filter());
     }
 }
 
 /// Get a reference to a static [`TracingControl`], initializing it if needed
-static TRACING_CTL: LazyLock<TracingControl> = LazyLock::new(TracingControl::new);
+static TRACING_CTL: OnceLock<TracingControl> = OnceLock::new();
 #[must_use]
 pub fn get_trace_ctl() -> &'static TracingControl {
-    #[allow(clippy::explicit_auto_deref)] // needed by mechanics of lazy lock
-    &*TRACING_CTL
+    TRACING_CTL.get_or_init(|| TracingControl::new(None))
 }
 
 // public methods for TracingControl
 impl TracingControl {
+    fn init_once(
+        tracing_ctl: &OnceLock<TracingControl>,
+        rate_limit_config: Option<TracingRateLimitConfig>,
+    ) -> bool {
+        let mut initialized = false;
+        let _ = tracing_ctl.get_or_init(|| {
+            initialized = true;
+            TracingControl::new(rate_limit_config)
+        });
+        initialized
+    }
+
     pub fn init() {
         let _ = get_trace_ctl();
     }
+    pub fn init_with_rate_limit(rate_limit_config: Option<TracingRateLimitConfig>) {
+        let has_rate_limit_config = rate_limit_config.is_some();
+        let initialized = Self::init_once(&TRACING_CTL, rate_limit_config);
+        if has_rate_limit_config && !initialized {
+            warn!("TracingControl already initialized; ignoring provided rate-limit config");
+        }
+    }
     fn set_tag_level(&self, tag: &str, level: LevelFilter) -> Result<(), TraceCtlError> {
-        let mut db = self.lock()?;
+        let mut db = self.lock();
         let changed = db.set_tag_level(tag, level)?;
         if changed > 0 {
-            self.reload(db.env_filter())?;
+            self.reload(db.env_filter());
         }
         info!("Changed log level for tag '{tag}' to {level}. Targets changed: {changed}");
         Ok(())
     }
     pub fn set_default_level(&self, level: LevelFilter) -> Result<(), TraceCtlError> {
-        let mut db = self.lock()?;
+        let mut db = self.lock();
         if db.default != level {
             info!("Changing default log-level from {} to {level}", db.default);
             db.default = level;
-            self.reload(db.env_filter())?;
+            self.reload(db.env_filter());
         }
         Ok(())
     }
     pub fn get_default_level(&self) -> Result<LevelFilter, TraceCtlError> {
-        let db = self.lock()?;
+        let db = self.lock();
         Ok(db.default)
     }
 
@@ -409,27 +622,27 @@ impl TracingControl {
     #[cfg(test)]
     #[allow(clippy::missing_panics_doc)]
     pub fn get_tags(&self) -> impl Iterator<Item = Tag> {
-        self.db.lock().unwrap().tags.clone().into_values()
+        self.db.lock().tags.clone().into_values()
     }
 
     #[cfg(test)]
     #[allow(clippy::missing_panics_doc)]
     #[must_use]
     pub fn get_tag(&self, tag: &str) -> Option<Tag> {
-        self.db.lock().unwrap().tags.get(tag).cloned()
+        self.db.lock().tags.get(tag).cloned()
     }
 
     #[cfg(test)]
     #[allow(clippy::missing_panics_doc)]
     #[must_use]
     pub fn get_target(&self, target: &str) -> Option<TargetCfg> {
-        self.db.lock().unwrap().targets.get(target).cloned()
+        self.db.lock().targets.get(target).cloned()
     }
 
     #[cfg(test)]
     #[allow(clippy::missing_panics_doc)]
     pub fn get_targets_by_tag(&self, tag: &str) -> impl Iterator<Item = TargetCfg> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock();
         db.tag_targets(tag)
             .map(|x| (*x).clone())
             .collect::<Vec<_>>()
@@ -437,7 +650,7 @@ impl TracingControl {
     }
 
     pub fn as_config_string(&self) -> Result<String, TraceCtlError> {
-        Ok(self.lock()?.as_config_string())
+        Ok(self.lock().as_config_string())
     }
 
     fn reconfigure_internal<'a>(
@@ -445,15 +658,12 @@ impl TracingControl {
         default: Option<LevelFilter>,
         tag_config: impl Iterator<Item = (&'a str, LevelFilter)>,
         resolver: &dyn Resolver,
-    ) -> Result<(), TraceCtlError> {
-        let mut db = self.lock()?;
+    ) {
+        let mut db = self.lock();
         let changed = db.reconfigure(default, tag_config, resolver);
         if changed > 0 {
-            self.reload_filter
-                .reload(db.env_filter())
-                .map_err(|e| TraceCtlError::ReloadFailure(e.to_string()))?;
+            self.reload(db.env_filter());
         }
-        Ok(())
     }
 
     /// Main method to reconfigure tracing
@@ -463,16 +673,17 @@ impl TracingControl {
         tag_config: impl Iterator<Item = (&'a str, LevelFilter)>,
     ) -> Result<(), TraceCtlError> {
         //self.reconfigure_internal(default, tag_config, &ResolveByLevel)
-        self.reconfigure_internal(default, tag_config, &ResolveByTagSize)
+        self.reconfigure_internal(default, tag_config, &ResolveByTagSize);
+        Ok(())
     }
     pub fn check_tags(&self, tags: &[&str]) -> Result<(), TraceCtlError> {
-        self.lock()?.check_tags(tags)
+        self.lock().check_tags(tags)
     }
     pub fn as_string(&self) -> Result<String, TraceCtlError> {
-        Ok(self.lock()?.to_string())
+        Ok(self.lock().to_string())
     }
     pub fn as_string_by_tag(&self) -> Result<String, TraceCtlError> {
-        let db = self.lock()?;
+        let db = self.lock();
         Ok(TargetCfgDbByTag(&db).to_string())
     }
 }
@@ -484,6 +695,7 @@ mod tests {
     use crate::control::{Tag, TracingControl, get_trace_ctl};
     use crate::targets::TRACING_TARGETS;
     use crate::{LevelFilter, custom_target, trace_target};
+    use concurrency::sync::OnceLock;
     use serial_test::serial;
     use tracing::Level;
     use tracing::event_enabled;
@@ -521,7 +733,26 @@ mod tests {
             "The current default loglevel is {}",
             tctl.get_default_level().unwrap()
         );
-        println!("{:#?}", tctl.db.lock().unwrap());
+        println!("{:#?}", tctl.db.lock());
+    }
+
+    #[test]
+    #[serial]
+    fn test_init_with_rate_limit() {
+        let tracing_ctl = OnceLock::new();
+        let rate_limit_config = Some(crate::control::TracingRateLimitConfig {
+            burst: 10,
+            replenish_per_second: 1,
+        });
+
+        assert!(TracingControl::init_once(&tracing_ctl, rate_limit_config));
+        assert!(tracing_ctl.get().is_some());
+        assert_eq!(
+            tracing_ctl.get().unwrap().get_default_level().unwrap(),
+            crate::control::DEFAULT_DEFAULT_LOGLEVEL
+        );
+
+        assert!(!TracingControl::init_once(&tracing_ctl, rate_limit_config));
     }
 
     #[test]
@@ -535,7 +766,6 @@ mod tests {
         println!("{}", tctl.as_string().unwrap());
         println!("{}", tctl.as_string_by_tag().unwrap());
 
-        assert_eq!(check_level!(TARGET_1), LevelFilter::TRACE);
         assert_eq!(check_level!(TARGET_2), LevelFilter::DEBUG);
         assert_eq!(check_level!(TARGET_3), LevelFilter::INFO);
 
@@ -586,12 +816,12 @@ mod tests {
 
         // check target presence in database: all should be there even if defined later
         let tctl = get_trace_ctl();
-        assert!(tctl.db.lock().unwrap().targets.contains_key(module_path!()));
-        assert!(tctl.db.lock().unwrap().targets.contains_key("target-1"));
-        assert!(tctl.db.lock().unwrap().targets.contains_key("target-2"));
-        assert!(tctl.db.lock().unwrap().targets.contains_key("target-3"));
-        assert!(tctl.db.lock().unwrap().targets.contains_key("target-4"));
-        assert!(tctl.db.lock().unwrap().targets.contains_key("func1"));
+        assert!(tctl.db.lock().targets.contains_key(module_path!()));
+        assert!(tctl.db.lock().targets.contains_key("target-1"));
+        assert!(tctl.db.lock().targets.contains_key("target-2"));
+        assert!(tctl.db.lock().targets.contains_key("target-3"));
+        assert!(tctl.db.lock().targets.contains_key("target-4"));
+        assert!(tctl.db.lock().targets.contains_key("func1"));
 
         // this is declared after the checks
         custom_target!("target-4", LevelFilter::OFF, &["target-4"]);
@@ -626,7 +856,7 @@ mod tests {
         custom_target!(TARGET, LevelFilter::TRACE, &[]);
 
         let tctl = get_trace_ctl();
-        assert!(tctl.db.lock().unwrap().targets.contains_key(TARGET));
+        assert!(tctl.db.lock().targets.contains_key(TARGET));
         let target = tctl.get_target(TARGET).expect("Should be found");
         assert_eq!(target.level, LevelFilter::TRACE);
 
@@ -801,7 +1031,6 @@ mod tests {
                 (T1, LevelFilter::OFF),
                 (T2, LevelFilter::DEBUG),
                 (T3, LevelFilter::ERROR),
-                (Y2, LevelFilter::TRACE),
                 (Y3, LevelFilter::OFF),
             ]
             .into_iter(),
@@ -809,7 +1038,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(check_level!(Y1), LevelFilter::ERROR);
-        assert_eq!(check_level!(Y2), LevelFilter::TRACE);
         assert_eq!(check_level!(Y3), LevelFilter::OFF);
         assert_eq!(check_level!(Y4), LevelFilter::DEBUG);
 
@@ -829,5 +1057,72 @@ mod tests {
         assert_eq!(check_level!(Y2), LevelFilter::ERROR);
         assert_eq!(check_level!(Y3), LevelFilter::ERROR);
         assert_eq!(check_level!(Y4), LevelFilter::DEBUG);
+    }
+
+    // Verify the rate limiter actually drops events past the burst.
+    #[test]
+    #[serial]
+    #[allow(clippy::disallowed_types)]
+    fn test_rate_limit_drops_burst_overflow() {
+        use crate::control::{TracingControl, TracingRateLimitConfig};
+        use std::sync::Mutex; // nosemgrep: rust-no-direct-std-sync-import
+        use tracing_subscriber::{EnvFilter, filter::FilterExt, layer::Layer, prelude::*};
+        use tracing_test::internal::MockWriter;
+
+        const INFO_MARKER: &str = "HH_RATE_TEST_INFO";
+        const DEBUG_MARKER: &str = "HH_RATE_TEST_DEBUG";
+        const BURST: u32 = 5;
+        const EMITTED: usize = 100;
+
+        // We leak a `Mutex<Vec<u8>>` to get a `'static` writer buffer for the subscriber layer.
+        let buf: &'static Mutex<Vec<u8>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+
+        let rate_limit = TracingControl::build_rate_limit_layer(Some(TracingRateLimitConfig {
+            burst: BURST,
+            replenish_per_second: 1,
+        }))
+        .expect("build rate-limit layer");
+
+        // Same for dataplane: `DEBUG` events are unthrottled, `INFO` events are
+        let fmt_unthrottled = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(MockWriter::new(buf))
+            .with_filter(TracingControl::unthrottled_level_filter());
+
+        let fmt_throttled = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(MockWriter::new(buf))
+            .with_filter(TracingControl::throttled_level_filter().and(rate_limit));
+
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("debug"))
+            .with(fmt_unthrottled)
+            .with(fmt_throttled);
+
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..EMITTED {
+                tracing::debug!("{DEBUG_MARKER}");
+                tracing::info!("{INFO_MARKER}");
+            }
+        });
+
+        let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let info_kept = captured.matches(INFO_MARKER).count();
+        let debug_kept = captured.matches(DEBUG_MARKER).count();
+
+        // DEBUG is unthrottled — every event must make it through, and the
+        // throttle layer never sees it so it can't burn tokens budgeted for INFO.
+        assert_eq!(
+            debug_kept, EMITTED,
+            "DEBUG events must pass the unthrottled layer; got {debug_kept}/{EMITTED}"
+        );
+        assert!(
+            info_kept >= 1,
+            "rate limiter swallowed the entire INFO burst"
+        );
+        assert!(
+            info_kept < EMITTED / 2,
+            "rate limiter let through {info_kept}/{EMITTED} INFO events; expected ≪ {EMITTED}\n{captured}"
+        );
     }
 }

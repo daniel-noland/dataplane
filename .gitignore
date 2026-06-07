@@ -1,5 +1,7 @@
 **.profraw
 **/__fuzz__/**
+# qemu-user core dumps from SIGABRT under emulated tests.
+**/qemu_*.core
 result*
 result*/**
 **/target/**
@@ -9,10 +11,11 @@ result*/**
 /artifact/**
 /compile-env
 /compile-env/**
-/dev-env-template/**
 /dpdk-sys/.macro_eval.c
 /dpdk-sys/dpdk_wrapper-precompile.h*
 *.pch
 /bin
 sysroot
 devroot
+testroot
+vmroot

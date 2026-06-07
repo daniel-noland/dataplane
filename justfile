@@ -5,6 +5,8 @@ set unstable := true
 set shell := ["/usr/bin/env", "bash", "-euo", "pipefail", "-c"]
 set script-interpreter := ["/usr/bin/env", "bash", "-euo", "pipefail"]
 
+mod miri
+
 # enable to debug just recipes
 debug_justfile := "false"
 
@@ -15,7 +17,7 @@ _just_debuggable_ := if debug_justfile == "true" { "set -x" } else { "" }
 jobs := "8"
 
 # libc
-libc := if platform == "wasm32-wasip1" { "unknown" } else { "gnu" }
+libc := if platform == "wasm32-wasip1" { "none" } else { "gnu" }
 
 # kernel (linux or wasip1)
 kernel := if platform == "wasm32-wasip1" { "wasip1" } else { "linux" }
@@ -49,7 +51,34 @@ _cargo_feature_flags := \
 _cargo_profile_flag := if profile == "debug" { "" } else { "--profile " + profile }
 
 # filters for nextest
-filter := if features == "shuttle" { "shuttle" } else { "" }
+#
+# Under `shuttle`, the legacy `dataplane-quiescent` test layout had a
+# `shuttle` binary that hosted the bolero x shuttle suite, and we used
+# `--package=shuttle` (now an `-E 'package(shuttle)'`-style filter
+# embedded in nextest's argv) to isolate it.  Today that suite lives in
+# `concurrency/tests/quiescent_shuttle.rs`, and the test binary is
+# `quiescent_shuttle`; matching the substring `shuttle` is good enough.
+#
+# Under `loom`, the legacy filter `-E 'binary(loom)'` matched
+# `quiescent_loom`, the single integration-test binary that opted into
+# `loom::model`.  After the concurrency rework, loom-compatible tests
+# are spread across multiple binaries (`quiescent_model`,
+# `thread_scope`, `arc_weak`, `stress_dispatch`); the rest are gated
+# with `#![cfg(not(any(feature = "loom", ...)))]` and compile down to
+# zero tests under the loom feature.  An empty filter is therefore the
+# right answer: nextest walks every archived binary, the cfg-gated
+# ones contain no tests, and the loom-compatible ones run under their
+# `#[concurrency::test]`-routed `loom::model` body.
+# Match all shuttle variants (`shuttle`, plus the additive
+# `shuttle_dfs` opt-in).
+# Under any shuttle backend, `concurrency::sync` types ARE shuttle
+# primitives, and touching them outside a `shuttle::check_*`-wrapped
+# body panics with `ExecutionState NotSet`. Tests that are designed
+# to run under shuttle either go through `#[concurrency::test]` (which
+# emits a `concurrency_model::<backend>` leaf -- the substring matches)
+# or live in a `*_shuttle` module / `*shuttle*` binary by convention.
+# Other workspace tests would fail spuriously without this filter.
+filter := if features =~ "^shuttle" { "shuttle" } else if features =~ "^loom" { "::concurrency_model::loom" } else { "" }
 
 # instrumentation mode (none/coverage)
 instrument := "none"
@@ -84,6 +113,9 @@ oci_image_frr_host := oci_repo + "/" + oci_frr_prefix + "-host:" + version
 _skopeo_dest_insecure := if oci_insecure == "true" { "--dest-tls-verify=false" } else { "" }
 
 [private]
+nightly := "false"
+
+[private]
 docker_sock := "/var/run/docker.sock"
 
 # Build a nix derivation with standard build arguments
@@ -102,6 +134,7 @@ build target="dataplane.tar" *args:
       --argstr instrumentation '{{ instrument }}' \
       --argstr platform '{{ platform }}' \
       --argstr tag '{{version}}' \
+      --argstr nightly '{{nightly}}' \
       --print-build-logs \
       --show-trace \
       --out-link "results/${target}" \
@@ -122,10 +155,40 @@ pre-flight: (check-dependencies) (fmt "--check") (test) (lint) (doctest)
     echo "pre flight checks pass"
 
 [script]
-test package="tests.all" *args: (build (if package == "tests.all" { "tests.all" } else { "tests.pkg." + package }) args)
+test package="tests.all" *args: (setup-roots) (build (if package == "tests.all" { "tests.all" } else { "tests.pkg." + package }) args)
     {{ _just_debuggable_ }}
     declare -r target="{{ if package == "tests.all" { "tests.all" } else { "tests.pkg." + package } }}"
-    cargo nextest run --archive-file results/${target}/*.tar.zst --workspace-remap $(pwd) {{ filter }}
+    # Export scratch-container roots when the symlinks exist so that
+    # #[in_vm] tests use the nix-built testroot/vmroot automatically.
+    if [[ -e testroot && -e vmroot ]]; then
+        export N_VM_TEST_ROOT="$(pwd)/testroot"
+        export N_VM_VM_ROOT="$(pwd)/vmroot"
+    fi
+    # `--no-tests pass`: a single-package archive whose only test(s) are
+    # `#[cfg_attr(emulated, ignore)]` (e.g. n-vm-macros' trybuild test under
+    # cross) runs zero tests; treat that as success, matching `test-each`.
+    cargo nextest run --archive-file results/${target}/*.tar.zst --workspace-remap $(pwd) --no-tests pass {{ filter }}
+
+# Build and run the criterion benches. The rte_acl benches are gated behind the
+# `dpdk` feature, so run `just features=dpdk bench` to exercise them; a plain
+# `just bench` builds them as empty `main()` and only runs the reference benches.
+[script]
+bench: (build "benches")
+    {{ _just_debuggable_ }}
+    shopt -s nullglob
+    for bench in ./results/benches/bin/*; do "$bench" --bench; done
+
+[script]
+build-each *args: (build "workspace" args)
+    {{ _just_debuggable_ }}
+
+[script]
+check package="" *args: (build (if package == "" { "check" } else { "check." + package }) args)
+    {{ _just_debuggable_ }}
+
+[script]
+check-each *args: (build "check" args)
+    {{ _just_debuggable_ }}
 
 [script]
 test-each *args: (build "tests.pkg" args)
@@ -145,16 +208,21 @@ test-each *args: (build "tests.pkg" args)
 docs package="" *args: (build (if package == "" { "docs.all" } else { "docs.pkg." + package }) args)
     {{ _just_debuggable_ }}
 
-# Create devroot and sysroot symlinks for local development
+# Create devroot, sysroot, testroot, and vmroot symlinks for local development
 [script]
 setup-roots *args:
     {{ _just_debuggable_ }}
-    for root in devroot sysroot; do
+    for root in devroot sysroot testroot vmroot; do
       nix build -f default.nix "${root}" \
+        --argstr default-features '{{ default_features }}' \
+        --argstr features '{{ features }}' \
+        --argstr instrumentation '{{ instrument }}' \
+        --argstr kernel '{{ kernel }}' \
+        --argstr libc '{{ libc }}' \
+        --argstr nightly '{{nightly}}' \
+        --argstr platform '{{ platform }}' \
         --argstr profile '{{ profile }}' \
         --argstr sanitize '{{ sanitize }}' \
-        --argstr instrumentation '{{ instrument }}' \
-        --argstr platform '{{ platform }}' \
         --argstr tag '{{version}}' \
         --out-link "${root}" \
         {{ args }}
@@ -167,11 +235,21 @@ build-container target="dataplane" *args: (build (if target == "dataplane" { "da
     declare -xr DOCKER_HOST="${DOCKER_HOST:-unix://{{docker_sock}}}"
     case "{{target}}" in
         "dataplane")
+            declare docker_platform
+            case "{{platform}}" in
+                aarch64|bluefield2|bluefield3) docker_platform="linux/arm64" ;;
+                x86-64-v3|x86-64-v4|zen3|zen4|zen5) docker_platform="linux/amd64" ;;
+                *)
+                    >&2 echo "build-container: no docker platform mapping for {{platform}}"
+                    exit 1
+                    ;;
+            esac
+            declare -r docker_platform
             declare img
-            img="$(docker import --change 'ENTRYPOINT ["/bin/dataplane"]' ./results/dataplane.tar)"
+            img="$(docker import --platform "${docker_platform}" --change 'ENTRYPOINT ["/bin/dataplane"]' ./results/dataplane.tar)"
             declare -r img
             docker tag "${img}" "{{oci_image_dataplane}}"
-            echo "imported {{ oci_image_dataplane }}"
+            echo "imported {{ oci_image_dataplane }} (${docker_platform})"
             ;;
         "dataplane-debugger")
             docker load < ./results/containers.dataplane-debugger
@@ -301,6 +379,12 @@ doctest *args:
 coverage target="tests.all" *args: (build (if target == "tests.all" { "tests.all" } else { "tests.pkg." + target }) args)
     {{ _just_debuggable_ }}
     declare -r target="{{ if target == "tests.all" { "tests.all" } else { "tests.pkg." + target } }}"
+    # Export scratch-container roots when the symlinks exist so that
+    # #[in_vm] tests use the nix-built testroot/vmroot automatically.
+    if [[ -e testroot && -e vmroot ]]; then
+      export N_VM_TEST_ROOT="$(pwd)/testroot"
+      export N_VM_VM_ROOT="$(pwd)/vmroot"
+    fi
     export LLVM_COV="$(pwd)/devroot/bin/llvm-cov"
     export LLVM_PROFDATA="$(pwd)/devroot/bin/llvm-profdata"
     export CARGO_LLVM_COV_TARGET_DIR="$(pwd)/target/llvm-cov"
@@ -344,4 +428,14 @@ bump_version version:
 # Enter nix-shell
 [script]
 shell:
-   nix-shell
+   nix-shell \
+      --argstr default-features '{{ default_features }}' \
+      --argstr features '{{ features }}' \
+      --argstr instrumentation '{{ instrument }}' \
+      --argstr kernel '{{ kernel }}' \
+      --argstr libc '{{ libc }}' \
+      --argstr nightly '{{nightly}}' \
+      --argstr platform '{{ platform }}' \
+      --argstr profile '{{ profile }}' \
+      --argstr sanitize '{{ sanitize }}' \
+      --argstr tag '{{version}}'

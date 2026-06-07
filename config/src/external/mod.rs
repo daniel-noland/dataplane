@@ -8,13 +8,15 @@ pub mod gwgroup;
 pub mod overlay;
 pub mod underlay;
 
+use std::num::NonZero;
+
 use crate::internal::device::DeviceConfig;
 use crate::{ConfigError, ConfigResult};
 use communities::PriorityCommunityTable;
 use derive_builder::Builder;
 use gwgroup::GwGroupTable;
-use overlay::Overlay;
 use overlay::vpc::Peering;
+use overlay::{Overlay, ValidatedOverlay};
 use tracing::debug;
 use underlay::Underlay;
 
@@ -31,6 +33,8 @@ pub struct ExternalConfig {
     pub overlay: Overlay, /* VPCs and peerings -- get highly developed in internal config */
     pub gwgroups: GwGroupTable, /* gateway group table */
     pub communities: PriorityCommunityTable, /* priority-to-community table */
+    #[builder(default)]
+    pub flow_table_capacity: Option<NonZero<usize>>, /* optional hard cap of flow table */
 }
 impl ExternalConfig {
     pub const BLANK_GENID: GenId = 0;
@@ -46,6 +50,7 @@ impl ExternalConfig {
             overlay: Overlay::default(),
             gwgroups: GwGroupTable::new(),
             communities: PriorityCommunityTable::new(),
+            flow_table_capacity: None,
         }
     }
 
@@ -98,20 +103,125 @@ impl ExternalConfig {
     /// # Errors
     ///
     /// Returns a [`ConfigError`] if validation fails.
-    pub fn validate(&mut self) -> ConfigResult {
+    pub fn validate(&self) -> Result<ValidatedExternalConfig, ConfigError> {
         self.device.validate()?;
-        self.underlay.validate()?;
-        self.overlay.validate()?;
+        let validated_underlay = self.underlay.validate()?;
+        let validated_overlay = self.overlay.validate()?;
         self.validate_peering_gw_groups()?;
 
         // if there are vpcs configured, there MUST be a vtep configured
-        if !self.overlay.vpc_table.is_empty() && self.underlay.vtep.is_none() {
+        if !validated_overlay.vpc_table().is_empty() && validated_underlay.vtep.is_none() {
             return Err(ConfigError::MissingParameter(
                 "Vtep interface configuration",
             ));
         }
         debug!("Community table mappings:\n{}", self.communities);
         debug!("Gateway-groups are:\n{}", self.gwgroups);
-        Ok(())
+        Ok(ValidatedExternalConfig {
+            gwname: self.gwname.clone(),
+            genid: self.genid,
+            device: self.device.clone(),
+            underlay: validated_underlay,
+            overlay: validated_overlay,
+            gwgroups: self.gwgroups.clone(),
+            communities: self.communities.clone(),
+            flow_table_capacity: self.flow_table_capacity,
+        })
+    }
+
+    /// FOR TESTS ONLY. Fake validation for the external config.
+    ///
+    /// # Safety
+    ///
+    /// All bets are off. Do not use outside of tests.
+    ///
+    /// # Panics
+    ///
+    /// May panic if the underlay validation fails.
+    #[cfg(feature = "testing")]
+    #[allow(unsafe_code)]
+    #[must_use]
+    pub unsafe fn fake_validated_external_for_tests(self) -> ValidatedExternalConfig {
+        #[allow(clippy::unwrap_used)]
+        let validated_underlay = self.underlay.validate().unwrap();
+        let fake_valid_overlay = unsafe { self.overlay.fake_validated_overlay_for_tests() };
+        ValidatedExternalConfig {
+            gwname: self.gwname,
+            genid: self.genid,
+            device: self.device,
+            underlay: validated_underlay,
+            overlay: fake_valid_overlay,
+            gwgroups: self.gwgroups,
+            communities: self.communities,
+            flow_table_capacity: self.flow_table_capacity,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ValidatedExternalConfig {
+    gwname: String,                              /* name of gateway */
+    genid: GenId,                                /* configuration generation id (version) */
+    device: DeviceConfig,                        /* goes as-is into the internal config */
+    underlay: Underlay,                          /* goes as-is into the internal config */
+    overlay: ValidatedOverlay, /* VPCs and peerings -- get highly developed in internal config */
+    gwgroups: GwGroupTable,    /* gateway group table */
+    communities: PriorityCommunityTable, /* priority-to-community table */
+    flow_table_capacity: Option<NonZero<usize>>, /* optional hard cap of flow table */
+}
+
+impl ValidatedExternalConfig {
+    #[must_use]
+    pub(crate) fn blank() -> Self {
+        Self {
+            gwname: String::new(),
+            genid: ExternalConfig::BLANK_GENID,
+            device: DeviceConfig::new(),
+            underlay: Underlay::default(),
+            overlay: ValidatedOverlay::blank(),
+            gwgroups: GwGroupTable::new(),
+            communities: PriorityCommunityTable::new(),
+            flow_table_capacity: None,
+        }
+    }
+
+    #[must_use]
+    pub fn gwname(&self) -> &str {
+        &self.gwname
+    }
+
+    #[must_use]
+    pub fn genid(&self) -> GenId {
+        self.genid
+    }
+
+    #[must_use]
+    pub fn device(&self) -> &DeviceConfig {
+        &self.device
+    }
+
+    #[must_use]
+    pub fn underlay(&self) -> &Underlay {
+        &self.underlay
+    }
+
+    #[must_use]
+    pub fn overlay(&self) -> &ValidatedOverlay {
+        &self.overlay
+    }
+
+    #[must_use]
+    pub fn gwgroups(&self) -> &GwGroupTable {
+        &self.gwgroups
+    }
+
+    #[must_use]
+    pub fn communities(&self) -> &PriorityCommunityTable {
+        &self.communities
+    }
+
+    #[must_use]
+    pub fn flow_table_capacity(&self) -> Option<&NonZero<usize>> {
+        self.flow_table_capacity.as_ref()
     }
 }

@@ -3,10 +3,12 @@
 
 #[cfg(test)]
 mod nf_test {
-    use crate::portfw::protocol::PortFwFlowStatus;
+    use crate::common::NatFlowStatus;
     use crate::portfw::{PortForwarder, PortFwEntry, PortFwKey, PortFwState, PortFwTableWriter};
 
+    use concurrency::sync::Arc;
     use flow_entry::flow_table::{FlowLookup, FlowTable};
+    use lpm::prefix::Prefix;
     use net::buffer::TestBuffer;
     use net::flows::FlowStatus;
     use net::flows::flow_info_item::ExtractRef;
@@ -14,13 +16,21 @@ mod nf_test {
     use net::ip::NextHeader;
     use net::packet::test_utils::{build_test_tcp_ipv4_packet, build_test_udp_ipv4_packet};
     use net::packet::{DoneReason, Packet, VpcDiscriminant};
-    use std::time::Duration;
-
-    use concurrency::sync::Arc;
-    use lpm::prefix::Prefix;
     use pipeline::{DynPipeline, NetworkFunction};
     use std::str::FromStr;
+    use std::time::Duration;
     use tracing_test::traced_test;
+
+    /*
+        All of the tests in this module refer to vpc1 (vni=2000) and vpc2 (vni=3000)
+        Traffic is port forwarded vpc1 => vpc2
+    */
+    fn vpcd1() -> VpcDiscriminant {
+        VpcDiscriminant::VNI(2000.try_into().unwrap())
+    }
+    fn vpcd2() -> VpcDiscriminant {
+        VpcDiscriminant::VNI(3000.try_into().unwrap())
+    }
 
     fn get_flow_status(packet: &Packet<TestBuffer>) -> Option<FlowStatus> {
         packet
@@ -30,14 +40,13 @@ mod nf_test {
             .map(|flow_info| flow_info.status())
     }
 
-    fn get_pfw_flow_status(packet: &Packet<TestBuffer>) -> Option<PortFwFlowStatus> {
+    fn get_pfw_flow_status(packet: &Packet<TestBuffer>) -> Option<NatFlowStatus> {
         packet
             .meta()
             .flow_info
             .as_ref()?
             .locked
             .read()
-            .unwrap()
             .port_fw_state
             .as_ref()
             .and_then(|s| s.extract_ref::<PortFwState>())
@@ -51,7 +60,6 @@ mod nf_test {
             .as_ref()?
             .locked
             .read()
-            .unwrap()
             .port_fw_state
             .as_ref()
             .and_then(|s| s.extract_ref::<PortFwState>())
@@ -60,7 +68,6 @@ mod nf_test {
 
     // build a reply for a given packet
     fn build_reply(packet: &Packet<TestBuffer>) -> Packet<TestBuffer> {
-        let src_vpcd = packet.meta().src_vpcd;
         let dst_vpcd = packet.meta().dst_vpcd;
         let src_mac = packet.eth_source().unwrap();
         let dst_mac = packet.eth_destination().unwrap();
@@ -71,7 +78,7 @@ mod nf_test {
 
         let mut reply = packet.clone();
         reply.meta_mut().src_vpcd = dst_vpcd;
-        reply.meta_mut().dst_vpcd = src_vpcd;
+        reply.meta_mut().dst_vpcd.take(); // strip dst vpcd
         reply.set_eth_source(dst_mac).unwrap();
         reply.set_eth_destination(src_mac).unwrap();
         reply.set_ip_source(dst_ip.try_into().unwrap()).unwrap();
@@ -92,13 +99,10 @@ mod nf_test {
     // build a sample port forwarding table
     fn build_test_port_forwarding_ruleset() -> Vec<PortFwEntry> {
         let mut ruleset = vec![];
-        let key = PortFwKey::new(
-            VpcDiscriminant::VNI(2000.try_into().unwrap()),
-            NextHeader::TCP,
-        );
+        let key = PortFwKey::new(vpcd1(), NextHeader::TCP);
         let entry = PortFwEntry::new(
             key,
-            VpcDiscriminant::VNI(3000.try_into().unwrap()),
+            vpcd2(),
             Prefix::from_str("70.71.72.73/32").unwrap(),
             Prefix::from_str("192.168.1.1/32").unwrap(),
             (3022, 3022),
@@ -109,13 +113,10 @@ mod nf_test {
         .unwrap();
         ruleset.push(entry);
 
-        let key = PortFwKey::new(
-            VpcDiscriminant::VNI(2000.try_into().unwrap()),
-            NextHeader::UDP,
-        );
+        let key = PortFwKey::new(vpcd1(), NextHeader::UDP);
         let entry = PortFwEntry::new(
             key,
-            VpcDiscriminant::VNI(3000.try_into().unwrap()),
+            vpcd2(),
             Prefix::from_str("70.71.72.73/32").unwrap(),
             Prefix::from_str("192.168.1.2/32").unwrap(),
             (3053, 3053),
@@ -133,8 +134,7 @@ mod nf_test {
         let mut packet: Packet<TestBuffer> =
             build_test_udp_ipv4_packet("10.0.0.1", "70.71.72.73", 9876, 3053);
         packet.meta_mut().set_overlay(true);
-        packet.meta_mut().src_vpcd = Some(VpcDiscriminant::VNI(2000.try_into().unwrap()));
-        packet.meta_mut().dst_vpcd = Some(VpcDiscriminant::VNI(3000.try_into().unwrap()));
+        packet.meta_mut().src_vpcd = Some(vpcd1());
         packet.meta_mut().set_port_forwarding(true);
         packet
     }
@@ -148,8 +148,7 @@ mod nf_test {
         packet.try_tcp_mut().unwrap().set_rst(false);
 
         packet.meta_mut().set_overlay(true);
-        packet.meta_mut().src_vpcd = Some(VpcDiscriminant::VNI(2000.try_into().unwrap()));
-        packet.meta_mut().dst_vpcd = Some(VpcDiscriminant::VNI(3000.try_into().unwrap()));
+        packet.meta_mut().src_vpcd = Some(vpcd1());
         packet.meta_mut().set_port_forwarding(true);
         packet
     }
@@ -162,8 +161,7 @@ mod nf_test {
         packet.try_tcp_mut().unwrap().set_rst(false);
 
         packet.meta_mut().set_overlay(true);
-        packet.meta_mut().src_vpcd = Some(VpcDiscriminant::VNI(3000.try_into().unwrap()));
-        packet.meta_mut().dst_vpcd = Some(VpcDiscriminant::VNI(2000.try_into().unwrap()));
+        packet.meta_mut().src_vpcd = Some(vpcd2());
         packet.meta_mut().set_port_forwarding(true);
         packet
     }
@@ -179,6 +177,24 @@ mod nf_test {
         println!("OUTPUT:{output}");
         output.clone()
     }
+    // Fake flow filter that routes between vpc1 and vpc2
+    struct TestFlowFilter;
+    impl NetworkFunction<TestBuffer> for TestFlowFilter {
+        fn process<'a, Input: Iterator<Item = Packet<TestBuffer>> + 'a>(
+            &'a mut self,
+            input: Input,
+        ) -> impl Iterator<Item = Packet<TestBuffer>> + 'a {
+            input.map(|mut packet| {
+                let dst_vpcd = if packet.meta().src_vpcd == Some(vpcd1()) {
+                    vpcd2()
+                } else {
+                    vpcd1()
+                };
+                packet.meta_mut().dst_vpcd = Some(dst_vpcd);
+                packet
+            })
+        }
+    }
 
     /// sets up a port-forwarding pipeline
     fn setup_pipeline(
@@ -189,8 +205,10 @@ mod nf_test {
         let flow_table = Arc::new(FlowTable::default());
         let flow_lookup_nf = FlowLookup::new("flow-lookup", flow_table.clone());
         let nf = PortForwarder::new("port-forwarder", writer.reader(), flow_table.clone());
-        let pipeline: DynPipeline<TestBuffer> =
-            DynPipeline::new().add_stage(flow_lookup_nf).add_stage(nf);
+        let pipeline: DynPipeline<TestBuffer> = DynPipeline::new()
+            .add_stage(flow_lookup_nf)
+            .add_stage(TestFlowFilter)
+            .add_stage(nf);
 
         // set port-forwarding rules
         writer.update_table(ruleset).unwrap();
@@ -200,7 +218,7 @@ mod nf_test {
         (flow_table, pipeline, writer)
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[tokio::test]
     async fn test_nf_port_forwarding_base() {
         let ruleset = build_test_port_forwarding_ruleset();
@@ -218,24 +236,26 @@ mod nf_test {
 
         // process a packet in the reverse direction
         let reply = build_reply(&output);
+        // Snapshot just before the call so the assertion below can use a
+        // strict lower bound (`expires_at >= before + timeout`) that is
+        // independent of how long the rest of the test takes -- otherwise
+        // slow test execution (e.g. under miri) eats into the tolerance.
+        let before_reply = std::time::Instant::now();
         let output = process_packet(&mut pipeline, reply);
         assert_eq!(output.ip_source().unwrap().to_string(), "70.71.72.73");
         assert_eq!(output.ip_destination().unwrap().to_string(), "10.0.0.1");
         assert_eq!(output.udp_source_port().unwrap().as_u16(), 3053);
         assert_eq!(output.udp_destination_port().unwrap().as_u16(), 9876);
         assert_eq!(get_flow_status(&output), Some(FlowStatus::Active));
-        assert_eq!(get_pfw_flow_status(&output), Some(PortFwFlowStatus::TwoWay));
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::TwoWay));
 
         let flow_info = output.meta().flow_info.as_ref().unwrap();
         assert_eq!(flow_info.status(), FlowStatus::Active);
-        let expires_in = flow_info
-            .expires_at()
-            .saturating_duration_since(std::time::Instant::now())
-            .as_secs();
-        assert!(expires_in > PortFwEntry::DEFAULT_INITIAL_TOUT.as_secs() - 2);
+        assert!(flow_info.expires_at() >= before_reply + PortFwEntry::DEFAULT_INITIAL_TOUT);
 
         // process original packet again. It should be fast-natted
         let repeated = udp_packet_to_port_forward();
+        let before_repeated = std::time::Instant::now();
         let output = process_packet(&mut pipeline, repeated);
         assert_eq!(output.ip_source().unwrap().to_string(), "10.0.0.1");
         assert_eq!(output.ip_destination().unwrap().to_string(), "192.168.1.2");
@@ -245,14 +265,12 @@ mod nf_test {
         // flow entry should be there
         let flow_info = output.meta().flow_info.as_ref().unwrap();
         assert_eq!(flow_info.status(), FlowStatus::Active);
-        let expires_in = flow_info
-            .expires_at()
-            .saturating_duration_since(std::time::Instant::now())
-            .as_secs();
-        assert!(expires_in > PortFwEntry::DEFAULT_ESTABLISHED_TOUT_UDP.as_secs() - 5);
+        assert!(
+            flow_info.expires_at() >= before_repeated + PortFwEntry::DEFAULT_ESTABLISHED_TOUT_UDP
+        );
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[test]
     fn test_nf_port_forwarding_tcp_filtered() {
         let ruleset = build_test_port_forwarding_ruleset();
@@ -265,7 +283,7 @@ mod nf_test {
         let tcp = packet.try_tcp_mut().unwrap();
         tcp.set_syn(false);
         let output = process_packet(&mut pipeline, packet);
-        assert_eq!(output.get_done(), Some(DoneReason::Filtered));
+        assert_eq!(output.get_done(), Some(DoneReason::NatNotPortForwarded));
 
         // process a packet in reverse direction: no flow info should have been found
         let packet = tcp_packet_reverse_reply();
@@ -286,7 +304,7 @@ mod nf_test {
         let output = process_packet(pipeline, reply);
         assert!(output.meta().flow_info.is_some());
         assert_eq!(get_flow_status(&output), Some(FlowStatus::Active));
-        assert_eq!(get_pfw_flow_status(&output), Some(PortFwFlowStatus::TwoWay));
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::TwoWay));
 
         // process TCP ACK packet in forward direction
         let mut packet = tcp_packet_to_port_forward();
@@ -296,11 +314,11 @@ mod nf_test {
         assert_eq!(get_flow_status(&output), Some(FlowStatus::Active));
         assert_eq!(
             get_pfw_flow_status(&output),
-            Some(PortFwFlowStatus::Established)
+            Some(NatFlowStatus::Established)
         );
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[tokio::test]
     async fn test_nf_port_forwarding_tcp_establishment() {
         let ruleset = build_test_port_forwarding_ruleset();
@@ -312,7 +330,7 @@ mod nf_test {
         establish_tcp_connection(&mut pipeline);
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[tokio::test]
     async fn test_nf_port_forwarding_tcp_close_server() {
         let ruleset = build_test_port_forwarding_ruleset();
@@ -329,10 +347,7 @@ mod nf_test {
         let output = process_packet(&mut pipeline, packet);
         assert!(output.meta().flow_info.is_some());
         assert_eq!(get_flow_status(&output), Some(FlowStatus::Active));
-        assert_eq!(
-            get_pfw_flow_status(&output),
-            Some(PortFwFlowStatus::SClosing)
-        );
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::SClosing));
 
         // process TCP FIN ACK packet in forward direction
         let mut packet = tcp_packet_to_port_forward();
@@ -340,23 +355,20 @@ mod nf_test {
         let output = process_packet(&mut pipeline, packet);
         assert!(!output.is_done());
         assert_eq!(get_flow_status(&output), Some(FlowStatus::Active));
-        assert_eq!(
-            get_pfw_flow_status(&output),
-            Some(PortFwFlowStatus::LastAck)
-        );
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::LastAck));
 
         // process TCP ACK in reverse direction: flow entry should be found. State should become Closed
         let mut packet = tcp_packet_reverse_reply();
         packet.try_tcp_mut().unwrap().set_ack(true);
         let output = process_packet(&mut pipeline, packet);
         assert!(output.meta().flow_info.is_some());
-        assert!(get_flow_status(&output) != Some(FlowStatus::Active)); // it may be None if the nf expiration removes it
-        assert_eq!(get_pfw_flow_status(&output), Some(PortFwFlowStatus::Closed));
+        assert_ne!(get_flow_status(&output), Some(FlowStatus::Active)); // it may be None if the nf expiration removes it
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::Closed));
         println!("{flow_table}");
         assert_eq!(flow_table.len().unwrap(), 2);
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[tokio::test]
     async fn test_nf_port_forwarding_tcp_close_client() {
         let ruleset = build_test_port_forwarding_ruleset();
@@ -372,33 +384,27 @@ mod nf_test {
         packet.try_tcp_mut().unwrap().set_fin(true);
         let output = process_packet(&mut pipeline, packet);
         assert!(output.meta().flow_info.is_some());
-        assert_eq!(
-            get_pfw_flow_status(&output),
-            Some(PortFwFlowStatus::CClosing)
-        );
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::CClosing));
 
         // process TCP FIN ACK packet in reverse direction
         let mut packet = tcp_packet_reverse_reply();
         packet.try_tcp_mut().unwrap().set_ack(true).set_fin(true);
         let output = process_packet(&mut pipeline, packet);
         assert!(!output.is_done());
-        assert_eq!(
-            get_pfw_flow_status(&output),
-            Some(PortFwFlowStatus::LastAck)
-        );
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::LastAck));
 
         // process TCP ACK in forward direction: flow entry should be found. State should become Closed
         let mut packet = tcp_packet_reverse_reply();
         packet.try_tcp_mut().unwrap().set_ack(true);
         let output = process_packet(&mut pipeline, packet);
         assert!(output.meta().flow_info.is_some());
-        assert!(get_flow_status(&output) != Some(FlowStatus::Active)); // may be cancelled or none
-        assert_eq!(get_pfw_flow_status(&output), Some(PortFwFlowStatus::Closed));
+        assert_ne!(get_flow_status(&output), Some(FlowStatus::Active)); // may be cancelled or none
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::Closed));
         println!("{flow_table}");
         assert_eq!(flow_table.len().unwrap(), 2);
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[tokio::test]
     async fn test_nf_port_forwarding_tcp_half_close_client() {
         let ruleset = build_test_port_forwarding_ruleset();
@@ -414,10 +420,7 @@ mod nf_test {
         packet.try_tcp_mut().unwrap().set_fin(true);
         let output = process_packet(&mut pipeline, packet);
         assert!(output.meta().flow_info.is_some());
-        assert_eq!(
-            get_pfw_flow_status(&output),
-            Some(PortFwFlowStatus::CClosing)
-        );
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::CClosing));
 
         // process TCP ACK packet in reverse direction. We assume this ACKs the FIN
         let mut packet = tcp_packet_reverse_reply();
@@ -426,7 +429,7 @@ mod nf_test {
         assert!(!output.is_done());
         assert_eq!(
             get_pfw_flow_status(&output),
-            Some(PortFwFlowStatus::CHalfClose)
+            Some(NatFlowStatus::CHalfClose)
         );
 
         // process TCP FIN in reverse direction: flow entry should be found. State should become LastAck
@@ -434,23 +437,20 @@ mod nf_test {
         packet.try_tcp_mut().unwrap().set_fin(true);
         let output = process_packet(&mut pipeline, packet);
         assert!(output.meta().flow_info.is_some());
-        assert_eq!(
-            get_pfw_flow_status(&output),
-            Some(PortFwFlowStatus::LastAck)
-        );
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::LastAck));
 
         // process TCP ACK in forward direction: flow entry should be found. State should become Closed
         let mut packet = tcp_packet_to_port_forward();
         packet.try_tcp_mut().unwrap().set_ack(true);
         let output = process_packet(&mut pipeline, packet);
         assert!(output.meta().flow_info.is_some());
-        assert!(get_flow_status(&output) != Some(FlowStatus::Active)); // may be cancelled or none
-        assert_eq!(get_pfw_flow_status(&output), Some(PortFwFlowStatus::Closed));
+        assert_ne!(get_flow_status(&output), Some(FlowStatus::Active)); // may be cancelled or none
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::Closed));
         println!("{flow_table}");
         assert_eq!(flow_table.len().unwrap(), 2);
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[tokio::test]
     async fn test_nf_port_forwarding_tcp_reset() {
         let ruleset = build_test_port_forwarding_ruleset();
@@ -471,7 +471,7 @@ mod nf_test {
         let output = process_packet(&mut pipeline, packet);
         assert_eq!(
             get_pfw_flow_status(&output),
-            Some(PortFwFlowStatus::Established)
+            Some(NatFlowStatus::Established)
         );
 
         // process TCP RST packet in forward direction.
@@ -480,14 +480,14 @@ mod nf_test {
         let output = process_packet(&mut pipeline, packet);
         assert!(!output.is_done());
         assert_eq!(get_flow_status(&output), Some(FlowStatus::Cancelled));
-        assert_eq!(get_pfw_flow_status(&output), Some(PortFwFlowStatus::Reset));
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::Reset));
 
         // the flow table still contains the two flows, although they are unusable
         assert_eq!(flow_table.len(), Some(2));
         println!("{flow_table}");
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[tokio::test]
     async fn test_nf_port_forwarding_config_removal_interrupts_traffic() {
         let ruleset = build_test_port_forwarding_ruleset();
@@ -506,7 +506,7 @@ mod nf_test {
         packet.try_tcp_mut().unwrap().set_syn(true).set_ack(true);
         let output = process_packet(&mut pipeline, packet);
         assert!(output.meta().flow_info.is_some());
-        assert_eq!(get_pfw_flow_status(&output), Some(PortFwFlowStatus::TwoWay));
+        assert_eq!(get_pfw_flow_status(&output), Some(NatFlowStatus::TwoWay));
 
         // process TCP ACK packet in forward direction
         let mut packet = tcp_packet_to_port_forward();
@@ -515,7 +515,7 @@ mod nf_test {
         assert!(!output.is_done());
         assert_eq!(
             get_pfw_flow_status(&output),
-            Some(PortFwFlowStatus::Established)
+            Some(NatFlowStatus::Established)
         );
 
         // build the same table without the TCP port-forwarding rule
@@ -525,8 +525,7 @@ mod nf_test {
 
         let packet = tcp_packet_to_port_forward();
         let output = process_packet(&mut pipeline, packet);
-        assert_eq!(output.get_done(), Some(DoneReason::Filtered));
-        //        assert!(get_pfw_flow_status(&output).is_none());
+        assert_eq!(output.get_done(), Some(DoneReason::NatNotPortForwarded));
 
         println!("{flow_table}");
 
@@ -535,7 +534,7 @@ mod nf_test {
 
         let packet = tcp_packet_to_port_forward();
         let output = process_packet(&mut pipeline, packet);
-        assert_eq!(output.get_done(), Some(DoneReason::Filtered)); // should be filtered
+        assert_eq!(output.get_done(), Some(DoneReason::NatNotPortForwarded));
         assert_eq!(get_flow_status(&output), None); // expiration NF should have removed the flow
         assert!(get_pfw_flow_status(&output).is_none());
         println!("{flow_table}");
@@ -543,13 +542,10 @@ mod nf_test {
 
     fn build_test_port_forwarding_table_with_ranges() -> Vec<PortFwEntry> {
         let mut ruleset = vec![];
-        let key = PortFwKey::new(
-            VpcDiscriminant::VNI(2000.try_into().unwrap()),
-            NextHeader::UDP,
-        );
+        let key = PortFwKey::new(vpcd1(), NextHeader::UDP);
         let entry = PortFwEntry::new(
             key,
-            VpcDiscriminant::VNI(3000.try_into().unwrap()),
+            vpcd2(),
             Prefix::from_str("70.71.72.73/32").unwrap(),
             Prefix::from_str("192.168.1.2/32").unwrap(),
             (3000, 3100),
@@ -564,13 +560,10 @@ mod nf_test {
 
     fn build_test_port_forwarding_table_with_prefixes_and_port_ranges() -> Vec<PortFwEntry> {
         let mut ruleset = vec![];
-        let key = PortFwKey::new(
-            VpcDiscriminant::VNI(2000.try_into().unwrap()),
-            NextHeader::UDP,
-        );
+        let key = PortFwKey::new(vpcd1(), NextHeader::UDP);
         let entry = PortFwEntry::new(
             key,
-            VpcDiscriminant::VNI(3000.try_into().unwrap()),
+            vpcd2(),
             Prefix::from_str("70.71.72.70/24").unwrap(),
             Prefix::from_str("192.168.6.0/24").unwrap(),
             (3000, 3100),
@@ -588,7 +581,7 @@ mod nf_test {
         let flow = packet.meta().flow_info.as_ref().unwrap();
 
         // flow entry should have port-forwarding state
-        let locked = flow.locked.read().unwrap();
+        let locked = flow.locked.read();
         let state = locked
             .port_fw_state
             .as_ref()
@@ -604,7 +597,7 @@ mod nf_test {
         let flow = packet.meta().flow_info.as_ref().unwrap();
 
         // flow entry should have port-forwarding state
-        let locked = flow.locked.read().unwrap();
+        let locked = flow.locked.read();
         let state = locked
             .port_fw_state
             .as_ref()
@@ -616,7 +609,7 @@ mod nf_test {
         state.rule().upgrade().is_some()
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[tokio::test]
     async fn test_nf_port_forwarding_with_port_ranges() {
         let ruleset = build_test_port_forwarding_table_with_ranges();
@@ -657,7 +650,7 @@ mod nf_test {
         println!("{flow_table}");
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[tokio::test]
     async fn test_nf_port_forwarding_with_prefixes_and_port_ranges() {
         let ruleset = build_test_port_forwarding_table_with_prefixes_and_port_ranges();
@@ -698,18 +691,15 @@ mod nf_test {
         println!("{flow_table}");
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[tokio::test]
     async fn test_nf_port_forwarding_compatible_rule_updates_preserves_flows() {
         // check that, when updating a rule, existing flows remain if the new rule would allow them
 
         // build rule
         let entry = PortFwEntry::new(
-            PortFwKey::new(
-                VpcDiscriminant::VNI(2000.try_into().unwrap()),
-                NextHeader::TCP,
-            ),
-            VpcDiscriminant::VNI(3000.try_into().unwrap()),
+            PortFwKey::new(vpcd1(), NextHeader::TCP),
+            vpcd2(),
             Prefix::from_str("70.71.72.0/24").unwrap(),
             Prefix::from_str("192.168.1.0/24").unwrap(),
             (3010, 3050),
@@ -728,11 +718,8 @@ mod nf_test {
 
         // update the rule to include the previous one
         let entry = PortFwEntry::new(
-            PortFwKey::new(
-                VpcDiscriminant::VNI(2000.try_into().unwrap()),
-                NextHeader::TCP,
-            ),
-            VpcDiscriminant::VNI(3000.try_into().unwrap()),
+            PortFwKey::new(vpcd1(), NextHeader::TCP),
+            vpcd2(),
             Prefix::from_str("70.71.72.73/32").unwrap(),
             Prefix::from_str("192.168.1.73/32").unwrap(),
             (3022, 3023),
@@ -750,7 +737,7 @@ mod nf_test {
         assert_eq!(get_flow_status(&output), Some(FlowStatus::Active));
         assert_eq!(
             get_pfw_flow_status(&output),
-            Some(PortFwFlowStatus::Established)
+            Some(NatFlowStatus::Established)
         );
         let rule_referenced = get_pfw_flow_state_rule(&output);
         assert_eq!(rule_referenced.as_ref().unwrap().as_ref(), &entry);
@@ -758,18 +745,15 @@ mod nf_test {
         println!("{flow_table}");
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[tokio::test]
     async fn test_nf_port_forwarding_incompatible_rule_updates_remove_flows() {
         // check that, when updating a rule, existing flows remain if the new rule would allow them
 
         // build rule
         let entry = PortFwEntry::new(
-            PortFwKey::new(
-                VpcDiscriminant::VNI(2000.try_into().unwrap()),
-                NextHeader::TCP,
-            ),
-            VpcDiscriminant::VNI(3000.try_into().unwrap()),
+            PortFwKey::new(vpcd1(), NextHeader::TCP),
+            vpcd2(),
             Prefix::from_str("70.71.72.0/24").unwrap(),
             Prefix::from_str("192.168.1.0/24").unwrap(),
             (3010, 3050),
@@ -788,11 +772,8 @@ mod nf_test {
 
         // update the rule so that the traffic would be sent somewhere else
         let entry = PortFwEntry::new(
-            PortFwKey::new(
-                VpcDiscriminant::VNI(2000.try_into().unwrap()),
-                NextHeader::TCP,
-            ),
-            VpcDiscriminant::VNI(3000.try_into().unwrap()),
+            PortFwKey::new(vpcd1(), NextHeader::TCP),
+            vpcd2(),
             Prefix::from_str("70.71.72.0/24").unwrap(),
             Prefix::from_str("192.168.2.0/24").unwrap(),
             (3010, 3050),
@@ -810,11 +791,11 @@ mod nf_test {
         assert_eq!(get_flow_status(&output), Some(FlowStatus::Cancelled)); // flow should be cancelled
         assert_eq!(
             get_pfw_flow_status(&output),
-            Some(PortFwFlowStatus::Established) // this remains established. That's fine.
+            Some(NatFlowStatus::Established) // this remains established. That's fine.
         );
         let rule_referenced = get_pfw_flow_state_rule(&output);
         assert!(rule_referenced.is_none()); // flow did not get a new reference to a rule
-        assert_eq!(output.get_done(), Some(DoneReason::Filtered)); // packet was dropped
+        assert_eq!(output.get_done(), Some(DoneReason::NatNotPortForwarded)); // packet was dropped
 
         println!("{flow_table}");
     }

@@ -19,9 +19,10 @@ use nat::portfw::{PortForwarder, PortFwTableWriter};
 use nat::stateful::NatAllocatorWriter;
 use nat::stateless::NatTablesWriter;
 use nat::{IcmpErrorHandler, StatefulNat, StatelessNat};
+use net::packet::PacketStats;
 
 use net::buffer::PacketBufferMut;
-use pipeline::sample_nfs::PacketDumper;
+use pipeline::sample_nfs::{PacketDumper, PacketStatsNF};
 use pipeline::{DynPipeline, PipelineData};
 
 use routing::{CliSources, Router, RouterError, RouterParams};
@@ -36,6 +37,7 @@ where
 {
     pub router: Router,
     pub pipeline: Arc<dyn Send + Sync + Fn() -> DynPipeline<Buf>>,
+    pub flow_table: Arc<FlowTable>,
     pub vpcmapw: VpcMapWriter<VpcMapName>,
     pub nattablesw: NatTablesWriter,
     pub natallocatorw: NatAllocatorWriter,
@@ -47,6 +49,9 @@ where
 
 /// Start a router and provide the associated pipeline
 pub(crate) fn start_router<Buf: PacketBufferMut>(
+    mgmt: &lifecycle::Subsystem,
+    mgmt_handle: &tokio::runtime::Handle,
+    router: &lifecycle::Subsystem,
     params: RouterParams,
 ) -> Result<InternalSetup<Buf>, RouterError> {
     let vpcmapw = VpcMapWriter::<VpcMapName>::new();
@@ -68,6 +73,7 @@ pub(crate) fn start_router<Buf: PacketBufferMut>(
     let portfw_w = PortFwTableWriter::new();
     let portfw_factory = portfw_w.reader().factory();
     let pdata = Arc::from(PipelineData::new(0));
+    let pkt_stats = Arc::from(PacketStats::new());
 
     // collect readers and the like for cli
     let cli_sources = CliSources {
@@ -76,17 +82,20 @@ pub(crate) fn start_router<Buf: PacketBufferMut>(
         portfw_table: Some(Box::new(portfw_w.reader().inner())),
         nat_tables: Some(Box::new(nattabler_factory.handle().inner())),
         masquerade_state: Some(Box::new(natallocator_factory.handle().inner())),
+        pkt_stats: Some(Box::new(pkt_stats.clone())),
     };
 
     // create router
-    let router = Router::new(params, Some(cli_sources))?;
+    let router = Router::new(mgmt, mgmt_handle, router, params, Some(cli_sources))?;
     let iftr_factory = router.get_iftabler_factory();
     let fibtr_factory = router.get_fibtr_factory();
     let atabler_factory = router.get_atabler_factory();
 
     // create pipeline builder
+    let flow_table_clone = flow_table.clone();
     let pipeline_builder = move || {
         let pdata_clone = pdata.clone();
+
         // Build network functions
         let stage_ingress = Ingress::new("Ingress", iftr_factory.handle());
         let stage_egress = Egress::new("Egress", iftr_factory.handle(), atabler_factory.handle());
@@ -95,19 +104,20 @@ pub(crate) fn start_router<Buf: PacketBufferMut>(
         let stateless_nat = StatelessNat::with_reader("stateless-NAT", nattabler_factory.handle());
         let stateful_nat = StatefulNat::new(
             "stateful-NAT",
-            flow_table.clone(),
+            flow_table_clone.clone(),
             natallocator_factory.handle(),
         );
         let pktdump = PacketDumper::new("pipeline-end", true, None);
         let stats_stage = Stats::new("stats", stats_w.clone());
         let flow_filter = FlowFilter::new("flow-filter", flowfiltertablesr_factory.handle());
-        let icmp_error_handler = IcmpErrorHandler::new(flow_table.clone());
-        let flow_lookup = FlowLookup::new("flow-lookup", flow_table.clone());
+        let icmp_error_handler = IcmpErrorHandler::new(flow_table_clone.clone());
+        let flow_lookup = FlowLookup::new("flow-lookup", flow_table_clone.clone());
         let portfw = PortForwarder::new(
             "port-forwarder",
             portfw_factory.handle(),
-            flow_table.clone(),
+            flow_table_clone.clone(),
         );
+        let pkt_stats_nf = PacketStatsNF::new(pkt_stats.clone());
 
         // Build the pipeline for a router. The composition of the pipeline (in stages) is currently
         // hard-coded. Flow expiration is handled by per-flow tokio timers; no ExpirationsNF needed.
@@ -115,21 +125,23 @@ pub(crate) fn start_router<Buf: PacketBufferMut>(
             .set_data(pdata_clone)
             .add_stage(stage_ingress)
             .add_stage(iprouter1)
+            .add_stage(icmp_error_handler)
             .add_stage(flow_lookup)
             .add_stage(flow_filter)
-            .add_stage(icmp_error_handler)
             .add_stage(portfw)
             .add_stage(stateless_nat)
             .add_stage(stateful_nat)
             .add_stage(iprouter2)
             .add_stage(stage_egress)
             .add_stage(pktdump)
+            .add_stage(pkt_stats_nf)
             .add_stage(stats_stage)
     };
 
     Ok(InternalSetup {
         router,
         pipeline: Arc::new(pipeline_builder),
+        flow_table,
         vpcmapw,
         nattablesw,
         natallocatorw,

@@ -131,8 +131,10 @@ fn fmt_nhop_resolvers(f: &mut std::fmt::Formatter<'_>, rc: &Nhop, depth: u8) -> 
     let indent = " ".repeat(tab);
     if !resolvers.is_empty() {
         for r in resolvers.iter() {
-            write!(f, "\n{indent} {}", r.key)?;
-            fmt_nhop_resolvers(f, r, depth + 1)?;
+            if let Some(r) = r.upgrade().as_ref() {
+                write!(f, "\n{indent} {}", r.key)?;
+                fmt_nhop_resolvers(f, r, depth + 1)?;
+            }
         }
     }
     Ok(())
@@ -175,7 +177,9 @@ fn fmt_nhop_rec(f: &mut std::fmt::Formatter<'_>, rc: &Rc<Nhop>, depth: u8) -> st
         return Ok(());
     };
     for r in resolvers.iter() {
-        fmt_nhop_rec(f, r, depth + 1)?;
+        if let Some(r) = r.upgrade().as_ref() {
+            fmt_nhop_rec(f, r, depth + 1)?;
+        }
     }
     //    if let Ok(fg) = rc.as_ref().fibgroup.read() {
     //        writeln!(f, "FibG {}", fg)?;
@@ -244,7 +248,7 @@ impl Display for Route {
     }
 }
 
-fn fmt_vrf_trie<P: IpPrefix, F: Fn(&(&P, &Route)) -> bool>(
+fn fmt_vrf_trie<P: IpPrefix, F: Fn(&(P, &Route)) -> bool>(
     f: &mut std::fmt::Formatter<'_>,
     show_string: &str,
     trie: &PrefixMapTrie<P, Route>,
@@ -292,12 +296,12 @@ impl Display for Vrf {
 
 pub struct VrfViewV4<'a, F>
 where
-    F: Fn(&(&Ipv4Prefix, &Route)) -> bool,
+    F: Fn(&(Ipv4Prefix, &Route)) -> bool,
 {
     pub vrf: &'a Vrf,
     pub filter: &'a F,
 }
-impl<F: for<'a> Fn(&'a (&Ipv4Prefix, &Route)) -> bool> Display for VrfViewV4<'_, F> {
+impl<F: for<'a> Fn(&'a (Ipv4Prefix, &Route)) -> bool> Display for VrfViewV4<'_, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // apply the filter
         let rt_iter = self.vrf.iter_v4().filter(&self.filter);
@@ -327,12 +331,12 @@ impl<F: for<'a> Fn(&'a (&Ipv4Prefix, &Route)) -> bool> Display for VrfViewV4<'_,
 
 pub struct VrfViewV6<'a, F>
 where
-    F: Fn(&(&Ipv6Prefix, &Route)) -> bool,
+    F: Fn(&(Ipv6Prefix, &Route)) -> bool,
 {
     pub vrf: &'a Vrf,
     pub filter: &'a F,
 }
-impl<F: for<'a> Fn(&'a (&Ipv6Prefix, &Route)) -> bool> Display for VrfViewV6<'_, F> {
+impl<F: for<'a> Fn(&'a (Ipv6Prefix, &Route)) -> bool> Display for VrfViewV6<'_, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // apply the filter
         let rt_iter = self.vrf.iter_v6().filter(&self.filter);
@@ -368,10 +372,11 @@ impl Display for VrfV4Nexthops<'_> {
         Heading("Ipv4 Next-hops").fmt(f)?;
         fmt_vrf_oneline(self.0, f)?;
 
-        let iter =
-            self.0.nhstore.iter().filter(|nh| {
-                nh.key.address.is_some_and(|a| a.is_ipv4()) || nh.key.address.is_none()
-            });
+        let iter = self
+            .0
+            .nhstore
+            .iter()
+            .filter(|nh| nh.key.address.is_none_or(|a| a.is_ipv4()));
 
         for nhop in iter {
             fmt_nhop_rec(f, nhop, 0)?;
@@ -385,10 +390,11 @@ impl Display for VrfV6Nexthops<'_> {
         Heading("Ipv6 Next-hops").fmt(f)?;
         fmt_vrf_oneline(self.0, f)?;
 
-        let iter =
-            self.0.nhstore.iter().filter(|nh| {
-                nh.key.address.is_some_and(|a| a.is_ipv6()) || nh.key.address.is_none()
-            });
+        let iter = self
+            .0
+            .nhstore
+            .iter()
+            .filter(|nh| nh.key.address.is_none_or(|a| a.is_ipv6()));
 
         for nhop in iter {
             fmt_nhop_rec(f, nhop, 0)?;
@@ -726,7 +732,7 @@ impl Display for FibRoute {
     }
 }
 
-fn fmt_fib_trie<P: IpPrefix, F: Fn(&(&P, &FibRoute)) -> bool>(
+fn fmt_fib_trie<P: IpPrefix, F: Fn(&(P, &FibRoute)) -> bool>(
     f: &mut std::fmt::Formatter<'_>,
     fibid: FibKey,
     show_string: &str,
@@ -754,12 +760,12 @@ impl Display for Fib {
 
 pub struct FibViewV4<'a, F>
 where
-    F: Fn(&(&Ipv4Prefix, &FibRoute)) -> bool,
+    F: Fn(&(Ipv4Prefix, &FibRoute)) -> bool,
 {
     pub vrf: &'a Vrf,
     pub filter: &'a F,
 }
-impl<F: for<'a> Fn(&'a (&Ipv4Prefix, &FibRoute)) -> bool> Display for FibViewV4<'_, F> {
+impl<F: for<'a> Fn(&'a (Ipv4Prefix, &FibRoute)) -> bool> Display for FibViewV4<'_, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Some(fibw) = &self.vrf.fibw else {
             return writeln!(f, "No fib");
@@ -792,12 +798,12 @@ impl<F: for<'a> Fn(&'a (&Ipv4Prefix, &FibRoute)) -> bool> Display for FibViewV4<
 
 pub struct FibViewV6<'a, F>
 where
-    F: Fn(&(&Ipv6Prefix, &FibRoute)) -> bool,
+    F: Fn(&(Ipv6Prefix, &FibRoute)) -> bool,
 {
     pub vrf: &'a Vrf,
     pub filter: &'a F,
 }
-impl<F: for<'a> Fn(&'a (&Ipv6Prefix, &FibRoute)) -> bool> Display for FibViewV6<'_, F> {
+impl<F: for<'a> Fn(&'a (Ipv6Prefix, &FibRoute)) -> bool> Display for FibViewV6<'_, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Some(fibw) = &self.vrf.fibw else {
             return writeln!(f, "No fib");

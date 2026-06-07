@@ -8,20 +8,16 @@ use concurrency::concurrency_mode;
 // This module does not contain tests, but helpers to build the context (VpcTable, allocator) used
 // by tests in other modules. These helpers are not to be used outside of tests.
 mod context {
-    use crate::stateful::allocator::AllocationResult;
     use crate::stateful::allocator_writer::StatefulNatConfig;
     use crate::stateful::apalloc::alloc::IpAllocator;
-    use crate::stateful::apalloc::port_alloc::AllocatedPort;
-    use crate::stateful::apalloc::{NatDefaultAllocator, NatIpWithBitmap, PoolTable, PoolTableKey};
-    use config::ConfigError;
-    use config::external::overlay::vpc::{Peering, Vpc, VpcTable};
+    use crate::stateful::apalloc::{NatAllocator, PoolTable, PoolTableKey};
+    use config::external::overlay::vpc::{Peering, ValidatedVpcTable, Vpc, VpcTable};
     use config::external::overlay::vpcpeering::{VpcExpose, VpcManifest};
     use net::ip::NextHeader;
     use net::packet::VpcDiscriminant;
-    use net::tcp::TcpPort;
     use net::udp::UdpPort;
     use net::vxlan::Vni;
-    use net::{IpProtoKey, TcpProtoKey, UdpProtoKey};
+    use net::{IpProtoKey, UdpProtoKey};
     use std::net::{IpAddr, Ipv4Addr};
     use std::str::FromStr;
 
@@ -51,33 +47,12 @@ mod context {
         VpcDiscriminant::from_vni(vni2())
     }
 
-    pub fn tcp_proto_key(src_port: u16, dst_port: u16) -> IpProtoKey {
-        IpProtoKey::Tcp(TcpProtoKey {
-            src_port: TcpPort::new_checked(src_port).unwrap(),
-            dst_port: TcpPort::new_checked(dst_port).unwrap(),
-        })
-    }
     #[allow(unused)]
     pub fn udp_proto_key(src_port: u16, dst_port: u16) -> IpProtoKey {
         IpProtoKey::Udp(UdpProtoKey {
             src_port: UdpPort::new_checked(src_port).unwrap(),
             dst_port: UdpPort::new_checked(dst_port).unwrap(),
         })
-    }
-
-    #[allow(unused)]
-    pub fn print_allocation<I: NatIpWithBitmap>(allocation: &AllocationResult<AllocatedPort<I>>) {
-        let format_ip_port = |ip_port: &Option<AllocatedPort<I>>| {
-            if let Some(ip_port) = ip_port {
-                format!("{:?}:{:?}", ip_port.ip(), ip_port.port().as_u16())
-            } else {
-                "<none>".to_string()
-            }
-        };
-        println!("src: {}", format_ip_port(&allocation.src));
-        println!("dst: {}", format_ip_port(&allocation.dst));
-        println!("return_src: {}", format_ip_port(&allocation.return_src));
-        println!("return_dst: {}", format_ip_port(&allocation.return_dst));
     }
 
     pub fn get_ip_allocator_v4(
@@ -95,50 +70,27 @@ mod context {
         .unwrap()
     }
 
-    fn build_context() -> VpcTable {
+    fn build_context() -> ValidatedVpcTable {
         // Exposes and manifests
         let expose1 = VpcExpose::empty()
             .make_stateful_nat(None)
             .unwrap()
             .ip("1.1.0.0/16".into())
-            .ip("1.2.0.0/16".into())
-            .ip("1.3.0.0/16".into())
+            .ip("1.2.0.0/15".into())
             .as_range("10.1.0.0/30".into())
             .unwrap()
             .not_as("10.1.0.3/32".into())
             .unwrap();
-        let expose2 = VpcExpose::empty()
-            .make_stateful_nat(None)
-            .unwrap()
-            .ip("2.0.0.0/16".into())
-            .as_range("10.2.0.0/29".into())
-            .unwrap();
+        let expose2 = VpcExpose::empty().ip("2.0.0.0/16".into());
 
-        let manifest1 = VpcManifest {
-            name: "VPC-1".into(),
-            exposes: vec![expose1, expose2],
-        };
+        let manifest1 = VpcManifest::with_exposes("VPC-1", vec![expose1, expose2]);
 
         let expose3 = VpcExpose::empty()
-            .make_stateful_nat(None)
-            .unwrap()
             .ip("3.0.0.0/24".into())
-            .ip("3.0.1.0/24".into())
-            .as_range("10.3.0.0/30".into())
-            .unwrap();
-        let expose4 = VpcExpose::empty()
-            .make_stateful_nat(None)
-            .unwrap()
-            .ip("4.0.0.0/16".into())
-            .as_range("10.4.0.0/31".into())
-            .unwrap()
-            .as_range("10.4.1.0/30".into())
-            .unwrap();
+            .ip("3.0.2.0/24".into());
+        let expose4 = VpcExpose::empty().ip("4.0.0.0/16".into());
 
-        let manifest2 = VpcManifest {
-            name: "VPC-2".into(),
-            exposes: vec![expose3, expose4],
-        };
+        let manifest2 = VpcManifest::with_exposes("VPC-2", vec![expose3, expose4]);
 
         // Peerings
         let peering1 = Peering {
@@ -169,29 +121,77 @@ mod context {
         vpctable.add(vpc1).unwrap();
         vpctable.add(vpc2).unwrap();
 
-        vpctable
+        vpctable.validate().unwrap()
     }
 
-    pub fn build_allocator() -> Result<NatDefaultAllocator, ConfigError> {
+    pub fn build_allocator() -> NatAllocator {
         let vpc_table = build_context();
-        let config = StatefulNatConfig::new(&vpc_table);
-        NatDefaultAllocator::build_nat_allocator(&config)
+        let config = StatefulNatConfig::new(&vpc_table, 1);
+        NatAllocator::new(config)
+    }
+}
+
+mod tests {
+    use super::context::*;
+    use concurrency::sync::Arc;
+    use concurrency::thread;
+    use net::ip::NextHeader;
+
+    #[allow(dead_code)]
+    pub(super) fn concurrent_allocations() {
+        let allocator = build_allocator();
+        let allocator_arc = Arc::new(allocator);
+        let allocator1 = allocator_arc.clone();
+        let allocator2 = allocator_arc.clone();
+        let allocator3 = allocator_arc.clone();
+
+        let mut handles = vec![];
+
+        handles.push(thread::spawn(move || {
+            let _allocation1 = allocator1
+                .allocate_v4(vpcd2(), addr_v4("1.1.0.0"), NextHeader::TCP)
+                .unwrap();
+        }));
+        handles.push(thread::spawn(move || {
+            let _allocation2 = allocator2
+                .allocate_v4(vpcd2(), addr_v4("1.1.0.0"), NextHeader::TCP)
+                .unwrap();
+        }));
+        handles.push(thread::spawn(move || {
+            let _allocation3 = allocator3
+                .allocate_v4(vpcd2(), addr_v4("1.1.0.0"), NextHeader::TCP)
+                .unwrap();
+        }));
+
+        let _results: Vec<()> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        // All allocations got out of scope and dropped when the threads terminated.
+
+        let mut allocator_again = Arc::try_unwrap(allocator_arc).unwrap();
+        let (bitmap, in_use) = get_ip_allocator_v4(
+            &mut allocator_again.pools_src44,
+            vpcd2(),
+            NextHeader::TCP,
+            addr_v4("1.1.0.0"),
+        )
+        .get_pool_clone_for_tests();
+        assert_eq!(bitmap.len(), 3); // 3 IP addresses available to NAT 1.1.0.0
+        assert!(in_use.front().unwrap().upgrade().is_none()); // Weak references in list no longer resolve
     }
 }
 
 #[concurrency_mode(std)]
 mod std_tests {
     use super::context::*;
-    use crate::stateful::allocator::NatAllocator;
     use crate::stateful::apalloc::PoolTableKey;
-    use concurrency::sync::Arc;
-    use concurrency::thread;
-    use net::FlowKey;
     use net::ip::NextHeader;
 
     #[test]
     fn test_build_allocator() {
-        let allocator = build_allocator().unwrap();
+        let allocator = build_allocator();
 
         /*
         println!("{allocator:?}");
@@ -219,7 +219,7 @@ mod std_tests {
                 .keys()
                 .filter(|k| k.protocol == NextHeader::TCP)
                 .count(),
-            7
+            2
         );
         assert_eq!(
             allocator
@@ -228,39 +228,10 @@ mod std_tests {
                 .keys()
                 .filter(|k| k.protocol == NextHeader::UDP)
                 .count(),
-            7
-        );
-
-        assert!(
-            allocator
-                .pools_dst44
-                .0
-                .keys()
-                .all(|k| k.dst_id == vpcd2() || k.dst_id == vpcd1())
-        );
-        // One entry for each ".as_range()" from the VPCExpose objects,
-        // after exclusion ranges have been applied
-        assert_eq!(
-            allocator
-                .pools_dst44
-                .0
-                .keys()
-                .filter(|k| k.protocol == NextHeader::TCP)
-                .count(),
-            6
-        );
-        assert_eq!(
-            allocator
-                .pools_dst44
-                .0
-                .keys()
-                .filter(|k| k.protocol == NextHeader::UDP)
-                .count(),
-            6
+            2
         );
 
         assert_eq!(allocator.pools_src66.0.len(), 0);
-        assert_eq!(allocator.pools_dst66.0.len(), 0);
 
         let ip_allocator = allocator
             .pools_src44
@@ -276,21 +247,6 @@ mod std_tests {
         assert!(bitmap.contains_range(addr_v4_bits("10.1.0.0")..=addr_v4_bits("10.1.0.2")));
         assert_eq!(bitmap.len(), 3);
         assert_eq!(in_use.len(), 0);
-
-        let ip_allocator = allocator
-            .pools_dst44
-            .get(&PoolTableKey::new(
-                NextHeader::TCP,
-                vpcd2(),
-                addr_v4("10.3.0.0"),
-                addr_v4("255.255.255.255"),
-            ))
-            .unwrap();
-        let (bitmap, in_use) = ip_allocator.get_pool_clone_for_tests();
-
-        assert!(bitmap.contains_range(addr_v4_bits("3.0.0.0")..=addr_v4_bits("3.0.1.255")));
-        assert_eq!(bitmap.len(), 512);
-        assert_eq!(in_use.len(), 0);
     }
 
     // Allocate IP addresses and ports for running NAT on a tuple from a simple packet. Ensure that
@@ -298,15 +254,7 @@ mod std_tests {
     // objects are dropped.
     #[test]
     fn test_allocate() {
-        let tuple = FlowKey::uni(
-            Some(vpcd1()),
-            ipaddr("1.1.0.0"),
-            ipaddr("10.3.0.2"),
-            tcp_proto_key(1234, 5678),
-        )
-        .extend_with_dst_vpcd(vpcd2());
-
-        let mut allocator = build_allocator().unwrap();
+        let mut allocator = build_allocator();
         let (bitmap, in_use) = get_ip_allocator_v4(
             &mut allocator.pools_src44,
             vpcd2(),
@@ -317,32 +265,12 @@ mod std_tests {
         assert_eq!(bitmap.len(), 3); // 3 IP addresses available to NAT 1.1.0.0
         assert_eq!(in_use.len(), 0); // None allocated yet
 
-        let allocation = allocator.allocate_v4(&tuple).unwrap();
-        print_allocation(&allocation);
+        let alloc_result = allocator
+            .allocate_v4(vpcd2(), addr_v4("1.1.0.0"), NextHeader::TCP)
+            .unwrap();
+        println!("{alloc_result}");
 
-        assert!(allocation.src.is_some());
-        assert!(allocation.dst.is_some());
-        assert!(allocation.return_src.is_some());
-        assert!(allocation.return_dst.is_some());
-
-        assert_eq!(allocation.src.as_ref().unwrap().ip(), addr_v4("10.1.0.0"));
-        assert_eq!(allocation.dst.as_ref().unwrap().ip(), addr_v4("3.0.0.0"));
-        assert_eq!(
-            allocation.return_src.as_ref().unwrap().ip(),
-            addr_v4("10.3.0.2")
-        );
-        assert_eq!(
-            allocation.return_src.as_ref().unwrap().port().as_u16(),
-            5678
-        );
-        assert_eq!(
-            allocation.return_dst.as_ref().unwrap().ip(),
-            addr_v4("1.1.0.0")
-        );
-        assert_eq!(
-            allocation.return_dst.as_ref().unwrap().port().as_u16(),
-            1234
-        );
+        assert_eq!(alloc_result.allocation.ip(), addr_v4("10.1.0.0"));
 
         let (bitmap, in_use) = get_ip_allocator_v4(
             &mut allocator.pools_src44,
@@ -354,7 +282,7 @@ mod std_tests {
         assert_eq!(bitmap.len(), 2); // 2 free IP addresses left to NAT 1.1.0.0
         assert_eq!(in_use.len(), 1); // 1 allocated, in use
 
-        drop(allocation);
+        drop(alloc_result);
         println!("Dropped allocation");
 
         let (bitmap, in_use) = get_ip_allocator_v4(
@@ -369,25 +297,10 @@ mod std_tests {
         assert!(in_use.front().unwrap().upgrade().is_none()); // But it no longer resolves
     }
 
-    #[test]
     // Allocate an IP for a TCP packet, then for a UDP packet.
+    #[test]
     fn test_tcp_udp() {
-        let tcp_flow_key = FlowKey::uni(
-            Some(vpcd1()),
-            ipaddr("1.1.0.0"),
-            ipaddr("10.3.0.2"),
-            tcp_proto_key(1234, 5678),
-        )
-        .extend_with_dst_vpcd(vpcd2());
-        let udp_flow_key = FlowKey::uni(
-            Some(vpcd1()),
-            ipaddr("1.1.0.0"),
-            ipaddr("10.3.0.2"),
-            udp_proto_key(1234, 5678),
-        )
-        .extend_with_dst_vpcd(vpcd2());
-
-        let mut allocator = build_allocator().unwrap();
+        let mut allocator = build_allocator();
         let (bitmap, in_use) = get_ip_allocator_v4(
             &mut allocator.pools_src44,
             vpcd2(),
@@ -409,8 +322,10 @@ mod std_tests {
         assert_eq!(in_use.len(), 0); // None allocated yet
 
         // Allocate for TCP
-        let tcp_allocation = allocator.allocate_v4(&tcp_flow_key).unwrap();
-        print_allocation(&tcp_allocation);
+        let tcp_allocation = allocator
+            .allocate_v4(vpcd2(), addr_v4("1.1.0.0"), NextHeader::TCP)
+            .unwrap();
+        println!("{tcp_allocation}");
 
         // Check number of allocated IPs for TCP after we have allocated for TCP
         let (bitmap, in_use) = get_ip_allocator_v4(
@@ -435,8 +350,10 @@ mod std_tests {
         assert_eq!(in_use.len(), 0); // None allocated yet
 
         // Allocate for UDP
-        let udp_allocation = allocator.allocate_v4(&udp_flow_key).unwrap();
-        print_allocation(&udp_allocation);
+        let udp_allocation = allocator
+            .allocate_v4(vpcd2(), addr_v4("1.1.0.0"), NextHeader::UDP)
+            .unwrap();
+        println!("{udp_allocation}");
 
         // Check number of allocated IPs for TCP after we have allocated for UDP
         let (bitmap, in_use) = get_ip_allocator_v4(
@@ -460,178 +377,55 @@ mod std_tests {
         assert_eq!(bitmap.len(), 2); // 2 free IP addresses left to NAT 1.1.0.0 (UDP)
         assert_eq!(in_use.len(), 1); // 1 allocated, in use
     }
+}
 
-    // This test is NOT a shuttle test. It validates that a basic example with threads works
-    // with or without shuttle components (depending on how we compile), as a control test in
-    // case shuttle tests do not work. For example, it helped understand that memory usage for
-    // Atomics is different in shuttle than in std, and that just testing simple allocations as
-    // we do here was not broken - we just needed to increase stack memory for shuttle's runner.
-    #[test]
-    fn test_concurrent_allocations_without_shuttle() {
-        let flow_key1 = FlowKey::uni(
-            Some(vpcd1()),
-            ipaddr("1.1.0.0"),
-            ipaddr("10.3.0.2"),
-            tcp_proto_key(1111, 1112),
-        )
-        .extend_with_dst_vpcd(vpcd2());
-        let flow_key2 = FlowKey::uni(
-            Some(vpcd1()),
-            ipaddr("2.0.1.3"),
-            ipaddr("10.4.1.1"),
-            tcp_proto_key(2222, 2223),
-        )
-        .extend_with_dst_vpcd(vpcd2());
+// Loom's Weak shim keeps allocator liveness entries alive forever.
+#[cfg(not(feature = "loom"))]
+mod concurrency_tests {
+    use super::context::*;
+    use super::tests;
+    use concurrency::sync::Arc;
+    use concurrency::thread;
+    use net::ip::NextHeader;
 
-        let allocator = build_allocator().unwrap();
+    #[concurrency::test]
+    fn test_concurrent_allocations_two_ips() {
+        let allocator = build_allocator();
         let allocator1 = Arc::new(allocator);
         let allocator2 = allocator1.clone();
 
-        thread::spawn(move || {
-            let _allocation1 = allocator1.allocate_v4(&flow_key1).unwrap();
+        let t1 = thread::spawn(move || {
+            let _allocation1 = allocator1
+                .allocate_v4(vpcd2(), addr_v4("1.1.0.0"), NextHeader::TCP)
+                .unwrap();
         });
-        thread::spawn(move || {
-            let _allocation2 = allocator2.allocate_v4(&flow_key2).unwrap();
+        let t2 = thread::spawn(move || {
+            let _allocation2 = allocator2
+                .allocate_v4(vpcd2(), addr_v4("1.2.0.0"), NextHeader::TCP)
+                .unwrap();
         });
+        t1.join().unwrap();
+        t2.join().unwrap();
     }
-}
 
-#[concurrency_mode(shuttle)]
-mod tests_shuttle {
-    use super::context::*;
-    use crate::stateful::allocator::NatAllocator;
-    use net::FlowKey;
-    use net::ip::NextHeader;
-    use shuttle::sync::{Arc, Mutex};
-    use shuttle::thread;
+    #[concurrency::test]
+    fn test_concurrent_allocations_three_workers() {
+        tests::concurrent_allocations();
+    }
 
+    // One-shot std execution is nondeterministic; model checkers make the race reachable.
+    #[cfg(any(feature = "loom", feature = "shuttle"))]
+    #[concurrency::test]
     #[should_panic(expected = "assertion `left == right` failed")]
-    #[test]
     fn test_ensure_shuttle_works() {
-        shuttle::check_random(
-            || {
-                let lock = Arc::new(Mutex::new(0u64));
-                let lock2 = lock.clone();
+        use concurrency::sync::Mutex;
+        let lock = Arc::new(Mutex::new(0u64));
+        let lock2 = lock.clone();
 
-                thread::spawn(move || {
-                    *lock.lock().unwrap() = 1;
-                });
-
-                assert_eq!(0, *lock2.lock().unwrap());
-            },
-            100,
-        );
-    }
-
-    fn run_shuttle<F>(f: F)
-    where
-        F: Fn() + Sync + Send + 'static,
-    {
-        let mut config = shuttle::Config::new();
-        // Raise the stack size to avoid stack overflow in the coroutine. The default is 32 kB, but
-        // the allocator uses Atomics for all port blocks for each allocated IP address, and in
-        // shuttle an AtomicBool takes over 100 bytes in memory, for example.
-        //
-        // Raise to 1 MB stack.
-        config.stack_size = 1024 * 1024;
-        // One hundred iterations
-        let runner = shuttle::Runner::new(shuttle::scheduler::RandomScheduler::new(100), config);
-        runner.run(f);
-    }
-
-    // Run concurrent allocations for four different tuples (some of them sharing the same source
-    // and destination IP addresses) using shuttle's random scheduler, see if anything breaks.
-    #[test]
-    fn test_concurrent_allocations() {
-        run_shuttle(|| {
-            let flow_key1 = FlowKey::uni(
-                Some(vpcd1()),
-                ipaddr("1.1.0.0"),
-                ipaddr("10.3.0.2"),
-                tcp_proto_key(1111, 1112),
-            )
-            .extend_with_dst_vpcd(vpcd2());
-            let flow_key2 = FlowKey::uni(
-                Some(vpcd1()),
-                ipaddr("2.0.1.3"),
-                ipaddr("10.4.1.1"),
-                tcp_proto_key(2222, 2223),
-            )
-            .extend_with_dst_vpcd(vpcd2());
-            let flow_key3 = FlowKey::uni(
-                Some(vpcd1()),
-                ipaddr("1.1.0.0"),
-                ipaddr("10.3.0.2"),
-                tcp_proto_key(3333, 3334),
-            )
-            .extend_with_dst_vpcd(vpcd2());
-            let flow_key4 = FlowKey::uni(
-                Some(vpcd1()),
-                ipaddr("1.1.0.0"),
-                ipaddr("10.3.0.3"),
-                tcp_proto_key(4444, 4445),
-            )
-            .extend_with_dst_vpcd(vpcd2());
-
-            let allocator = build_allocator().unwrap();
-            let allocator_arc = Arc::new(allocator);
-            let allocator1 = allocator_arc.clone();
-            let allocator2 = allocator_arc.clone();
-            let allocator3 = allocator_arc.clone();
-            let allocator4 = allocator_arc.clone();
-
-            let mut handles = vec![];
-
-            handles.push(thread::spawn(move || {
-                let allocation1 = allocator1.allocate_v4(&flow_key1);
-                let res = allocation1.unwrap();
-                assert!(res.src.is_some());
-                assert!(res.dst.is_some());
-                assert!(res.return_src.is_some());
-                assert!(res.return_dst.is_some());
-            }));
-            handles.push(thread::spawn(move || {
-                let allocation2 = allocator2.allocate_v4(&flow_key2);
-                let res = allocation2.unwrap();
-                assert!(res.src.is_some());
-                assert!(res.dst.is_some());
-                assert!(res.return_src.is_some());
-                assert!(res.return_dst.is_some());
-            }));
-            handles.push(thread::spawn(move || {
-                let allocation3 = allocator3.allocate_v4(&flow_key3);
-                let res = allocation3.unwrap();
-                assert!(res.src.is_some());
-                assert!(res.dst.is_some());
-                assert!(res.return_src.is_some());
-                assert!(res.return_dst.is_some());
-            }));
-            handles.push(thread::spawn(move || {
-                let allocation4 = allocator4.allocate_v4(&flow_key4);
-                let res = allocation4.unwrap();
-                assert!(res.src.is_some());
-                assert!(res.dst.is_some());
-                assert!(res.return_src.is_some());
-                assert!(res.return_dst.is_some());
-            }));
-
-            let _results: Vec<()> = handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect();
-
-            // All allocations got out of scope and dropped when the threads terminated.
-
-            let mut allocator_again = Arc::try_unwrap(allocator_arc).unwrap();
-            let (bitmap, in_use) = get_ip_allocator_v4(
-                &mut allocator_again.pools_src44,
-                vpcd2(),
-                NextHeader::TCP,
-                addr_v4("1.1.0.0"),
-            )
-            .get_pool_clone_for_tests();
-            assert_eq!(bitmap.len(), 3); // 3 IP addresses available to NAT 1.1.0.0
-            assert!(in_use.front().unwrap().upgrade().is_none()); // Weak references in list no longer resolve
+        thread::spawn(move || {
+            *lock.lock() = 1;
         });
+
+        assert_eq!(0, *lock2.lock());
     }
 }

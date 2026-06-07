@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Open Network Fabric Authors
 
-//! Testing utilities for the dataplane
+//! Testing utilities for the dataplane.
+//!
+//! The fixtures in this module use [`std::panic::catch_unwind`] to run
+//! cleanup (e.g. removing the network namespace, dropping raised
+//! capabilities) when a test panics, so they require `panic = "unwind"`.
+//! Plain `cargo test` keeps the cargo default of unwind, and the nix
+//! test archive build forces unwind via `for-tests` in `nix/profiles.nix`.
 
 use caps::{CapSet, Capability};
 use rtnetlink::NetworkNamespace;

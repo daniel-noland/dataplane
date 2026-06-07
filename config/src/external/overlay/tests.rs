@@ -110,7 +110,7 @@ pub mod test {
         );
 
         let expose = VpcExpose::empty().ip("10.0.0.0/16".into());
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
 
         // Empty ips but non-empty nots - Currently not supported
         /*
@@ -130,7 +130,7 @@ pub mod test {
             .ip("10.0.0.0/16".into())
             .as_range("2.0.0.0/16".into())
             .unwrap();
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
 
         let expose = VpcExpose::empty()
             .make_stateless_nat()
@@ -141,7 +141,7 @@ pub mod test {
             .unwrap()
             .not_as("2.0.0.0/24".into())
             .unwrap();
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
 
         let expose = VpcExpose::empty()
             .make_stateless_nat()
@@ -149,7 +149,19 @@ pub mod test {
             .ip("1::/64".into())
             .as_range("2::/64".into())
             .unwrap();
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
+
+        // Overlapping prefixes
+        let expose = VpcExpose::empty()
+            .make_stateless_nat()
+            .unwrap()
+            .ip("10.0.0.0/16".into())
+            .ip("10.0.0.0/17".into())
+            .as_range("2.0.0.0/17".into())
+            .unwrap()
+            .as_range("2.0.0.0/16".into())
+            .unwrap();
+        assert!(expose.validate().is_ok());
 
         // Out-of-range exclusion prefix
         let expose = VpcExpose::empty()
@@ -161,7 +173,7 @@ pub mod test {
             .unwrap()
             .not_as("2.0.1.0/24".into())
             .unwrap();
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
 
         // Incorrect: mixed IP versions
         let expose = VpcExpose::empty()
@@ -203,24 +215,6 @@ pub mod test {
         assert_eq!(
             expose.validate(),
             Err(ConfigError::InconsistentIpVersion(Box::new(expose.clone())))
-        );
-
-        // Incorrect: prefix overlapping
-        let expose = VpcExpose::empty()
-            .make_stateless_nat()
-            .unwrap()
-            .ip("10.0.0.0/16".into())
-            .ip("10.0.0.0/17".into())
-            .as_range("2.0.0.0/16".into())
-            .unwrap()
-            .as_range("3.0.0.0/17".into())
-            .unwrap();
-        assert_eq!(
-            expose.validate(),
-            Err(ConfigError::OverlappingPrefixes(
-                "10.0.0.0/16".into(),
-                "10.0.0.0/17".into(),
-            ))
         );
 
         // Incorrect: all prefixes excluded
@@ -297,7 +291,7 @@ pub mod test {
         let mut manifest = VpcManifest::new("VPC-1");
         manifest.add_expose(expose1);
         manifest.add_expose(expose2);
-        assert_eq!(manifest.validate(), Ok(()));
+        assert!(manifest.clone().validate().is_ok());
 
         // Overlap between a manifest's exposes prefixes is not allowed
         let mut invalid_manifest = manifest.clone();
@@ -348,9 +342,9 @@ pub mod test {
         // Build peering with stateful NAT on both sides
         let peering = VpcPeering::with_default_group(
             "Peering-1",
-            VpcManifest {
-                name: "VPC-1".to_owned(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "VPC-1",
+                vec![
                     VpcExpose::empty()
                         .make_stateful_nat(None)
                         .unwrap()
@@ -358,10 +352,10 @@ pub mod test {
                         .as_range("2.0.0.0/8".into())
                         .unwrap(),
                 ],
-            },
-            VpcManifest {
-                name: "VPC-2".to_owned(),
-                exposes: vec![
+            ),
+            VpcManifest::with_exposes(
+                "VPC-2",
+                vec![
                     VpcExpose::empty()
                         .make_stateful_nat(None)
                         .unwrap()
@@ -369,7 +363,7 @@ pub mod test {
                         .as_range("4.0.0.0/8".into())
                         .unwrap(),
                 ],
-            },
+            ),
         );
 
         // Build VPC pering table and add peering
@@ -377,9 +371,9 @@ pub mod test {
         peering_table.add(peering).unwrap();
 
         // Build overlay object and validate it
-        let mut overlay = Overlay::new(vpc_table, peering_table);
+        let overlay = Overlay::new(vpc_table, peering_table);
         assert_eq!(
-            overlay.validate(),
+            overlay.validate().map(|_| ()),
             Err(ConfigError::IncompatibleNatModes("Peering-1".to_owned()))
         );
     }
@@ -396,9 +390,9 @@ pub mod test {
         // Build peering with stateful NAT on one side and stateless NAT on the other side
         let peering = VpcPeering::with_default_group(
             "Peering-1",
-            VpcManifest {
-                name: "VPC-1".to_owned(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "VPC-1",
+                vec![
                     VpcExpose::empty()
                         .make_stateful_nat(None)
                         .unwrap()
@@ -406,10 +400,10 @@ pub mod test {
                         .as_range("2.0.0.0/8".into())
                         .unwrap(),
                 ],
-            },
-            VpcManifest {
-                name: "VPC-2".to_owned(),
-                exposes: vec![
+            ),
+            VpcManifest::with_exposes(
+                "VPC-2",
+                vec![
                     VpcExpose::empty()
                         .make_stateless_nat()
                         .unwrap()
@@ -417,7 +411,7 @@ pub mod test {
                         .as_range("4.0.0.0/8".into())
                         .unwrap(),
                 ],
-            },
+            ),
         );
 
         // Build VPC pering table and add peering
@@ -425,10 +419,11 @@ pub mod test {
         peering_table.add(peering).unwrap();
 
         // Build overlay object and validate it
-        let mut overlay = Overlay::new(vpc_table, peering_table);
-        assert_eq!(
-            overlay.validate(),
-            Err(ConfigError::IncompatibleNatModes("Peering-1".to_owned()))
+        let overlay = Overlay::new(vpc_table, peering_table);
+        assert!(
+            overlay
+                .validate()
+                .is_err_and(|e| e == ConfigError::IncompatibleNatModes("Peering-1".to_owned()))
         );
     }
 
@@ -449,10 +444,11 @@ pub mod test {
         peering_table.add(peering).expect("Should succeed");
 
         /* build overlay object and validate it */
-        let mut overlay = Overlay::new(vpc_table, peering_table);
-        assert_eq!(
-            overlay.validate(),
-            Err(ConfigError::NoSuchVpc("VPC-2".to_owned()))
+        let overlay = Overlay::new(vpc_table, peering_table);
+        assert!(
+            overlay
+                .validate()
+                .is_err_and(|e| e == ConfigError::NoSuchVpc("VPC-2".to_owned()))
         );
     }
 
@@ -474,8 +470,8 @@ pub mod test {
 
         let name1 = peering1.name.clone();
 
-        assert_eq!(peering1.validate(), Ok(()));
-        assert_eq!(peering2.validate(), Ok(()));
+        assert!(peering1.clone().validate().is_ok());
+        assert!(peering2.clone().validate().is_ok());
 
         /* build peering table */
         let mut peering_table = VpcPeeringTable::new();
@@ -483,10 +479,11 @@ pub mod test {
         peering_table.add(peering2).expect("Should succeed");
 
         /* build overlay object and validate it */
-        let mut overlay = Overlay::new(vpc_table, peering_table);
-        assert_eq!(
-            overlay.validate(),
-            Err(ConfigError::DuplicateVpcPeerings(name1))
+        let overlay = Overlay::new(vpc_table, peering_table);
+        assert!(
+            overlay
+                .validate()
+                .is_err_and(|e| e == ConfigError::DuplicateVpcPeerings(name1))
         );
     }
 
@@ -511,8 +508,8 @@ pub mod test {
         println!("{peering_table}");
 
         /* build overlay object and validate it */
-        let mut overlay = Overlay::new(vpc_table, peering_table);
-        assert_eq!(overlay.validate(), Ok(()));
+        let overlay = Overlay::new(vpc_table, peering_table);
+        assert!(overlay.validate().is_ok());
     }
 
     #[test]
@@ -719,7 +716,7 @@ pub mod test {
             "10.0.0.0/16".into(),
             Some(PortRange::new(1, 65535).unwrap()),
         ));
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
 
         let expose = VpcExpose::empty()
             .make_stateless_nat()
@@ -733,7 +730,7 @@ pub mod test {
                 Some(PortRange::new(8001, 9000).unwrap()),
             ))
             .unwrap();
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
 
         let expose = VpcExpose::empty()
             .make_stateless_nat()
@@ -756,7 +753,7 @@ pub mod test {
                 Some(PortRange::new(8001, 8200).unwrap()),
             ))
             .unwrap();
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
 
         let expose = VpcExpose::empty()
             .make_stateless_nat()
@@ -770,7 +767,7 @@ pub mod test {
                 Some(PortRange::new(8001, 9000).unwrap()),
             ))
             .unwrap();
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
 
         // Overlapping prefix, but distinct port ranges
         let expose = VpcExpose::empty()
@@ -782,7 +779,31 @@ pub mod test {
                 "10.0.0.0/17".into(),
                 Some(PortRange::new(8001, 9500).unwrap()),
             ));
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
+
+        // Overlapping prefixes
+        let expose = VpcExpose::empty()
+            .make_stateless_nat()
+            .unwrap()
+            .ip(PrefixWithOptionalPorts::new(
+                "10.0.0.0/16".into(),
+                Some(PortRange::new(5001, 6000).unwrap()),
+            ))
+            .ip(PrefixWithOptionalPorts::new(
+                "10.0.0.0/17".into(),
+                Some(PortRange::new(5001, 5500).unwrap()),
+            ))
+            .as_range(PrefixWithOptionalPorts::new(
+                "2.0.0.0/16".into(),
+                Some(PortRange::new(8001, 9000).unwrap()),
+            ))
+            .unwrap()
+            .as_range(PrefixWithOptionalPorts::new(
+                "2.0.0.0/17".into(),
+                Some(PortRange::new(8001, 8500).unwrap()),
+            ))
+            .unwrap();
+        assert!(expose.validate().is_ok());
 
         // Out-of-range exclusion prefix (IPs)
         let expose = VpcExpose::empty()
@@ -798,7 +819,7 @@ pub mod test {
                 "10.0.0.0/15".into(),
                 Some(PortRange::new(5001, 5500).unwrap()),
             ));
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
 
         // Out-of-range exclusion prefix (port range)
         let expose = VpcExpose::empty()
@@ -810,7 +831,7 @@ pub mod test {
                 "10.0.0.0/24".into(),
                 Some(PortRange::new(7001, 8000).unwrap()),
             ));
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
 
         // Out-of-range exclusion prefix (port range, albeit with overlap)
         let expose = VpcExpose::empty()
@@ -822,7 +843,7 @@ pub mod test {
                 "10.0.0.0/24".into(),
                 Some(PortRange::new(5001, 8000).unwrap()),
             ));
-        assert_eq!(expose.validate(), Ok(()));
+        assert!(expose.validate().is_ok());
 
         // Incorrect: mixed IP versions
         let expose = VpcExpose::empty()
@@ -867,42 +888,6 @@ pub mod test {
         assert_eq!(
             expose.validate(),
             Err(ConfigError::InconsistentIpVersion(Box::new(expose.clone())))
-        );
-
-        // Incorrect: prefix overlapping
-        let expose = VpcExpose::empty()
-            .make_stateless_nat()
-            .unwrap()
-            .ip(PrefixWithOptionalPorts::new(
-                "10.0.0.0/16".into(),
-                Some(PortRange::new(5001, 6000).unwrap()),
-            ))
-            .ip(PrefixWithOptionalPorts::new(
-                "10.0.0.0/17".into(),
-                Some(PortRange::new(5001, 5500).unwrap()),
-            ))
-            .as_range(PrefixWithOptionalPorts::new(
-                "2.0.0.0/16".into(),
-                Some(PortRange::new(8001, 9000).unwrap()),
-            ))
-            .unwrap()
-            .as_range(PrefixWithOptionalPorts::new(
-                "3.0.0.0/17".into(),
-                Some(PortRange::new(8001, 8500).unwrap()),
-            ))
-            .unwrap();
-        assert_eq!(
-            expose.validate(),
-            Err(ConfigError::OverlappingPrefixes(
-                PrefixWithOptionalPorts::new(
-                    "10.0.0.0/16".into(),
-                    Some(PortRange::new(5001, 6000).unwrap())
-                ),
-                PrefixWithOptionalPorts::new(
-                    "10.0.0.0/17".into(),
-                    Some(PortRange::new(5001, 5500).unwrap())
-                ),
-            ))
         );
 
         // Incorrect: all prefixes excluded
@@ -1005,46 +990,45 @@ pub mod test {
         peering_table
             .add(VpcPeering::with_default_group(
                 "vpc1-to-vpc2",
-                VpcManifest {
-                    name: "vpc1".to_string(),
-                    exposes: vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
+                VpcManifest::with_exposes(
+                    "vpc1",
+                    vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                         "1.0.0.0/24".into(),
                         Some(PortRange::new(2001, 3000).unwrap()),
                     ))],
-                },
-                VpcManifest {
-                    name: "vpc2".to_string(),
-                    exposes: vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
+                ),
+                VpcManifest::with_exposes(
+                    "vpc2",
+                    vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                         "5.0.0.0/24".into(),
                         Some(PortRange::new(6001, 8000).unwrap()),
                     ))],
-                },
+                ),
             ))
             .unwrap();
         peering_table
             .add(VpcPeering::with_default_group(
                 "vpc1-to-vpc3",
-                VpcManifest {
-                    name: "vpc1".to_string(),
-                    exposes: vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
+                VpcManifest::with_exposes(
+                    "vpc1",
+                    vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                         "2.0.0.0/24".into(),
                         Some(PortRange::new(2001, 3000).unwrap()),
                     ))],
-                },
-                VpcManifest {
-                    name: "vpc3".to_string(),
-                    exposes: vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
+                ),
+                VpcManifest::with_exposes(
+                    "vpc3",
+                    vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                         "5.0.0.0/25".into(),
                         Some(PortRange::new(5001, 7000).unwrap()),
                     ))],
-                },
+                ),
             ))
             .unwrap();
 
-        let mut overlay = Overlay::new(vpc_table, peering_table);
-        assert_eq!(
-            overlay.validate(),
-            Err(ConfigError::OverlappingPrefixes(
+        let overlay = Overlay::new(vpc_table, peering_table);
+        assert!(overlay.validate().is_err_and(|e| e
+            == ConfigError::OverlappingPrefixes(
                 PrefixWithOptionalPorts::new(
                     "5.0.0.0/24".into(),
                     Some(PortRange::new(6001, 8000).unwrap())
@@ -1053,8 +1037,7 @@ pub mod test {
                     "5.0.0.0/25".into(),
                     Some(PortRange::new(5001, 7000).unwrap())
                 ),
-            )),
-        );
+            )));
     }
 
     #[test]
@@ -1074,41 +1057,38 @@ pub mod test {
         peering_table
             .add(VpcPeering::with_default_group(
                 "vpc1-to-vpc2",
-                VpcManifest {
-                    name: "vpc1".to_string(),
-                    exposes: vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
+                VpcManifest::with_exposes(
+                    "vpc1",
+                    vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                         "1.0.0.0/24".into(),
                         Some(PortRange::new(2001, 3000).unwrap()),
                     ))],
-                },
-                VpcManifest {
-                    name: "vpc2".to_string(),
-                    exposes: vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
+                ),
+                VpcManifest::with_exposes(
+                    "vpc2",
+                    vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                         "5.0.0.0/24".into(),
                         Some(PortRange::new(6001, 8000).unwrap()),
                     ))],
-                },
+                ),
             ))
             .unwrap();
 
         peering_table
             .add(VpcPeering::with_default_group(
                 "vpc1-to-vpc3",
-                VpcManifest {
-                    name: "vpc1".to_string(),
-                    exposes: vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
+                VpcManifest::with_exposes(
+                    "vpc1",
+                    vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                         "2.0.0.0/24".into(),
                         Some(PortRange::new(2001, 3000).unwrap()),
                     ))],
-                },
-                VpcManifest {
-                    name: "vpc3".to_string(),
-                    exposes: vec![VpcExpose::empty().set_default()],
-                },
+                ),
+                VpcManifest::with_exposes("vpc3", vec![VpcExpose::empty().set_default()]),
             ))
             .unwrap();
 
-        let mut overlay = Overlay::new(vpc_table, peering_table);
+        let overlay = Overlay::new(vpc_table, peering_table);
         assert!(overlay.validate().is_ok());
     }
 
@@ -1129,37 +1109,31 @@ pub mod test {
         peering_table
             .add(VpcPeering::with_default_group(
                 "vpc1-to-vpc2",
-                VpcManifest {
-                    name: "vpc1".to_string(),
-                    exposes: vec![VpcExpose::empty().set_default()],
-                },
-                VpcManifest {
-                    name: "vpc2".to_string(),
-                    exposes: vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
+                VpcManifest::with_exposes("vpc1", vec![VpcExpose::empty().set_default()]),
+                VpcManifest::with_exposes(
+                    "vpc2",
+                    vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                         "5.0.0.0/24".into(),
                         Some(PortRange::new(6001, 8000).unwrap()),
                     ))],
-                },
+                ),
             ))
             .unwrap();
         peering_table
             .add(VpcPeering::with_default_group(
                 "vpc1-to-vpc3",
-                VpcManifest {
-                    name: "vpc1".to_string(),
-                    exposes: vec![VpcExpose::empty().set_default()],
-                },
-                VpcManifest {
-                    name: "vpc3".to_string(),
-                    exposes: vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
+                VpcManifest::with_exposes("vpc1", vec![VpcExpose::empty().set_default()]),
+                VpcManifest::with_exposes(
+                    "vpc3",
+                    vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                         "6.0.0.0/24".into(),
                         Some(PortRange::new(6001, 8000).unwrap()),
                     ))],
-                },
+                ),
             ))
             .unwrap();
 
-        let mut overlay = Overlay::new(vpc_table, peering_table);
+        let overlay = Overlay::new(vpc_table, peering_table);
         assert!(overlay.validate().is_ok());
     }
 
@@ -1180,43 +1154,34 @@ pub mod test {
         peering_table
             .add(VpcPeering::with_default_group(
                 "vpc1-to-vpc2",
-                VpcManifest {
-                    name: "vpc1".to_string(),
-                    exposes: vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
+                VpcManifest::with_exposes(
+                    "vpc1",
+                    vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                         "1.0.0.0/24".into(),
                         Some(PortRange::new(6001, 8000).unwrap()),
                     ))],
-                },
-                VpcManifest {
-                    name: "vpc2".to_string(),
-                    exposes: vec![VpcExpose::empty().set_default()],
-                },
+                ),
+                VpcManifest::with_exposes("vpc2", vec![VpcExpose::empty().set_default()]),
             ))
             .unwrap();
         peering_table
             .add(VpcPeering::with_default_group(
                 "vpc1-to-vpc3",
-                VpcManifest {
-                    name: "vpc1".to_string(),
-                    exposes: vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
+                VpcManifest::with_exposes(
+                    "vpc1",
+                    vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                         "1.0.0.0/24".into(),
                         Some(PortRange::new(6001, 8000).unwrap()),
                     ))],
-                },
-                VpcManifest {
-                    name: "vpc3".to_string(),
-                    exposes: vec![VpcExpose::empty().set_default()],
-                },
+                ),
+                VpcManifest::with_exposes("vpc3", vec![VpcExpose::empty().set_default()]),
             ))
             .unwrap();
 
-        let mut overlay = Overlay::new(vpc_table, peering_table);
-        assert_eq!(
-            overlay.validate(),
-            Err(ConfigError::Forbidden(
-                "Multiple 'default' destinations exposed to VPC"
-            )),
-        );
+        let overlay = Overlay::new(vpc_table, peering_table);
+        assert!(overlay.validate().is_err_and(
+            |e| e == ConfigError::Forbidden("Multiple 'default' destinations exposed to VPC")
+        ));
     }
 
     #[test]
@@ -1233,16 +1198,16 @@ pub mod test {
         peering_table
             .add(VpcPeering::with_default_group(
                 "vpc1-to-vpc2",
-                VpcManifest {
-                    name: "vpc1".to_string(),
-                    exposes: vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
+                VpcManifest::with_exposes(
+                    "vpc1",
+                    vec![VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                         "1.0.0.0/24".into(),
                         Some(PortRange::new(6001, 8000).unwrap()),
                     ))],
-                },
-                VpcManifest {
-                    name: "vpc2".to_string(),
-                    exposes: vec![
+                ),
+                VpcManifest::with_exposes(
+                    "vpc2",
+                    vec![
                         VpcExpose::empty().set_default(),
                         VpcExpose::empty().ip(PrefixWithOptionalPorts::new(
                             "4.0.0.0/24".into(),
@@ -1255,17 +1220,14 @@ pub mod test {
                         )),
                         VpcExpose::empty().set_default(),
                     ],
-                },
+                ),
             ))
             .unwrap();
 
-        let mut overlay = Overlay::new(vpc_table, peering_table);
-        assert_eq!(
-            overlay.validate(),
-            Err(ConfigError::Forbidden(
-                "Multiple 'default' expose blocks for a same peering",
-            )),
-        );
+        let overlay = Overlay::new(vpc_table, peering_table);
+        assert!(overlay.validate().is_err_and(
+            |e| e == ConfigError::Forbidden("Manifest cannot have multiple default exposes",)
+        ));
     }
 
     #[test]

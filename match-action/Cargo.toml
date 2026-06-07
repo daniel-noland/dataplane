@@ -1,0 +1,17 @@
+[package]
+name = "dataplane-match-action"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+arrayvec = { workspace = true, default-features = true }
+bolero = { workspace = true, optional = true }
+fixed-size = { workspace = true, features = [] }
+match-action-derive = { workspace = true, optional = true }
+
+[features]
+default = ["derive"]
+derive = ["dep:match-action-derive"]
+bolero = ["dep:bolero", "match-action-derive?/bolero"]

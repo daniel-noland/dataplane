@@ -6,11 +6,26 @@ publish.workspace = true
 version.workspace = true
 
 [features]
+default = ["parking_lot"]
 loom = ["dep:loom", "concurrency-macros/loom"]
+parking_lot = ["dep:parking_lot"]
 shuttle = ["dep:shuttle", "concurrency-macros/shuttle"]
+shuttle_dfs = ["shuttle"]
 silence_clippy = ["concurrency-macros/silence_clippy"] # Do not manually enable this feature, let --all-features do it for you
+# Force the Mutex-based slot fallback even without a model checker.
+# Intended for the CI miri job that exercises the fallback slot under
+# strict-provenance; arc_swap uses hazard pointers that strict-provenance
+# rejects, so the production slot can't be miri-checked under strict
+# provenance.
+_strict_provenance = []
 
 [dependencies]
-loom = { workspace = true, optional = true, features = [] }
-shuttle = { workspace = true, optional = true, features = [] }
+arc-swap = { workspace = true }
 concurrency-macros = { workspace = true, features = [] }
+loom = { workspace = true, optional = true, features = [] }
+parking_lot = { workspace = true, optional = true, features = [] }
+shuttle = { workspace = true, optional = true, features = [] }
+static_assertions = { workspace = true }
+
+[dev-dependencies]
+bolero = { workspace = true, features = ["std"] }

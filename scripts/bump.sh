@@ -4,26 +4,21 @@
 
 set -euxo pipefail
 
-pushd "$(dirname "${BASH_SOURCE[0]}")"
+pushd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-declare -rx DPDK_SYS_BRANCH="${1:-main}"
+# update all the (non-frozen) pins
+npins update
 
-declare dpdk_sys
-dpdk_sys="$(mktemp -d  --suffix=".dpdk-sys")"
-declare -r dpdk_sys
+# Refresh the opengrep release-asset content hash.  The pin only tracks the
+# release tag; the raw binary is hashed into nix/pkgs/opengrep/binary.sri,
+# which the derivation reads at eval time.  Idempotent: the URL content
+# doesn't change for a given tag, so re-running is a no-op unless the
+# opengrep pin has moved during `npins update` above, or upstream has
+# mutated the asset.
+opengrep_version="$(jq --exit-status --raw-output '.pins.opengrep.version' npins/sources.json)"
+opengrep_url="https://github.com/opengrep/opengrep/releases/download/${opengrep_version}/opengrep_manylinux_x86"
+nix-hash --to-sri --type sha256 \
+    "$(nix-prefetch-url --type sha256 "$opengrep_url")" \
+    > nix/pkgs/opengrep/binary.sri
 
-git clone \
-  --filter=blob:none \
-  --no-checkout \
-  --single-branch \
-  --branch="${DPDK_SYS_BRANCH}" \
-  --depth=1 \
-  "https://github.com/githedgehog/dpdk-sys.git" \
-  "${dpdk_sys}"
-pushd "${dpdk_sys}"
-declare DPDK_SYS_COMMIT
-DPDK_SYS_COMMIT="$(git rev-parse HEAD)"
-declare -rx DPDK_SYS_COMMIT
-popd
-rm -fr "${dpdk_sys}"
-envsubst < ./templates/dpdk-sys.env.template > ./dpdk-sys.env
+./scripts/update-doc-headers.sh

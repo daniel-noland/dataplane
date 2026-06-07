@@ -12,8 +12,8 @@
 use super::{NatIpWithBitmap, port_alloc};
 use crate::port::NatPort;
 use crate::ranges::IpRange;
-use crate::stateful::NatIp;
-use crate::stateful::allocator::AllocatorError;
+use crate::stateful::allocation::AllocatorError;
+use crate::stateful::natip::NatIp;
 use concurrency::sync::{Arc, RwLock, RwLockReadGuard, Weak};
 use lpm::prefix::range_map::DisjointRangesBTreeMap;
 use lpm::prefix::{IpPrefix, PortRange, Prefix};
@@ -21,6 +21,7 @@ use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
 use std::time::Duration;
+use tracing::debug;
 
 ///////////////////////////////////////////////////////////////////////////////
 // IpAllocator
@@ -33,34 +34,34 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub(crate) struct IpAllocator<I: NatIpWithBitmap> {
     pool: Arc<RwLock<NatPool<I>>>,
+    randomize: bool,
 }
 
 impl<I: NatIpWithBitmap> IpAllocator<I> {
-    pub(crate) fn new(pool: NatPool<I>) -> Self {
+    pub(crate) fn new(pool: NatPool<I>, randomize: bool) -> Self {
         Self {
             pool: Arc::new(RwLock::new(pool)),
+            randomize,
         }
     }
 
-    pub(crate) fn read(&self) -> Result<RwLockReadGuard<'_, NatPool<I>>, AllocatorError> {
-        self.pool.read().map_err(|_| {
-            AllocatorError::InternalIssue("Failed to acquire read lock (poisoned)".to_string())
-        })
+    pub(crate) fn read(&self) -> RwLockReadGuard<'_, NatPool<I>> {
+        self.pool.read()
     }
 
-    pub(crate) fn idle_timeout(&self) -> Option<Duration> {
-        Some(self.pool.read().ok()?.idle_timeout())
+    pub(crate) fn idle_timeout(&self) -> Duration {
+        self.pool.read().idle_timeout()
     }
 
     fn deallocate_ip(&self, ip: I) {
-        self.pool.write().unwrap().deallocate_from_pool(ip);
+        self.pool.write().deallocate_from_pool(ip);
     }
 
     fn reuse_allocated_ip(
         &self,
         allow_null: bool,
     ) -> Result<port_alloc::AllocatedPort<I>, AllocatorError> {
-        let allocated_ips = self.pool.read().unwrap();
+        let allocated_ips = self.pool.read();
         for ip_weak in allocated_ips.ips_in_use() {
             let Some(ip) = ip_weak.upgrade() else {
                 continue;
@@ -69,7 +70,10 @@ impl<I: NatIpWithBitmap> IpAllocator<I> {
                 continue;
             }
             match ip.allocate_port_for_ip(allow_null) {
-                Ok(port) => return Ok(port),
+                Ok(port) => {
+                    debug!("Allocated port {port}");
+                    return Ok(port);
+                }
                 // If there is no free port left, loop again to try another IP address
                 Err(AllocatorError::NoFreePort(_)) => {}
                 Err(e) => return Err(e),
@@ -78,35 +82,31 @@ impl<I: NatIpWithBitmap> IpAllocator<I> {
         Err(AllocatorError::NoFreeIp)
     }
 
-    fn allocate_new_ip_from_pool(
-        &self,
-        disable_randomness: bool,
-    ) -> Result<Arc<AllocatedIp<I>>, AllocatorError> {
-        let mut allocated_ips = self.pool.write().unwrap();
-        let new_ip = allocated_ips.use_new_ip(self.clone(), disable_randomness)?;
+    fn allocate_new_ip_from_pool(&self) -> Result<Arc<AllocatedIp<I>>, AllocatorError> {
+        let mut allocated_ips = self.pool.write();
+        let new_ip = allocated_ips.use_new_ip(self.clone(), self.randomize)?;
         let arc_ip = Arc::new(new_ip);
         allocated_ips.add_in_use(&arc_ip);
+        debug!("Allocated new ip {}", arc_ip.ip());
         Ok(arc_ip)
     }
 
     fn allocate_from_new_ip(
         &self,
         allow_null: bool,
-        disable_randomness: bool,
     ) -> Result<port_alloc::AllocatedPort<I>, AllocatorError> {
-        self.allocate_new_ip_from_pool(disable_randomness)
+        self.allocate_new_ip_from_pool()
             .and_then(|ip| ip.allocate_port_for_ip(allow_null))
     }
 
     fn cleanup_used_ips(&self) {
-        let mut allocated_ips = self.pool.write().unwrap();
+        let mut allocated_ips = self.pool.write();
         allocated_ips.cleanup();
     }
 
     pub(crate) fn allocate(
         &self,
         allow_null: bool,
-        disable_randomness: bool,
     ) -> Result<port_alloc::AllocatedPort<I>, AllocatorError> {
         // FIXME: Should we clean up every time??
         self.cleanup_used_ips();
@@ -114,35 +114,28 @@ impl<I: NatIpWithBitmap> IpAllocator<I> {
         if let Ok(port) = self.reuse_allocated_ip(allow_null) {
             return Ok(port);
         }
-
-        self.allocate_from_new_ip(allow_null, disable_randomness)
+        self.allocate_from_new_ip(allow_null)
     }
 
-    fn get_allocated_ip(
-        &self,
-        ip: I,
-        disable_randomness: bool,
-    ) -> Result<Arc<AllocatedIp<I>>, AllocatorError> {
+    fn get_allocated_ip(&self, ip: I) -> Result<Arc<AllocatedIp<I>>, AllocatorError> {
         self.pool
             .write()
-            .unwrap()
-            .reserve_from_pool(ip, self.clone(), disable_randomness)
+            .reserve_from_pool(ip, self.clone(), self.randomize)
     }
 
     pub(crate) fn reserve(
         &self,
         ip: I,
         port: NatPort,
-        disable_randomness: bool,
     ) -> Result<port_alloc::AllocatedPort<I>, AllocatorError> {
-        self.get_allocated_ip(ip, disable_randomness)
+        self.get_allocated_ip(ip)
             .and_then(|allocated_ip| allocated_ip.reserve_port_for_ip(port))
     }
 
     // Helper to access IpAllocator's internals for tests. Not to be used outside of tests.
     #[cfg(test)]
     pub fn get_pool_clone_for_tests(&self) -> (RoaringBitmap, VecDeque<Weak<AllocatedIp<I>>>) {
-        let pool = self.pool.read().unwrap();
+        let pool = self.pool.read();
         (pool.bitmap.0.clone(), pool.in_use.clone())
     }
 }
@@ -167,35 +160,18 @@ impl<I: NatIpWithBitmap> AllocatedIp<I> {
         ip: I,
         ip_allocator: IpAllocator<I>,
         reserved_port_range: Option<PortRange>,
-        disable_randomness: bool,
+        randomize: bool,
+        exclude_wellknown_ports: bool,
     ) -> Self {
-        // Allow opt-in deterministic port allocation for tests
-        let port_allocator = Self::get_new_portallocator(reserved_port_range, disable_randomness);
-
         Self {
             ip,
-            port_allocator,
+            port_allocator: port_alloc::PortAllocator::new(
+                reserved_port_range,
+                randomize,
+                exclude_wellknown_ports,
+            ),
             ip_allocator,
         }
-    }
-
-    #[cfg(test)]
-    fn get_new_portallocator(
-        reserved_port_range: Option<PortRange>,
-        disable_randomness: bool,
-    ) -> port_alloc::PortAllocator<I> {
-        if disable_randomness {
-            port_alloc::PortAllocator::new_no_randomness(reserved_port_range)
-        } else {
-            port_alloc::PortAllocator::new(reserved_port_range)
-        }
-    }
-    #[cfg(not(test))]
-    fn get_new_portallocator(
-        reserved_port_range: Option<PortRange>,
-        _disable_randomness: bool,
-    ) -> port_alloc::PortAllocator<I> {
-        port_alloc::PortAllocator::new(reserved_port_range)
     }
 
     pub(crate) fn ip(&self) -> I {
@@ -219,7 +195,16 @@ impl<I: NatIpWithBitmap> AllocatedIp<I> {
         self: Arc<Self>,
         allow_null: bool,
     ) -> Result<port_alloc::AllocatedPort<I>, AllocatorError> {
-        self.port_allocator.allocate_port(self.clone(), allow_null)
+        let alloc_port = self
+            .port_allocator
+            .allocate_port(self.clone(), allow_null)?;
+
+        debug!(
+            "Allocated port {} for ip {}",
+            alloc_port.port().as_u16(),
+            alloc_port.ip()
+        );
+        Ok(alloc_port)
     }
 
     fn reserve_port_for_ip(
@@ -251,6 +236,7 @@ pub(crate) struct NatPool<I: NatIpWithBitmap> {
     in_use: VecDeque<Weak<AllocatedIp<I>>>,
     reserved_prefixes_ports: Option<DisjointRangesBTreeMap<IpRange, PortRange>>,
     idle_timeout: Duration,
+    exclude_wellknown_ports: bool,
 }
 
 impl<I: NatIpWithBitmap> NatPool<I> {
@@ -260,6 +246,7 @@ impl<I: NatIpWithBitmap> NatPool<I> {
         reverse_bitmap_mapping: BTreeMap<u128, u32>,
         reserved_prefixes_ports: Option<DisjointRangesBTreeMap<IpRange, PortRange>>,
         idle_timeout: Duration,
+        exclude_wellknown_ports: bool,
     ) -> Self {
         Self {
             bitmap,
@@ -268,6 +255,7 @@ impl<I: NatIpWithBitmap> NatPool<I> {
             in_use: VecDeque::new(),
             reserved_prefixes_ports,
             idle_timeout,
+            exclude_wellknown_ports,
         }
     }
 
@@ -302,7 +290,7 @@ impl<I: NatIpWithBitmap> NatPool<I> {
     fn use_new_ip(
         &mut self,
         ip_allocator: IpAllocator<I>,
-        disable_randomness: bool,
+        randomize: bool,
     ) -> Result<AllocatedIp<I>, AllocatorError> {
         // Retrieve the first available offset
         let offset = self.bitmap.pop_ip()?;
@@ -319,11 +307,13 @@ impl<I: NatIpWithBitmap> NatPool<I> {
             ip,
             ip_allocator,
             reserved_port_range,
-            disable_randomness,
+            randomize,
+            self.exclude_wellknown_ports,
         ))
     }
 
     fn deallocate_from_pool(&mut self, ip: I) {
+        debug!("Address {ip} was deallocated");
         let offset = I::try_to_offset(ip, &self.reverse_bitmap_mapping).unwrap();
         self.bitmap.set_ip_free(offset);
     }
@@ -332,7 +322,7 @@ impl<I: NatIpWithBitmap> NatPool<I> {
         &mut self,
         ip: I,
         ip_allocator: IpAllocator<I>,
-        disable_randomness: bool,
+        randomize: bool,
     ) -> Result<Arc<AllocatedIp<I>>, AllocatorError> {
         let offset = I::try_to_offset(ip, &self.reverse_bitmap_mapping)?;
 
@@ -341,6 +331,7 @@ impl<I: NatIpWithBitmap> NatPool<I> {
                 && ip_arc.ip() == ip
             {
                 // We found the allocated IP in the list of IPs in use, return it
+                debug!("Reserved ip {ip_arc}");
                 return Ok(ip_arc);
             }
         }
@@ -353,7 +344,15 @@ impl<I: NatIpWithBitmap> NatPool<I> {
         // drops an AllocatedIp and its reference count goes to 0, but it hasn't called the drop()
         // function to remove the IP from the bitmap in that other thread yet).
         let _ = self.bitmap.set_ip_allocated(offset);
-        let arc_ip = Arc::new(AllocatedIp::new(ip, ip_allocator, None, disable_randomness));
+        let arc_ip = Arc::new(AllocatedIp::new(
+            ip,
+            ip_allocator,
+            None,
+            randomize,
+            // Keep the low-port exclusion policy for explicitly reserved IPs as well, so
+            // reserve() follows the same TCP/UDP allocation rules as allocate().
+            self.exclude_wellknown_ports,
+        ));
         self.add_in_use(&arc_ip);
         Ok(arc_ip)
     }
@@ -437,11 +436,7 @@ impl PoolBitmap {
         self.0.insert(index)
     }
 
-    pub(crate) fn add_prefix(
-        &mut self,
-        prefix: &Prefix,
-        bitmap_mapping: &BTreeMap<u128, u32>,
-    ) -> Result<(), AllocatorError> {
+    pub(crate) fn add_prefix(&mut self, prefix: &Prefix, bitmap_mapping: &BTreeMap<u128, u32>) {
         match prefix {
             Prefix::IPV4(p) => {
                 let start = p.network().to_bits();
@@ -449,12 +444,11 @@ impl PoolBitmap {
                 self.0.insert_range(start..=end);
             }
             Prefix::IPV6(p) => {
-                let start = map_address(p.network(), bitmap_mapping)?;
-                let end = map_address(p.last_address(), bitmap_mapping)?;
+                let start = map_address(p.network(), bitmap_mapping);
+                let end = map_address(p.last_address(), bitmap_mapping);
                 self.0.insert_range(start..=end);
             }
         }
-        Ok(())
     }
 }
 
@@ -486,19 +480,11 @@ pub(crate) fn map_offset(
 }
 
 // Reverse operation from map_offset()
-pub(crate) fn map_address(
-    address: Ipv6Addr,
-    bitmap_mapping: &BTreeMap<u128, u32>,
-) -> Result<u32, AllocatorError> {
+pub(crate) fn map_address(address: Ipv6Addr, bitmap_mapping: &BTreeMap<u128, u32>) -> u32 {
     let (prefix_start_bits, prefix_offset) = bitmap_mapping
         .range(..=address.to_bits())
         .next_back()
-        .ok_or(AllocatorError::InternalIssue(
-            "Failed to find prefix in map for IPv6".to_string(),
-        ))?;
+        .expect("This should never fail");
 
-    Ok(prefix_offset
-        + u32::try_from(address.to_bits() - prefix_start_bits).map_err(|_| {
-            AllocatorError::InternalIssue("Failed to convert Ipv6 to offset".to_string())
-        })?)
+    prefix_offset + u32::try_from(address.to_bits() - prefix_start_bits).unwrap()
 }

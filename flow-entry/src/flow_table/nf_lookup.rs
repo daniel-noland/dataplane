@@ -39,7 +39,7 @@ impl<Buf: PacketBufferMut> NetworkFunction<Buf> for FlowLookup {
     ) -> impl Iterator<Item = Packet<Buf>> + 'a {
         input.filter_map(move |mut packet| {
             let nfi = &self.name;
-            if !packet.is_done() && packet.meta().is_overlay() {
+            if !packet.is_done() && packet.meta().is_overlay() && packet.meta().dst_vpcd.is_none() {
                 if let Ok(flow_key) = FlowKey::try_from(flow_key::Uni(&packet)) {
                     if let Some(flow_info) = self.flow_table.lookup(&flow_key) {
                         debug!("{nfi}: Tagging packet with flow info for flow key {flow_key}",);
@@ -102,8 +102,8 @@ mod test {
 
         // Insert matching flow entry
         let flow_key = FlowKey::try_from(net::flow_key::Uni(&packet)).unwrap();
-        let flow_info = FlowInfo::new(Instant::now() + Duration::from_secs(10));
-        flow_table.insert(flow_key, flow_info);
+        let flow_info = FlowInfo::new(flow_key, Instant::now() + Duration::from_secs(10));
+        flow_table.insert(flow_info).unwrap();
 
         // Ensure packet is tagged
         let mut output_iter = lookup_nf.process(std::iter::once(packet));
@@ -131,14 +131,16 @@ mod test {
         ) -> impl Iterator<Item = Packet<Buf>> + 'a {
             input.filter_map(move |packet| {
                 let flow_key = FlowKey::try_from(net::flow_key::Uni(&packet)).unwrap();
-                let flow_info = FlowInfo::new(Instant::now() + self.timeout);
-                self.flow_table.insert(flow_key, flow_info);
+                let flow_info = FlowInfo::new(flow_key, Instant::now() + self.timeout);
+                self.flow_table
+                    .insert(flow_info)
+                    .expect("insert in FlowInfoCreator should not fail");
                 packet.enforce()
             })
         }
     }
 
-    #[traced_test]
+    #[cfg_attr(not(miri), traced_test)]
     #[tokio::test]
     async fn test_lookup_nf_with_expiration() {
         let flow_table = Arc::new(FlowTable::default());
@@ -148,7 +150,10 @@ mod test {
             .add_stage(lookup_nf)
             .add_stage(flowinfo_creator);
 
-        const NUM_PACKETS: u16 = 1000;
+        const NUM_PACKETS: u16 = cfg_select! {
+            emulated => 10,
+            _ => 1000,
+        };
 
         // create NUM_PACKETS, each with a distinct port from in [1, NUM_PACKETS]
         let dst_ports = 1..=NUM_PACKETS;
@@ -171,7 +176,11 @@ mod test {
     }
 
     //#[traced_test]
-    #[tokio::test]
+    // start_paused so per-flow timer deadlines and the test's sleep share tokio's virtual
+    // clock; otherwise miri's slow interpretation lets real wall time blow past flow_2's
+    // 1-minute deadline (the whole test takes ~90s under miri), expiring both flows
+    // instead of just flow_1. Same root cause as test_flow_table_timeout.
+    #[tokio::test(start_paused = true)]
     async fn test_lookups_with_related_flows() {
         let flow_table = Arc::new(FlowTable::default());
         let lookup_nf = FlowLookup::new("lookup_nf", flow_table.clone());
@@ -188,7 +197,7 @@ mod test {
             let key_2 = FlowKey::try_from(net::flow_key::Uni(&packet_2)).unwrap();
 
             // create a pair of related flow entries; flow_2 will get a longer timeout
-            let expires_at = Instant::now() + Duration::from_secs(2);
+            let expires_at = tokio::time::Instant::now().into_std() + Duration::from_secs(2);
             let (flow_1, flow_2) = FlowInfo::related_pair(expires_at, key_1, key_2);
             assert_eq!(Arc::weak_count(&flow_1), 1);
             assert_eq!(Arc::weak_count(&flow_2), 1);
@@ -196,11 +205,11 @@ mod test {
             assert_eq!(Arc::strong_count(&flow_2), 1);
 
             // extend flow2's timeout so that it does not expire
-            flow_2.extend_expiry_unchecked(Duration::from_secs(60));
+            flow_2.extend_expiry_unchecked(Duration::from_mins(1));
 
             // ... and insert the two flows in the flow table
-            flow_table.insert_from_arc(key_1, &flow_1);
-            flow_table.insert_from_arc(key_2, &flow_2);
+            flow_table.insert_from_arc(&flow_1).unwrap();
+            flow_table.insert_from_arc(&flow_2).unwrap();
 
             // check that flows can be looked up
             let _ = flow_table.lookup(&key_1).unwrap();

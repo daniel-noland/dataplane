@@ -5,12 +5,15 @@ use crate::tables::NatRequirement;
 use crate::{
     FlowFilter, FlowFilterTable, FlowFilterTableWriter, FlowTuple, RemoteData, VpcdLookupResult,
 };
+use config::ConfigError;
 use config::external::overlay::Overlay;
 use config::external::overlay::vpc::{Vpc, VpcTable};
 use config::external::overlay::vpcpeering::{VpcExpose, VpcManifest, VpcPeering, VpcPeeringTable};
 use lpm::prefix::{L4Protocol, PortRange, Prefix, PrefixWithOptionalPorts};
+use net::FlowKey;
 use net::buffer::{PacketBufferMut, TestBuffer};
-use net::flows::FlowInfo;
+use net::flow_key::Uni;
+use net::flows::{FlowInfo, FlowStatus};
 use net::headers::{Net, TryHeadersMut, TryIpMut};
 use net::ip::NextHeader;
 use net::ipv4::addr::UnicastIpv4Addr;
@@ -26,7 +29,9 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use concurrency::sync::Arc;
 use tracing_test::traced_test;
 
 fn vni(id: u32) -> Vni {
@@ -185,9 +190,16 @@ fn fake_flow_session<Buf: PacketBufferMut>(
     set_nat_state: bool,
     set_port_fw_state: bool,
 ) {
+    // build flow key
+    let flow_key = FlowKey::try_from(Uni(&*packet)).unwrap();
+
     // Create flow_info with dst_vpcd and NAT info and attach it to the packet
-    let flow_info = FlowInfo::new(std::time::Instant::now() + std::time::Duration::from_secs(60));
-    let mut binding = flow_info.locked.write().unwrap();
+    let flow_info = FlowInfo::new(flow_key, Instant::now() + Duration::from_secs(60));
+
+    // pretend that flow is in table
+    flow_info.update_status(FlowStatus::Active);
+
+    let mut binding = flow_info.locked.write();
     binding.dst_vpcd = Some(dst_vpcd);
     if set_nat_state {
         // Content should be a NatFlowState object but we can't include it in this crate without
@@ -409,14 +421,8 @@ fn test_flow_filter_table_overlap_cases() {
     peering_table
         .add(VpcPeering::new(
             "vpc1-to-vpc2",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![VpcExpose::empty().ip("1.0.0.0/24".into())],
-            },
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![VpcExpose::empty().ip("5.0.0.0/24".into())],
-            },
+            VpcManifest::with_exposes("vpc1", vec![VpcExpose::empty().ip("1.0.0.0/24".into())]),
+            VpcManifest::with_exposes("vpc2", vec![VpcExpose::empty().ip("5.0.0.0/24".into())]),
             None,
         ))
         .unwrap();
@@ -424,32 +430,31 @@ fn test_flow_filter_table_overlap_cases() {
     peering_table
         .add(VpcPeering::new(
             "vpc2-to-vpc3",
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "vpc2",
+                vec![
                     VpcExpose::empty().ip("5.0.0.0/24".into()),
                     VpcExpose::empty().ip("6.0.0.0/24".into()),
                 ],
-            },
-            VpcManifest {
-                name: "vpc3".to_string(),
-                exposes: vec![VpcExpose::empty().ip("1.0.0.64/26".into())],
-            },
+            ),
+            VpcManifest::with_exposes("vpc3", vec![VpcExpose::empty().ip("1.0.0.64/26".into())]),
             None,
         ))
         .unwrap();
 
-    let mut overlay = Overlay::new(vpc_table, peering_table);
     // Build overlay.vpc_table's peerings from peering_table, with no validation.
     // We don't validate because overlapping prefixes actually make the config invalid; but it
     // doesn't matter for the test.
-    overlay.collect_peerings();
+    let overlay = Overlay::new(vpc_table, peering_table);
+    assert!(matches!(
+        overlay.validate(),
+        Err(ConfigError::OverlappingPrefixes(_, _))
+    ));
+    let overlay = unsafe { overlay.fake_validated_overlay_for_tests() };
 
     let table = FlowFilterTable::build_from_overlay(&overlay).unwrap();
-
     let mut writer = FlowFilterTableWriter::new();
     writer.update_flow_filter_table(table);
-
     let mut flow_filter = FlowFilter::new("test-filter", writer.get_reader());
 
     // Test with packets
@@ -621,7 +626,7 @@ fn test_flow_filter_packet_icmp_filtered() {
     assert_eq!(packet_out.meta().dst_vpcd, None);
 }
 
-#[traced_test]
+#[cfg_attr(not(emulated), traced_test)]
 #[test]
 fn test_flow_filter_table_from_overlay() {
     let vni1 = Vni::new_checked(100).unwrap();
@@ -643,46 +648,35 @@ fn test_flow_filter_table_from_overlay() {
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc2",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![VpcExpose::empty().ip("1.0.0.0/24".into())],
-            },
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes("vpc1", vec![VpcExpose::empty().ip("1.0.0.0/24".into())]),
+            VpcManifest::with_exposes(
+                "vpc2",
+                vec![
                     VpcExpose::empty().ip("5.0.0.0/24".into()),
                     VpcExpose::empty().set_default(),
                 ],
-            },
+            ),
         ))
         .unwrap();
 
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc3",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "vpc1",
+                vec![
                     VpcExpose::empty().ip("1.0.0.0/24".into()),
                     VpcExpose::empty().ip("2.0.0.0/24".into()),
                 ],
-            },
-            VpcManifest {
-                name: "vpc3".to_string(),
-                exposes: vec![VpcExpose::empty().ip("6.0.0.0/24".into())],
-            },
+            ),
+            VpcManifest::with_exposes("vpc3", vec![VpcExpose::empty().ip("6.0.0.0/24".into())]),
         ))
         .unwrap();
 
-    let mut overlay = Overlay::new(vpc_table, peering_table);
-    // Validation is necessary to build overlay.vpc_table's peerings from peering_table
-    overlay.validate().unwrap();
-
+    let overlay = Overlay::new(vpc_table, peering_table).validate().unwrap();
     let table = FlowFilterTable::build_from_overlay(&overlay).unwrap();
-
     let mut writer = FlowFilterTableWriter::new();
     writer.update_flow_filter_table(table);
-
     let mut flow_filter = FlowFilter::new("test-filter", writer.get_reader());
 
     // Test with packets
@@ -740,7 +734,7 @@ fn test_flow_filter_table_from_overlay() {
     assert_eq!(packet_out.meta().dst_vpcd, None);
 }
 
-#[traced_test]
+#[cfg_attr(not(emulated), traced_test)]
 #[test]
 fn test_flow_filter_table_check_send_from_default() {
     let vni1 = Vni::new_checked(100).unwrap();
@@ -758,26 +752,15 @@ fn test_flow_filter_table_check_send_from_default() {
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc2",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![VpcExpose::empty().set_default()],
-            },
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![VpcExpose::empty().ip("5.0.0.0/24".into())],
-            },
+            VpcManifest::with_exposes("vpc1", vec![VpcExpose::empty().set_default()]),
+            VpcManifest::with_exposes("vpc2", vec![VpcExpose::empty().ip("5.0.0.0/24".into())]),
         ))
         .unwrap();
 
-    let mut overlay = Overlay::new(vpc_table, peering_table);
-    // Validation is necessary to build overlay.vpc_table's peerings from peering_table
-    overlay.validate().unwrap();
-
+    let overlay = Overlay::new(vpc_table, peering_table).validate().unwrap();
     let table = FlowFilterTable::build_from_overlay(&overlay).unwrap();
-
     let mut writer = FlowFilterTableWriter::new();
     writer.update_flow_filter_table(table);
-
     let mut flow_filter = FlowFilter::new("test-filter", writer.get_reader());
 
     // Test with a packet
@@ -792,7 +775,7 @@ fn test_flow_filter_table_check_send_from_default() {
     assert_eq!(packet_out.meta().dst_vpcd, Some(vni2.into()));
 }
 
-#[traced_test]
+#[cfg_attr(not(emulated), traced_test)]
 #[test]
 fn test_flow_filter_table_check_default_to_default() {
     let vni1 = Vni::new_checked(100).unwrap();
@@ -810,26 +793,21 @@ fn test_flow_filter_table_check_default_to_default() {
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc2",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![VpcExpose::empty().set_default()],
-            },
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![VpcExpose::empty().set_default()],
-            },
+            VpcManifest::with_exposes("vpc1", vec![VpcExpose::empty().set_default()]),
+            VpcManifest::with_exposes("vpc2", vec![VpcExpose::empty().set_default()]),
         ))
         .unwrap();
 
-    let mut overlay = Overlay::new(vpc_table, peering_table);
-    // Build overlay.vpc_table's peerings from peering_table, with no validation
-    overlay.collect_peerings();
+    // Build overlay.vpc_table's peerings from peering_table, with no validation.
+    // We don't validate because overlapping prefixes actually make the config invalid; but it
+    // doesn't matter for the test.
+    let overlay = Overlay::new(vpc_table, peering_table);
+    assert!(matches!(overlay.validate(), Err(ConfigError::Forbidden(_))));
+    let overlay = unsafe { overlay.fake_validated_overlay_for_tests() };
 
     let table = FlowFilterTable::build_from_overlay(&overlay).unwrap();
-
     let mut writer = FlowFilterTableWriter::new();
     writer.update_flow_filter_table(table);
-
     let mut flow_filter = FlowFilter::new("test-filter", writer.get_reader());
 
     // Test with packets
@@ -844,7 +822,7 @@ fn test_flow_filter_table_check_default_to_default() {
     assert_eq!(packet_out.meta().dst_vpcd, Some(vni2.into()));
 }
 
-#[traced_test]
+#[cfg_attr(not(emulated), traced_test)]
 #[test]
 fn test_flow_filter_table_check_nat_requirements() {
     let vni1 = Vni::new_checked(100).unwrap();
@@ -862,9 +840,9 @@ fn test_flow_filter_table_check_nat_requirements() {
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc2",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "vpc1",
+                vec![
                     VpcExpose::empty().ip("1.0.0.0/24".into()), // No NAT
                     VpcExpose::empty()
                         .make_stateless_nat()
@@ -880,10 +858,10 @@ fn test_flow_filter_table_check_nat_requirements() {
                         .unwrap(),
                     VpcExpose::empty().set_default(), // Default (no NAT)
                 ],
-            },
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![
+            ),
+            VpcManifest::with_exposes(
+                "vpc2",
+                vec![
                     VpcExpose::empty().ip("5.0.0.0/24".into()), // No NAT
                     VpcExpose::empty()
                         .make_stateless_nat()
@@ -899,19 +877,20 @@ fn test_flow_filter_table_check_nat_requirements() {
                         .unwrap(),
                     VpcExpose::empty().set_default(), // Default (no NAT)
                 ],
-            },
+            ),
         ))
         .unwrap();
 
-    let mut overlay = Overlay::new(vpc_table, peering_table);
-    // Build overlay.vpc_table's peerings from peering_table, with no validation
-    overlay.collect_peerings();
+    // Build overlay.vpc_table's peerings from peering_table, with no validation.
+    // We don't validate because overlapping prefixes actually make the config invalid; but it
+    // doesn't matter for the test.
+    let overlay = Overlay::new(vpc_table, peering_table);
+    assert!(matches!(overlay.validate(), Err(ConfigError::Forbidden(_))));
+    let overlay = unsafe { overlay.fake_validated_overlay_for_tests() };
 
     let table = FlowFilterTable::build_from_overlay(&overlay).unwrap();
-
     let mut writer = FlowFilterTableWriter::new();
     writer.update_flow_filter_table(table);
-
     let mut flow_filter = FlowFilter::new("test-filter", writer.get_reader());
 
     // Test with packets
@@ -972,7 +951,7 @@ fn test_flow_filter_table_check_nat_requirements() {
     assert!(needs_masquerade(&packet_out));
 }
 
-#[traced_test]
+#[cfg_attr(not(emulated), traced_test)]
 #[test]
 fn test_flow_filter_table_check_stateful_nat_plus_peer_forwarding() {
     let vni1 = vni(100);
@@ -990,9 +969,9 @@ fn test_flow_filter_table_check_stateful_nat_plus_peer_forwarding() {
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc2",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "vpc1",
+                vec![
                     VpcExpose::empty()
                         .make_stateful_nat(None)
                         .unwrap()
@@ -1012,19 +991,16 @@ fn test_flow_filter_table_check_stateful_nat_plus_peer_forwarding() {
                         )) // Port forwarding
                         .unwrap(),
                 ],
-            },
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![VpcExpose::empty().ip("5.0.0.0/24".into())], // No NAT
-            },
+            ),
+            VpcManifest::with_exposes(
+                "vpc2",
+                vec![VpcExpose::empty().ip("5.0.0.0/24".into())], // No NAT
+            ),
         ))
         .unwrap();
 
-    let mut overlay = Overlay::new(vpc_table, peering_table);
-    overlay.validate().unwrap();
-
+    let overlay = Overlay::new(vpc_table, peering_table).validate().unwrap();
     let table = FlowFilterTable::build_from_overlay(&overlay).unwrap();
-
     let mut writer = FlowFilterTableWriter::new();
     writer.update_flow_filter_table(table);
 
@@ -1171,7 +1147,7 @@ fn test_flow_filter_table_check_stateful_nat_plus_peer_forwarding() {
 }
 
 #[test]
-#[traced_test]
+#[cfg_attr(not(emulated), traced_test)]
 fn test_flow_filter_protocol_aware_port_forwarding() {
     // Test that protocol-specific port forwarding correctly filters by L4 protocol.
     // Setup: TCP-only port forwarding overlapping with stateful NAT.
@@ -1195,9 +1171,9 @@ fn test_flow_filter_protocol_aware_port_forwarding() {
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc2",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "vpc1",
+                vec![
                     VpcExpose::empty()
                         .make_stateful_nat(None) // Stateful NAT
                         .unwrap()
@@ -1217,22 +1193,18 @@ fn test_flow_filter_protocol_aware_port_forwarding() {
                         ))
                         .unwrap(),
                 ],
-            },
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![VpcExpose::empty().ip("5.0.0.0/24".into())], // No NAT
-            },
+            ),
+            VpcManifest::with_exposes(
+                "vpc2",
+                vec![VpcExpose::empty().ip("5.0.0.0/24".into())], // No NAT
+            ),
         ))
         .unwrap();
 
-    let mut overlay = Overlay::new(vpc_table, peering_table);
-    overlay.validate().unwrap();
-
+    let overlay = Overlay::new(vpc_table, peering_table).validate().unwrap();
     let table = FlowFilterTable::build_from_overlay(&overlay).unwrap();
-
     let mut writer = FlowFilterTableWriter::new();
     writer.update_flow_filter_table(table);
-
     let mut flow_filter = FlowFilter::new("test-filter", writer.get_reader());
 
     // Source side: VPC 1 -> VPC 2
@@ -1309,7 +1281,7 @@ fn test_flow_filter_protocol_aware_port_forwarding() {
 }
 
 #[test]
-#[traced_test]
+#[cfg_attr(not(emulated), traced_test)]
 fn test_flow_filter_protocol_any_port_forwarding() {
     // Test that L4Protocol::Any port forwarding works for both TCP and UDP packets.
 
@@ -1329,9 +1301,9 @@ fn test_flow_filter_protocol_any_port_forwarding() {
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc2",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "vpc1",
+                vec![
                     VpcExpose::empty()
                         .make_stateful_nat(None)
                         .unwrap()
@@ -1351,22 +1323,15 @@ fn test_flow_filter_protocol_any_port_forwarding() {
                         ))
                         .unwrap(),
                 ],
-            },
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![VpcExpose::empty().ip("5.0.0.0/24".into())],
-            },
+            ),
+            VpcManifest::with_exposes("vpc2", vec![VpcExpose::empty().ip("5.0.0.0/24".into())]),
         ))
         .unwrap();
 
-    let mut overlay = Overlay::new(vpc_table, peering_table);
-    overlay.validate().unwrap();
-
+    let overlay = Overlay::new(vpc_table, peering_table).validate().unwrap();
     let table = FlowFilterTable::build_from_overlay(&overlay).unwrap();
-
     let mut writer = FlowFilterTableWriter::new();
     writer.update_flow_filter_table(table);
-
     let mut flow_filter = FlowFilter::new("test-filter", writer.get_reader());
 
     // Destination side: TCP packet -> port forwarding
@@ -1394,7 +1359,7 @@ fn test_flow_filter_protocol_any_port_forwarding() {
     assert!(needs_port_forwarding(&packet_out));
 }
 
-#[traced_test]
+#[cfg_attr(not(emulated), traced_test)]
 #[test]
 fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_overlap() {
     let vni1 = Vni::new_checked(100).unwrap();
@@ -1416,17 +1381,17 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc2",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "vpc1",
+                vec![
                     VpcExpose::empty()
                         .ip("192.168.50.0/24".into())
                         .ip("192.168.60.0/24".into()),
                 ],
-            },
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![
+            ),
+            VpcManifest::with_exposes(
+                "vpc2",
+                vec![
                     VpcExpose::empty()
                         .make_port_forwarding(None, Some(L4Protocol::Tcp))
                         .unwrap()
@@ -1465,16 +1430,16 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
                         .unwrap(),
                     VpcExpose::empty().ip("192.168.80.0/24".into()),
                 ],
-            },
+            ),
         ))
         .unwrap();
 
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc3",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "vpc1",
+                vec![
                     VpcExpose::empty()
                         .make_stateless_nat()
                         .unwrap()
@@ -1482,10 +1447,10 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
                         .as_range("10.30.50.0/24".into())
                         .unwrap(),
                 ],
-            },
-            VpcManifest {
-                name: "vpc3".to_string(),
-                exposes: vec![
+            ),
+            VpcManifest::with_exposes(
+                "vpc3",
+                vec![
                     VpcExpose::empty().ip("192.168.100.0/24".into()),
                     VpcExpose::empty()
                         .make_stateless_nat()
@@ -1494,16 +1459,16 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
                         .as_range("30.10.128.0/27".into())
                         .unwrap(),
                 ],
-            },
+            ),
         ))
         .unwrap();
 
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc2-to-vpc3",
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "vpc2",
+                vec![
                     VpcExpose::empty()
                         .make_stateful_nat(None)
                         .unwrap()
@@ -1511,23 +1476,18 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
                         .as_range("20.30.90.0/24".into())
                         .unwrap(),
                 ],
-            },
-            VpcManifest {
-                name: "vpc3".to_string(),
-                exposes: vec![VpcExpose::empty().ip("192.168.128.0/27".into())],
-            },
+            ),
+            VpcManifest::with_exposes(
+                "vpc3",
+                vec![VpcExpose::empty().ip("192.168.128.0/27".into())],
+            ),
         ))
         .unwrap();
 
-    let mut overlay = Overlay::new(vpc_table, peering_table);
-    // Validation is necessary to build overlay.vpc_table's peerings from peering_table
-    overlay.validate().unwrap();
-
+    let overlay = Overlay::new(vpc_table, peering_table).validate().unwrap();
     let table = FlowFilterTable::build_from_overlay(&overlay).unwrap();
-
     let mut writer = FlowFilterTableWriter::new();
     writer.update_flow_filter_table(table);
-
     let mut flow_filter = FlowFilter::new("test-filter", writer.get_reader());
 
     // Test with packets
@@ -1618,7 +1578,7 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
 // forwarding, although the latter is restricted to specific ports. This test validates that
 // prefix splitting occurs correctly for this configuration, and that we find the right
 // destination and NAT requirements.
-#[traced_test]
+#[cfg_attr(not(emulated), traced_test)]
 #[test]
 fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_overlap_smaller_masquerade()
  {
@@ -1641,17 +1601,17 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc2",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "vpc1",
+                vec![
                     VpcExpose::empty()
                         .ip("192.168.50.0/24".into())
                         .ip("192.168.60.0/24".into()),
                 ],
-            },
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![
+            ),
+            VpcManifest::with_exposes(
+                "vpc2",
+                vec![
                     VpcExpose::empty()
                         .make_port_forwarding(None, Some(L4Protocol::Tcp))
                         .unwrap()
@@ -1697,16 +1657,16 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
                         .unwrap(),
                     VpcExpose::empty().ip("192.168.80.0/24".into()),
                 ],
-            },
+            ),
         ))
         .unwrap();
 
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc3",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "vpc1",
+                vec![
                     VpcExpose::empty()
                         .make_stateless_nat()
                         .unwrap()
@@ -1714,10 +1674,10 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
                         .as_range("10.30.50.0/24".into())
                         .unwrap(),
                 ],
-            },
-            VpcManifest {
-                name: "vpc3".to_string(),
-                exposes: vec![
+            ),
+            VpcManifest::with_exposes(
+                "vpc3",
+                vec![
                     VpcExpose::empty().ip("192.168.100.0/24".into()),
                     VpcExpose::empty()
                         .make_stateless_nat()
@@ -1726,16 +1686,16 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
                         .as_range("30.10.128.0/27".into())
                         .unwrap(),
                 ],
-            },
+            ),
         ))
         .unwrap();
 
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc2-to-vpc3",
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes(
+                "vpc2",
+                vec![
                     VpcExpose::empty()
                         .make_stateful_nat(None)
                         .unwrap()
@@ -1743,23 +1703,18 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
                         .as_range("20.30.90.30/32".into())
                         .unwrap(),
                 ],
-            },
-            VpcManifest {
-                name: "vpc3".to_string(),
-                exposes: vec![VpcExpose::empty().ip("192.168.128.0/27".into())],
-            },
+            ),
+            VpcManifest::with_exposes(
+                "vpc3",
+                vec![VpcExpose::empty().ip("192.168.128.0/27".into())],
+            ),
         ))
         .unwrap();
 
-    let mut overlay = Overlay::new(vpc_table, peering_table);
-    // Validation is necessary to build overlay.vpc_table's peerings from peering_table
-    overlay.validate().unwrap();
-
+    let overlay = Overlay::new(vpc_table, peering_table).validate().unwrap();
     let table = FlowFilterTable::build_from_overlay(&overlay).unwrap();
-
     let mut writer = FlowFilterTableWriter::new();
     writer.update_flow_filter_table(table);
-
     let mut flow_filter = FlowFilter::new("test-filter", writer.get_reader());
 
     // Test with packets
@@ -1828,7 +1783,7 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
     assert!(needs_masquerade(&packet_out));
 }
 
-#[traced_test]
+#[cfg_attr(not(emulated), traced_test)]
 #[test]
 fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_overlap_to_default() {
     let vni1 = Vni::new_checked(100).unwrap();
@@ -1846,13 +1801,10 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
     peering_table
         .add(VpcPeering::with_default_group(
             "vpc1-to-vpc2",
-            VpcManifest {
-                name: "vpc1".to_string(),
-                exposes: vec![VpcExpose::empty().set_default()],
-            },
-            VpcManifest {
-                name: "vpc2".to_string(),
-                exposes: vec![
+            VpcManifest::with_exposes("vpc1", vec![VpcExpose::empty().set_default()]),
+            VpcManifest::with_exposes(
+                "vpc2",
+                vec![
                     VpcExpose::empty()
                         .make_port_forwarding(None, Some(L4Protocol::Tcp))
                         .unwrap()
@@ -1872,19 +1824,14 @@ fn test_flow_filter_table_from_overlay_masquerade_port_forwarding_private_ips_ov
                         .as_range("10.0.0.0/24".into())
                         .unwrap(),
                 ],
-            },
+            ),
         ))
         .unwrap();
 
-    let mut overlay = Overlay::new(vpc_table, peering_table);
-    // Validation is necessary to build overlay.vpc_table's peerings from peering_table
-    overlay.validate().unwrap();
-
+    let overlay = Overlay::new(vpc_table, peering_table).validate().unwrap();
     let table = FlowFilterTable::build_from_overlay(&overlay).unwrap();
-
     let mut writer = FlowFilterTableWriter::new();
     writer.update_flow_filter_table(table);
-
     let mut flow_filter = FlowFilter::new("test-filter", writer.get_reader());
 
     // Test with packets

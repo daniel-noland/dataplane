@@ -22,7 +22,7 @@ pub struct TruncatedTcpHeader {
 }
 
 impl TruncatedTcpHeader {
-    const MIN_HEADER_LEN: usize = 4;
+    pub(crate) const MIN_HEADER_LEN: usize = 4;
 
     fn new(source_port: TcpPort, destination_port: TcpPort, everything_else: Vec<u8>) -> Self {
         Self {
@@ -244,7 +244,7 @@ mod contract {
             if driver.produce::<bool>()? {
                 Some(full_header)
             } else {
-                let mut buffer = driver.produce::<[u8; Tcp::MIN_LENGTH.get() as usize]>()?;
+                let mut buffer = [0u8; Tcp::MAX_LENGTH];
                 #[allow(clippy::unwrap_used)] // We want to catch errors when deparsing, if any
                 full_header.deparse(&mut buffer).unwrap();
 

@@ -4,26 +4,28 @@
 //! Configuration processor
 
 use concurrency::sync::Arc;
+use config::external::overlay::ValidatedOverlay;
+use flow_entry::flow_table::FlowTable;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
 
 use tokio::spawn;
 use tokio::sync::mpsc;
 
-use config::external::overlay::vpc::VpcTable;
+use config::external::overlay::vpc::ValidatedVpcTable;
+use config::internal::device::tracecfg::TracingConfig;
 use config::internal::status::{
     DataplaneStatus, FrrStatus, VpcCounters, VpcPeeringCounters, VpcStatus,
 };
 use config::{ConfigError, ConfigResult, stringify};
-use config::{DeviceConfig, ExternalConfig, GenId, GwConfig, InternalConfig};
-use config::{external::overlay::Overlay, internal::device::tracecfg::TracingConfig};
+use config::{DeviceConfig, ExternalConfig, GenId, GwConfig, InternalConfig, ValidatedGwConfig};
 
 use crate::processor::confbuild::internal::build_internal_config;
 use crate::processor::confbuild::router::generate_router_config;
 use flow_filter::{FlowFilterTable, FlowFilterTableWriter};
 use nat::portfw::PortFwTableWriter;
 use nat::portfw::build_port_forwarding_configuration;
-use nat::stateful::NatAllocatorWriter;
+use nat::stateful::{NatAllocatorWriter, StatefulNatConfig};
 use nat::stateless::NatTablesWriter;
 use nat::stateless::setup::build_nat_configuration;
 use pipeline::PipelineData;
@@ -80,6 +82,9 @@ pub struct ConfigProcessorParams {
     // access data associated to pipeline
     pub pipeline_data: Arc<PipelineData>,
 
+    // flow table
+    pub flow_table: Arc<FlowTable>,
+
     // writer for vpc mapping table
     pub vpcmapw: VpcMapWriter<VpcMapName>,
 
@@ -134,27 +139,28 @@ impl ConfigProcessor {
     }
 
     /// Main entry point for new configurations
-    pub(crate) async fn process_incoming_config(&mut self, mut config: GwConfig) -> ConfigResult {
-        config.validate()?;
-        let internal = build_internal_config(&config, self.proc_params.bmp_options.clone())?;
-        config.set_internal_config(internal);
-        self.apply(config).await
+    pub(crate) async fn process_incoming_config(&mut self, config: GwConfig) -> ConfigResult {
+        let mut validated_config = config.validate()?;
+        let internal =
+            build_internal_config(&validated_config, self.proc_params.bmp_options.clone())?;
+        validated_config.set_internal_config(internal);
+        self.apply(validated_config).await
     }
 
     async fn update_history(
         &mut self,
-        config: &GwConfig,
+        config: &ValidatedGwConfig,
         result: &ConfigResult,
         is_rollback: bool,
     ) {
-        let guard = config.meta.load();
+        let guard = config.meta().load();
         let mut meta = guard.as_ref().clone();
         meta.apply_time();
         meta.error(result);
         meta.is_rollback = is_rollback;
         self.config_db.history_mut().push(meta.clone());
         if !is_rollback {
-            config.meta.store(Arc::from(meta));
+            config.meta().store(Arc::from(meta));
         }
         let history = Arc::from(self.config_db.history().clone());
         let router_ctl = &mut self.proc_params.router_ctl;
@@ -163,7 +169,7 @@ impl ConfigProcessor {
     }
 
     /// Apply a configuration. On success, store it. On failure, roll-back. Update the history in either case.
-    async fn apply(&mut self, config: GwConfig) -> ConfigResult {
+    async fn apply(&mut self, config: ValidatedGwConfig) -> ConfigResult {
         let config = Arc::from(config);
         let result = self.apply_gw_config(config.clone()).await;
         self.update_history(&config, &result, false).await;
@@ -443,7 +449,7 @@ impl VpcManager<RequiredInformationBase> {
 /// Build router config and apply it over the router control channel
 async fn apply_router_config(
     kernel_vrfs: &HashMap<InterfaceName, Interface>,
-    config: Arc<GwConfig>,
+    config: Arc<ValidatedGwConfig>,
     router_ctl: &mut RouterCtlSender,
 ) -> ConfigResult {
     let genid = config.genid();
@@ -465,19 +471,19 @@ async fn apply_router_config(
 ///
 /// Returns the list of `(VpcDiscriminant, name)` so the caller can seed the stats store.
 fn update_stats_vpc_mappings(
-    config: &GwConfig,
+    config: &ValidatedGwConfig,
     vpcmapw: &mut VpcMapWriter<VpcMapName>,
 ) -> Vec<(VpcDiscriminant, String)> {
     // create a mapping table from the vpc table in the config
     // FIXME(fredi): visibility
     // FIXME(fredi): generalize the vpcmapName table
-    let vpc_table = &config.external.overlay.vpc_table;
+    let vpc_table = config.external().overlay().vpc_table();
     let mut vpcmap = VpcMap::<VpcMapName>::new();
     let mut pairs: Vec<(VpcDiscriminant, String)> = Vec::with_capacity(vpc_table.len());
 
     for vpc in vpc_table.values() {
-        let disc = VpcDiscriminant::VNI(vpc.vni);
-        let name = vpc.name.clone();
+        let disc = VpcDiscriminant::VNI(vpc.vni());
+        let name = vpc.name().to_string();
         let map = VpcMapName::new(disc, &name);
         vpcmap.add(disc, map).unwrap_or_else(|_| unreachable!());
         pairs.push((disc, name));
@@ -489,7 +495,7 @@ fn update_stats_vpc_mappings(
 
 /// Update the Nat tables for stateless NAT
 fn apply_stateless_nat_config(
-    vpc_table: &VpcTable,
+    vpc_table: &ValidatedVpcTable,
     nattablesw: &mut NatTablesWriter,
 ) -> ConfigResult {
     let nat_table = build_nat_configuration(vpc_table)?;
@@ -498,32 +504,21 @@ fn apply_stateless_nat_config(
     Ok(())
 }
 
-/// Update the config for stateful NAT
+/// Update the config for stateful NAT.
+/// This is now infallible. Validation should ensure it is.
 fn apply_stateful_nat_config(
-    vpc_table: &VpcTable,
+    vpc_table: &ValidatedVpcTable,
+    flow_table: &FlowTable,
     natallocatorw: &mut NatAllocatorWriter,
-) -> ConfigResult {
-    natallocatorw.update_allocator(vpc_table)?;
-    // TODO: Update session table
-    //
-    // Long-term, we want to keep at least the sessions that remain valid under the new
-    // configuration. But this requires reporting the internal state from the old allocator to the
-    // new one, or we risk allocating again some IPs and ports that are already in use for existing
-    // sessions. We don't support this yet.
-    //
-    // Short-term, we want to drop all existing sessions from the table and start fresh. This first
-    // requires the NAT code to move to the new session table implementation, which has not been
-    // done as of this writing.
-    //
-    // Side note: session table and allocator may need to be updated at the same time, so we might
-    // need a lock around them in the StatefulNat stage and we may need to update them both from
-    // .update_allocator().
-    debug!("Successfully updated the stateful NAT allocator");
-    Ok(())
+    genid: GenId,
+) {
+    let nat_config = StatefulNatConfig::new(vpc_table, genid).set_randomize(true);
+    natallocatorw.update_nat_allocator(nat_config, flow_table);
+    debug!("Updated stateful NAT allocator");
 }
 
 fn apply_flow_filtering_config(
-    overlay: &Overlay,
+    overlay: &ValidatedOverlay,
     flowfilterw: &mut FlowFilterTableWriter,
 ) -> ConfigResult {
     let flow_filter_table = FlowFilterTable::build_from_overlay(overlay)?;
@@ -533,7 +528,7 @@ fn apply_flow_filtering_config(
 }
 
 fn apply_port_forwarding_config(
-    vpc_table: &VpcTable,
+    vpc_table: &ValidatedVpcTable,
     portfw_w: &mut PortFwTableWriter,
 ) -> ConfigResult {
     let ruleset = build_port_forwarding_configuration(vpc_table)?;
@@ -568,7 +563,7 @@ fn apply_device_config(device: &DeviceConfig) -> ConfigResult {
 
 impl ConfigProcessor {
     /// Main method to apply a config
-    async fn apply_gw_config(&mut self, config: Arc<GwConfig>) -> Result<(), ConfigError> {
+    async fn apply_gw_config(&mut self, config: Arc<ValidatedGwConfig>) -> Result<(), ConfigError> {
         let genid = config.genid();
         debug!("Applying config with genid '{genid}'...");
 
@@ -579,12 +574,21 @@ impl ConfigProcessor {
         let natallocatorw = &mut self.proc_params.natallocatorw;
         let flowfilterw = &mut self.proc_params.flowfilterw;
         let portfw_w = &mut self.proc_params.portfw_w;
+        let flow_table = &self.proc_params.flow_table;
 
         // internal config should be available
-        let internal = config.internal.as_ref().unwrap_or_else(|| unreachable!());
+        let internal = config.internal().unwrap_or_else(|| unreachable!());
 
         /* apply device config */
-        apply_device_config(&config.external.device)?;
+        apply_device_config(config.external().device())?;
+
+        /* apply flow table capacity (falls back to default when not explicitly configured) */
+        self.proc_params.flow_table.set_capacity(
+            config
+                .external()
+                .flow_table_capacity()
+                .map_or(FlowTable::DEFAULT_CAPACITY, |gwc| gwc.get()),
+        );
 
         if genid == ExternalConfig::BLANK_GENID {
             /* apply config with VPC manager */
@@ -606,16 +610,21 @@ impl ConfigProcessor {
         let kernel_vrfs = vpc_mgr.get_kernel_vrfs().await?;
 
         /* apply stateless NAT config */
-        apply_stateless_nat_config(&config.external.overlay.vpc_table, nattablesw)?;
+        apply_stateless_nat_config(config.external().overlay().vpc_table(), nattablesw)?;
 
         /* apply stateful NAT config */
-        apply_stateful_nat_config(&config.external.overlay.vpc_table, natallocatorw)?;
+        apply_stateful_nat_config(
+            config.external().overlay().vpc_table(),
+            flow_table.as_ref(),
+            natallocatorw,
+            genid,
+        );
 
         /* apply flow filtering config */
-        apply_flow_filtering_config(&config.external.overlay, flowfilterw)?;
+        apply_flow_filtering_config(config.external().overlay(), flowfilterw)?;
 
         /* apply port-forwarding config */
-        apply_port_forwarding_config(&config.external.overlay.vpc_table, portfw_w)?;
+        apply_port_forwarding_config(config.external().overlay().vpc_table(), portfw_w)?;
 
         /* update stats mappings and seed names to the stats store */
         let _ = update_stats_vpc_mappings(&config, vpcmapw);

@@ -14,26 +14,22 @@ use net::{FlowKey, IpProtoKey};
 
 use std::fmt::Display;
 use std::num::NonZero;
-use std::sync::{Arc, Weak};
+
+use concurrency::sync::{Arc, Weak};
 
 use flow_entry::flow_table::FlowInfo;
 
+use crate::common::{AtomicNatFlowStatus, NatAction, NatFlowStatus};
 use crate::portfw::PortFwEntry;
-use crate::portfw::protocol::{AtomicPortFwFlowStatus, PortFwFlowStatus, next_flow_status};
+use crate::portfw::protocol::next_flow_status;
 
 #[allow(unused)]
 use tracing::{debug, error, warn};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PortFwAction {
-    DstNat,
-    SrcNat,
-}
-
 #[derive(Debug, Clone)]
 pub struct PortFwState {
-    pub(crate) action: PortFwAction,
-    pub(crate) status: AtomicPortFwFlowStatus,
+    pub(crate) action: NatAction,
+    pub(crate) status: AtomicNatFlowStatus,
     use_ip: UnicastIpAddr,
     use_port: NonZero<u16>,
     pub(crate) rule: Weak<PortFwEntry>,
@@ -44,10 +40,10 @@ impl PortFwState {
         use_ip: UnicastIpAddr,
         use_port: NonZero<u16>,
         rule: Weak<PortFwEntry>,
-        status: AtomicPortFwFlowStatus,
+        status: AtomicNatFlowStatus,
     ) -> Self {
         Self {
-            action: PortFwAction::SrcNat,
+            action: NatAction::SrcNat,
             status,
             use_ip,
             use_port,
@@ -59,10 +55,10 @@ impl PortFwState {
         use_ip: UnicastIpAddr,
         use_port: NonZero<u16>,
         rule: Weak<PortFwEntry>,
-        status: AtomicPortFwFlowStatus,
+        status: AtomicNatFlowStatus,
     ) -> Self {
         Self {
-            action: PortFwAction::DstNat,
+            action: NatAction::DstNat,
             status,
             use_ip,
             use_port,
@@ -70,7 +66,7 @@ impl PortFwState {
         }
     }
     #[must_use]
-    pub fn action(&self) -> PortFwAction {
+    pub fn action(&self) -> NatAction {
         self.action
     }
     #[must_use]
@@ -87,20 +83,11 @@ impl PortFwState {
     }
 }
 
-impl Display for PortFwAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PortFwAction::DstNat => write!(f, "dnat"),
-            PortFwAction::SrcNat => write!(f, "snat"),
-        }
-    }
-}
-
 impl Display for PortFwState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let dir = match self.action {
-            PortFwAction::DstNat => "to",
-            PortFwAction::SrcNat => "from",
+            NatAction::DstNat => "to",
+            NatAction::SrcNat => "from",
         };
         write!(f, "\n        {}", self.action)?;
         writeln!(f, " {dir} ip:{} port:{}", self.use_ip, self.use_port)?;
@@ -143,9 +130,9 @@ pub(crate) fn setup_forward_flow(
     entry: &Arc<PortFwEntry>,
     new_dst_ip: UnicastIpAddr,
     new_dst_port: NonZero<u16>,
-) -> AtomicPortFwFlowStatus {
+) -> AtomicNatFlowStatus {
     // build port forwarding state for the forward flow
-    let status = AtomicPortFwFlowStatus::new();
+    let status = AtomicNatFlowStatus::new();
     let port_fw_state = PortFwState::new_dnat(
         new_dst_ip,
         new_dst_port,
@@ -154,11 +141,10 @@ pub(crate) fn setup_forward_flow(
     );
 
     // set the port forwarding state in the flow
-    if let Ok(mut write_guard) = forward_flow.locked.write() {
+    {
+        let mut write_guard = forward_flow.locked.write();
         write_guard.port_fw_state = Some(Box::new(port_fw_state));
         write_guard.dst_vpcd = Some(entry.dst_vpcd);
-    } else {
-        unreachable!()
     }
     debug!("Set up FORWARD flow for port-forwarding;\nkey={flow_key}\ninfo={forward_flow}");
     status
@@ -170,17 +156,16 @@ pub(crate) fn setup_reverse_flow(
     entry: &Arc<PortFwEntry>,
     dst_ip: UnicastIpAddr,
     dst_port: NonZero<u16>,
-    status: AtomicPortFwFlowStatus,
+    status: AtomicNatFlowStatus,
 ) {
     // build port forwarding state for the REVERSE flow
     let port_fw_state = PortFwState::new_snat(dst_ip, dst_port, Arc::downgrade(entry), status);
 
     // set the port forwarding state in the flow
-    if let Ok(mut write_guard) = reverse_flow.locked.write() {
+    {
+        let mut write_guard = reverse_flow.locked.write();
         write_guard.port_fw_state = Some(Box::new(port_fw_state));
         write_guard.dst_vpcd = Some(entry.key.src_vpcd());
-    } else {
-        unreachable!()
     }
     debug!("Set up REVERSE flow for port-forwarding;\nkey={reverse_key}\ninfo={reverse_flow}");
 }
@@ -199,11 +184,8 @@ pub(crate) fn get_packet_port_fw_state<Buf: PacketBufferMut>(
         debug!("Packet flow-info is not active (status:{status})");
         return None;
     }
-    let Ok(flow_info_locked) = flow.locked.read() else {
-        error!("Packet has flow-info but it could not be locked");
-        return None;
-    };
-    let Some(state) = flow_info_locked
+    let guard = flow.locked.read();
+    let Some(state) = guard
         .port_fw_state
         .as_ref()
         .and_then(|s| s.extract_ref::<PortFwState>())
@@ -213,13 +195,6 @@ pub(crate) fn get_packet_port_fw_state<Buf: PacketBufferMut>(
     };
     debug!("Packet hit entry with port-forwarding state: {flow}");
     Some(state.clone())
-}
-
-/// Invalidate the flow that this packet matched and the related one if any.
-pub(crate) fn invalidate_flow_state<Buf: PacketBufferMut>(packet: &Packet<Buf>) {
-    if let Some(flow_info) = packet.meta().flow_info.as_ref() {
-        flow_info.invalidate_pair();
-    }
 }
 
 /// Update the port-forwarding state of a flow entry after processing a packet.
@@ -252,8 +227,8 @@ pub(crate) fn refresh_port_fw_entry<Buf: PacketBufferMut>(
     // compute new timeout for the flow. In case of TCP, if the connection was reset or closed,
     // invalidate the flows in both directions. In either case, the packet is let through.
     let extend_by = match new_status {
-        PortFwFlowStatus::Established => entry.estab_timeout(),
-        PortFwFlowStatus::Closed | PortFwFlowStatus::Reset => return invalidate_flow_state(packet),
+        NatFlowStatus::Established => entry.estab_timeout(),
+        NatFlowStatus::Closed | NatFlowStatus::Reset => return packet.invalidate_flows(),
         _ => entry.init_timeout(),
     };
 
@@ -266,7 +241,7 @@ pub(crate) fn refresh_port_fw_entry<Buf: PacketBufferMut>(
         }
 
         // .. except if we transition to established, as that is a sound indication of legit traffic
-        if new_status == PortFwFlowStatus::Established && new_status != current_status {
+        if new_status == NatFlowStatus::Established && new_status != current_status {
             flow.related
                 .as_ref()
                 .and_then(Weak::upgrade)

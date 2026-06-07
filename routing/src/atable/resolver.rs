@@ -3,11 +3,11 @@
 
 //! Module to resolve ARP from the /proc. This module only supports ARP (IPv4)
 
+use concurrency::sync::Arc;
+use concurrency::sync::atomic::{AtomicBool, Ordering};
+use concurrency::thread;
+use concurrency::thread::JoinHandle;
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use netdev::Interface;
@@ -167,6 +167,10 @@ pub mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        emulated,
+        ignore = "reads /proc/net/arp and queries kernel interfaces, neither available under miri and not reliable under qemu"
+    )]
     fn test_adjacency_resolver() {
         let (mut resolver, atabler) = AtResolver::new(true);
         resolver.start(1);

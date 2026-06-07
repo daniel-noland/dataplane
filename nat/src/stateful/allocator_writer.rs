@@ -1,63 +1,111 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Open Network Fabric Authors
 
-use crate::stateful::NatDefaultAllocator;
-use arc_swap::ArcSwapOption;
-use config::ConfigError;
-use config::external::overlay::vpc::Peering;
-use config::external::overlay::vpc::VpcTable;
+use crate::stateful::apalloc::NatAllocator;
+use concurrency::slot::SlotOption;
+use concurrency::sync::Arc;
+use config::GenId;
+use config::external::overlay::vpc::{ValidatedPeering, ValidatedVpcTable};
+use config::external::overlay::vpcpeering::ValidatedExpose;
+use flow_entry::flow_table::FlowTable;
 use net::packet::VpcDiscriminant;
-use std::sync::Arc;
 use tracing::debug;
 
-#[derive(Debug, PartialEq)]
+use crate::stateful::flows::check_masquerading_flows;
+use crate::stateful::flows::invalidate_all_masquerading_flows;
+use crate::stateful::flows::upgrade_all_masquerading_flows;
+
+#[derive(Debug, PartialEq, Clone)]
 pub(crate) struct StatefulNatPeering {
-    pub(crate) src_vpc_id: VpcDiscriminant,
-    pub(crate) dst_vpc_id: VpcDiscriminant,
-    pub(crate) peering: Peering,
+    pub(crate) src_vpcd: VpcDiscriminant,
+    pub(crate) dst_vpcd: VpcDiscriminant,
+    pub(crate) peering: ValidatedPeering,
+}
+#[derive(Debug, Default, Clone)]
+pub struct StatefulNatConfig {
+    genid: GenId,
+    peerings: Vec<StatefulNatPeering>,
+    randomize: bool,
+}
+impl PartialEq for StatefulNatConfig {
+    fn eq(&self, other: &Self) -> bool {
+        // we exclude genid from comparison
+        self.peerings == other.peerings && self.randomize == other.randomize
+    }
 }
 
-#[derive(Debug, Default, PartialEq)]
-pub(crate) struct StatefulNatConfig(Vec<StatefulNatPeering>);
-
 impl StatefulNatConfig {
-    pub(crate) fn new(vpc_table: &VpcTable) -> Self {
-        let mut config = Vec::new();
+    #[must_use]
+    pub fn new(vpc_table: &ValidatedVpcTable, genid: GenId) -> Self {
+        let mut peerings = Vec::new();
         for vpc in vpc_table.values() {
-            for peering in &vpc.peerings {
-                config.push(StatefulNatPeering {
-                    src_vpc_id: VpcDiscriminant::from_vni(vpc.vni),
-                    dst_vpc_id: VpcDiscriminant::from_vni(vpc_table.get_remote_vni(peering)),
+            for peering in vpc.local_stateful_nat_peerings() {
+                peerings.push(StatefulNatPeering {
+                    src_vpcd: VpcDiscriminant::from_vni(vpc.vni()),
+                    dst_vpcd: VpcDiscriminant::from_vni(vpc_table.get_remote_vni(peering)),
                     peering: peering.clone(),
                 });
             }
         }
-        Self(config)
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &StatefulNatPeering> {
-        self.0.iter()
-    }
-}
-
-#[derive(Debug)]
-pub struct NatAllocatorWriter {
-    config: StatefulNatConfig,
-    allocator: Arc<ArcSwapOption<NatDefaultAllocator>>,
-}
-
-impl NatAllocatorWriter {
-    #[must_use]
-    pub fn new() -> Self {
         Self {
-            config: StatefulNatConfig::default(),
-            allocator: Arc::new(ArcSwapOption::new(None)),
+            genid,
+            peerings,
+            randomize: true, // randomize by default
         }
     }
 
     #[must_use]
+    pub fn genid(&self) -> GenId {
+        self.genid
+    }
+
+    #[must_use]
+    pub fn set_randomize(mut self, value: bool) -> Self {
+        self.randomize = value;
+        self
+    }
+
+    #[must_use]
+    pub fn randomize(&self) -> bool {
+        self.randomize
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &StatefulNatPeering> {
+        self.peerings.iter()
+    }
+
+    pub(crate) fn has_masquerading_peerings(&self) -> bool {
+        self.peerings.iter().map(|p| &p.peering).any(|p| {
+            p.local()
+                .valexp()
+                .iter()
+                .any(ValidatedExpose::has_stateful_nat)
+        })
+    }
+
+    pub(crate) fn get_peering(
+        &self,
+        src_vpcd: VpcDiscriminant,
+        dst_vpcd: VpcDiscriminant,
+    ) -> Option<&StatefulNatPeering> {
+        self.peerings
+            .iter()
+            .find(|p| p.src_vpcd == src_vpcd && p.dst_vpcd == dst_vpcd)
+    }
+}
+
+#[derive(Debug)]
+pub struct NatAllocatorWriter(Arc<SlotOption<NatAllocator>>);
+
+impl NatAllocatorWriter {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(SlotOption::empty()))
+    }
+
+    #[must_use]
     pub fn get_reader(&self) -> NatAllocatorReader {
-        NatAllocatorReader(self.allocator.clone())
+        NatAllocatorReader(self.0.clone())
     }
 
     #[must_use]
@@ -65,80 +113,47 @@ impl NatAllocatorWriter {
         self.get_reader().factory()
     }
 
-    fn update_allocator_and_set_randomness(
-        &mut self,
-        vpc_table: &VpcTable,
-        #[allow(unused_variables)] disable_randomness: bool,
-    ) -> Result<(), ConfigError> {
-        let new_config = StatefulNatConfig::new(vpc_table);
+    /// Replace the nat allocator with a new one for the new config. If the config is such that
+    /// no masquerading is needed no allocator will be stored and the existing one, if any, be
+    /// removed. Flows using that allocator will be cancelled. If, instead, a new, distinct
+    /// masquerading config is provided, a new allocator will be installed and the flows using the
+    /// previous one be either invalidated or adapted to use the new allocator: their ports/ips
+    /// will be transferred (reserved) in the new allocator.
+    pub fn update_nat_allocator(&mut self, nat_config: StatefulNatConfig, flow_table: &FlowTable) {
+        let genid = nat_config.genid();
+        let curr_allocator = self.0.load_full();
 
-        let old_allocator_guard = self.allocator.load();
-        let Some(old_allocator) = old_allocator_guard.as_deref() else {
-            // No existing allocator, build a new one
-            #[cfg(test)]
-            let new_allocator =
-                Self::build_new_allocator(&new_config)?.set_disable_randomness(disable_randomness);
-            #[cfg(not(test))]
-            let new_allocator = Self::build_new_allocator(&new_config)?;
-
-            self.allocator.store(Some(Arc::new(new_allocator)));
-            self.config = new_config;
-            return Ok(());
-        };
-
-        if self.config == new_config {
-            // Nothing to update, simply return
-            return Ok(());
+        // keep state as-is if config did not change, and just upgrade flows
+        if let Some(current) = curr_allocator.as_ref()
+            && current.config() == &nat_config
+        {
+            debug!("No need to update NAT allocator: NAT peerings did not change");
+            upgrade_all_masquerading_flows(flow_table, genid);
+            return;
         }
 
-        let new_allocator =
-            Self::update_existing_allocator(old_allocator, &self.config, &new_config)?;
-        // Swap allocators; the old one is dropped.
-        self.allocator.store(Some(Arc::new(new_allocator)));
-        self.config = new_config;
-        debug!("Updated allocator for stateful NAT");
-        Ok(())
-    }
+        // if we transition to a config without masquerading, flush allocator and remove all flows
+        if !nat_config.has_masquerading_peerings() {
+            if curr_allocator.is_some() {
+                debug!("No stateful NAT is required anymore: will invalidate flows");
+                self.0.store(None);
+                invalidate_all_masquerading_flows(flow_table);
+            }
+            return;
+        }
 
-    pub fn update_allocator(&mut self, vpc_table: &VpcTable) -> Result<(), ConfigError> {
-        self.update_allocator_and_set_randomness(vpc_table, false)
-    }
-
-    #[cfg(test)]
-    pub fn update_allocator_and_turn_off_randomness(
-        &mut self,
-        vpc_table: &VpcTable,
-    ) -> Result<(), ConfigError> {
-        self.update_allocator_and_set_randomness(vpc_table, true)
-    }
-
-    fn build_new_allocator(config: &StatefulNatConfig) -> Result<NatDefaultAllocator, ConfigError> {
-        NatDefaultAllocator::build_nat_allocator(config)
-    }
-
-    fn update_existing_allocator(
-        _allocator: &NatDefaultAllocator,
-        _old_config: &StatefulNatConfig,
-        new_config: &StatefulNatConfig,
-    ) -> Result<NatDefaultAllocator, ConfigError> {
-        // TODO: Report state from old allocator to new allocator
-        //
-        // This means reporting all allocated IPs (and ports for these IPs) from the old allocator
-        // that remain valid in the new configuration to the new allocator (and discard the ones
-        // that are now invalid). This is required if we want to keep existing, valid connections open.
-        //
-        // It is not trivial to do, though, because it's difficult to do a meaningful "diff" between
-        // the two configurations or allocators' internal states. One allocated IP from the old
-        // allocator may still be available for NAT with the new configuration, but possibly for a
-        // different list of original prefixes. We can even have connections using some ports for a
-        // given allocated IP remaining valid, while others using other ports for the same IP become
-        // invalid.
-        //
-        // One "option" is to process all entries in the session table, look at the new
-        // configuration (or the new allocator entries) to see if they're still valid, and then
-        // report them to the new allocator. However, the old allocator keeps being updated during
-        // this process.
-        Self::build_new_allocator(new_config)
+        let mut allocator = NatAllocator::new(nat_config);
+        if curr_allocator.is_some() {
+            let guard = check_masquerading_flows(flow_table, &mut allocator);
+            debug!("Replacing stateful NAT allocator...");
+            self.0.store(Some(Arc::new(allocator)));
+            debug!("NAT allocator has been replaced");
+            drop(guard);
+        } else {
+            debug!("Installing new stateful NAT allocator...");
+            self.0.store(Some(Arc::new(allocator)));
+            debug!("NAT allocator is installed");
+        }
     }
 }
 
@@ -149,17 +164,17 @@ impl Default for NatAllocatorWriter {
 }
 
 #[derive(Debug, Clone)]
-pub struct NatAllocatorReader(Arc<ArcSwapOption<NatDefaultAllocator>>);
+pub struct NatAllocatorReader(Arc<SlotOption<NatAllocator>>);
 
 impl NatAllocatorReader {
-    pub fn get(&self) -> Option<Arc<NatDefaultAllocator>> {
-        self.0.load().clone()
+    pub fn get(&self) -> Option<Arc<NatAllocator>> {
+        self.0.load_full()
     }
     #[must_use]
     pub fn factory(&self) -> NatAllocatorReaderFactory {
         NatAllocatorReaderFactory(self.clone())
     }
-    pub fn inner(&self) -> Arc<ArcSwapOption<NatDefaultAllocator>> {
+    pub fn inner(&self) -> Arc<SlotOption<NatAllocator>> {
         self.0.clone()
     }
 }

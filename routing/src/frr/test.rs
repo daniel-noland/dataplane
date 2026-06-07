@@ -130,8 +130,12 @@ pub mod tests {
     use tokio::sync::RwLock;
     use tracing_test::traced_test;
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[tokio::test]
+    #[cfg_attr(
+        emulated,
+        ignore = "binds Unix domain sockets; miri has no UDS, qemu-user has flaky epoll readiness"
+    )]
     async fn test_fake_frr_agent() {
         let dp_status: Arc<RwLock<DataplaneStatus>> = Arc::new(RwLock::new(DataplaneStatus::new()));
 
@@ -145,7 +149,12 @@ pub mod tests {
             .expect("Should succeed due to defaults");
 
         /* start router */
-        let mut router = Router::new(router_params, None).unwrap();
+        let mgmt = lifecycle::Subsystem::new("mgmt", lifecycle::CancellationToken::new());
+        let router_subsystem =
+            lifecycle::Subsystem::new("router", lifecycle::CancellationToken::new());
+        let handle = tokio::runtime::Handle::current();
+        let mut router =
+            Router::new(&mgmt, &handle, &router_subsystem, router_params, None).unwrap();
         let mut ctl = router.get_ctl_tx();
 
         /* start fake frr agent */

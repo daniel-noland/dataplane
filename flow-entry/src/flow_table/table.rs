@@ -2,21 +2,21 @@
 // Copyright Open Network Fabric Authors
 
 use ahash::RandomState;
+use concurrency::sync::atomic::{AtomicUsize, Ordering};
+use concurrency::sync::{Arc, RwLock, RwLockReadGuard, Weak};
 use dashmap::DashMap;
 use net::FlowKey;
-use std::fmt::Debug;
-use std::hash::Hash;
-use std::{borrow::Borrow, time::Duration};
-use tracing::debug;
-
-use concurrency::sync::{Arc, RwLock};
-
 use net::flows::{FlowInfo, FlowStatus};
+use std::borrow::Borrow;
+use std::fmt::{Debug, Display};
+use std::hash::Hash;
+use std::time::Duration;
+use tracing::debug;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FlowTableError {
-    #[error("Invalid number of shards: {0}. Must be a power of two.")]
-    InvalidShardCount(usize),
+    #[error("Flow table capacity exceeded")]
+    CapacityExceeded,
 }
 
 type Table = DashMap<FlowKey, Arc<FlowInfo>, RandomState>;
@@ -25,6 +25,7 @@ type Table = DashMap<FlowKey, Arc<FlowInfo>, RandomState>;
 pub struct FlowTable {
     // TODO(mvachhar) move this to a cross beam sharded lock
     pub(crate) table: Arc<RwLock<Table>>,
+    capacity: AtomicUsize,
 }
 
 impl Default for FlowTable {
@@ -34,12 +35,30 @@ impl Default for FlowTable {
 }
 
 fn hasher_state() -> &'static RandomState {
-    use std::sync::OnceLock;
+    use concurrency::sync::OnceLock;
     static HASHER_STATE: OnceLock<RandomState> = OnceLock::new();
     HASHER_STATE.get_or_init(|| RandomState::with_seeds(0, 0, 0, 0))
 }
 
+/// A read guard to the `FlowTable`. While a guard like this one exists, other threads
+/// attempting insertions in the corresponding `FlowTable` will wait. This guard is
+/// returned by some methods that iterate over the `FlowTable` as a knob to allow callers
+/// to block the table from insertions, without exposing the internal types
+pub struct FlowTableReadGuard<'a>(
+    #[allow(unused)] RwLockReadGuard<'a, DashMap<FlowKey, Arc<FlowInfo>, RandomState>>,
+);
+impl Drop for FlowTableReadGuard<'_> {
+    fn drop(&mut self) {
+        debug!("Dropping flow-table read lock");
+    }
+}
+
 impl FlowTable {
+    /// Default capacity for the flow table: 10M.
+    ///
+    /// Use [`FlowTable::set_capacity`] to enforce a hard limit.
+    pub const DEFAULT_CAPACITY: usize = 10_000_000;
+
     #[must_use]
     pub fn new(num_shards: usize) -> Self {
         Self {
@@ -47,7 +66,16 @@ impl FlowTable {
                 hasher_state().clone(),
                 num_shards,
             ))),
+            capacity: AtomicUsize::new(Self::DEFAULT_CAPACITY),
         }
+    }
+
+    /// Set the hard capacity limit for the flow table.
+    ///
+    /// When the table reaches this limit, new flow insertions will fail with
+    /// [`FlowTableError::CapacityExceeded`] after one drain attempt.
+    pub fn set_capacity(&self, capacity: usize) {
+        self.capacity.store(capacity, Ordering::Relaxed);
     }
 
     /// Reshard the flow table into the given number of shards.
@@ -58,18 +86,19 @@ impl FlowTable {
     ///
     /// # Panics
     ///
-    /// Panics if this thread already holds the read lock on the table or
-    /// if the table lock is poisoned.
-    pub fn reshard(&self, num_shards: usize) -> Result<(), FlowTableError> {
-        if !num_shards.is_power_of_two() {
-            return Err(FlowTableError::InvalidShardCount(num_shards));
-        }
+    /// Panics if this thread already holds the read lock on the table,
+    /// or if the new number of shards is not a power of 2.
+    pub fn reshard(&self, num_shards: usize) {
+        assert!(
+            num_shards.is_power_of_two(),
+            "Shard number must be a power of 2!"
+        );
         debug!(
             "reshard: Resharding flow table from {} shards into {} shards",
-            self.table.read().unwrap().shards().len(),
+            self.table.read().shards().len(),
             num_shards
         );
-        let mut locked_table = self.table.write().unwrap();
+        let mut locked_table = self.table.write();
         let new_table =
             DashMap::with_hasher_and_shard_amount(locked_table.hasher().clone(), num_shards);
         let old_table = std::mem::replace(&mut *locked_table, new_table);
@@ -82,7 +111,6 @@ impl FlowTable {
                 locked_table.insert(k, v.into_inner());
             }
         }
-        Ok(())
     }
 
     /// Add a flow to the table.
@@ -93,27 +121,14 @@ impl FlowTable {
     ///
     /// # Panics
     ///
-    /// Panics if:
-    ///  - this thread already holds the read lock on the table orif the table lock is poisoned.
-    ///  - if the `flow_info` to insert has a key different from `flow_key`
+    /// Panics if this thread already holds the read lock on the table.
     ///
-    pub fn insert(&self, flow_key: FlowKey, mut flow_info: FlowInfo) -> Option<Arc<FlowInfo>> {
-        // if the flow_info embeds its key already, it must match `flow_key`
-        flow_info.flowkey().inspect(|key| {
-            assert_eq!(
-                *key, &flow_key,
-                "Attempted to insert a flow with key: {key} with a distinct key: {flow_key}"
-            );
-        });
-
-        // embed the key in the flow if it did not provide one
-        if flow_info.flowkey().is_none() {
-            flow_info.set_flowkey(flow_key);
-        }
-
-        debug!("insert: Inserting flow {flow_key}");
+    /// # Errors
+    ///
+    /// Returns [`FlowTableError::CapacityExceeded`] when the table has reached its hard limit.
+    pub fn insert(&self, flow_info: FlowInfo) -> Result<Option<Arc<FlowInfo>>, FlowTableError> {
         let val = Arc::new(flow_info);
-        self.insert_common(flow_key, &val)
+        self.insert_common(&val)
     }
 
     /// Add a flow entry to the table from a `&Arc<FlowInfo>`
@@ -124,40 +139,16 @@ impl FlowTable {
     ///
     /// # Panics
     ///
-    /// Panics if:
-    ///   - this thread already holds the read lock on the table or if the table lock is poisoned.
-    ///   - if the `flow_info` to insert has a key different from `flow_key`
+    /// Panics if this thread already holds the read lock on the table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlowTableError::CapacityExceeded`] when the table has reached its hard limit.
     pub fn insert_from_arc(
         &self,
-        flow_key: FlowKey,
         flow_info: &Arc<FlowInfo>,
-    ) -> Option<Arc<FlowInfo>> {
-        flow_info.flowkey().inspect(|key| {
-            assert_eq!(
-                *key, &flow_key,
-                "Attempted to insert a flow with key: {key} with a distinct key: {flow_key}"
-            );
-        });
-        debug!("insert: Inserting flow {flow_key}");
-        self.insert_common(flow_key, flow_info)
-    }
-
-    /// Add a flow to the table via an Arc
-    ///
-    /// This is intended to re-add a flow to the flow table via the Arc returned from
-    /// lookup, but it can be used with a fresh Arc as well.
-    ///
-    /// # Returns
-    ///
-    /// Returns the old `Arc<FlowInfo>` associated with the flow key, if any.
-    ///
-    /// # Panics
-    ///
-    /// Panics if this thread already holds the read lock on the table or
-    /// if the table lock is poisoned.
-    pub fn reinsert(&self, flow_key: FlowKey, flow_info: &Arc<FlowInfo>) -> Option<Arc<FlowInfo>> {
-        debug!("reinsert: Re-inserting flow key {flow_key}");
-        self.insert_common(flow_key, flow_info)
+    ) -> Result<Option<Arc<FlowInfo>>, FlowTableError> {
+        self.insert_common(flow_info)
     }
 
     /// Start a timer task for a flow
@@ -165,7 +156,7 @@ impl FlowTable {
     fn start_timer(table: Arc<RwLock<Table>>, flow_info: Arc<FlowInfo>) {
         tokio::task::spawn(async move {
             let table = table;
-            let flow_key = flow_info.flowkey().unwrap_or_else(|| unreachable!()); // flows have key when inserted
+            let flow_key = flow_info.flowkey();
             let mut deadline = flow_info.expires_at();
             loop {
                 tokio::select! {
@@ -200,59 +191,101 @@ impl FlowTable {
             // We use remove_if + ptr_eq so that a concurrently-inserted replacement is left intact
             // and try_read() instead of read() so as not to block
             loop {
-                let result = table.try_read();
-                match result {
-                    Ok(table) => {
-                        let res = table.remove_if(flow_key, |_, v| Arc::ptr_eq(v, &flow_info));
-                        if res.is_none() {
-                            debug!("Flow-timer: Unable to remove flow {flow_key}: not found");
-                        }
-                        return;
+                if let Some(table) = table.try_read() {
+                    let res = table.remove_if(flow_key, |_, v| Arc::ptr_eq(v, &flow_info));
+                    if res.is_none() {
+                        debug!("Flow-timer: Unable to remove flow {flow_key}: not found");
                     }
-                    Err(std::sync::TryLockError::WouldBlock) => {
-                        // let other work get done while we wait. We need to drop the result first
-                        drop(result);
-                        debug!("Flow-timer: Waiting for table read access");
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    Err(std::sync::TryLockError::Poisoned(p)) => {
-                        debug!("Flow-timer: FlowTable RwLock poisoned!");
-                        return;
-                    }
+                    return;
                 }
+                // Outer write lock is only held during reshard, which is rare and brief; we still
+                // want a bounded backoff rather than `yield_now()` so a write-locker contending
+                // with this task can't cause it to spin a tokio worker.
+                debug!("Flow-timer: Waiting for table read access");
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         });
     }
 
-    fn insert_common(&self, flow_key: FlowKey, val: &Arc<FlowInfo>) -> Option<Arc<FlowInfo>> {
-        val.update_status(FlowStatus::Active);
-        let table = self.table.read().unwrap();
-        let result = table.insert(flow_key, val.clone());
+    fn insert_common(&self, val: &Arc<FlowInfo>) -> Result<Option<Arc<FlowInfo>>, FlowTableError> {
+        let table = self.table.read();
+        let capacity = self.capacity.load(Ordering::Relaxed);
+        let flow_key = val.flowkey();
+        debug!("insert: inserting flow {flow_key}");
 
-        #[cfg(not(feature = "shuttle"))]
+        // Reject new flows when at capacity.  Exception: always admit the second half of a
+        // related pair (e.g. the reverse NAT flow) to avoid leaving a one-sided entry.
+        if table.len() >= capacity {
+            let has_related_in_table = val
+                .related
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|rel| rel.is_active());
+
+            if !has_related_in_table {
+                return Err(FlowTableError::CapacityExceeded);
+            }
+        }
+
+        let result = table.insert(*flow_key, val.clone());
+        // Set Active only after the insert so that the invariant holds: Active iff in the
+        // table.  The narrow window where the entry is in the DashMap but not yet Active is
+        // harmless: drain_stale's stale condition is (status != Active || expires_at <= now),
+        // and a freshly inserted flow always has expires_at in the future.
+        val.update_status(FlowStatus::Active);
+        drop(table);
+
+        #[cfg(not(any(feature = "shuttle", feature = "loom")))]
         Self::start_timer(self.table.clone(), val.clone());
 
         if let Some(old) = result.as_ref() {
             old.update_status(FlowStatus::Detached);
-            #[cfg(not(feature = "shuttle"))]
             old.token.cancel();
         }
-        result
+
+        let Some(ret) = result else {
+            return Ok(None);
+        };
+
+        if ret.status() == FlowStatus::Expired {
+            return Ok(None);
+        }
+
+        Ok(Some(ret))
+    }
+
+    /// Drain all stale (Expired / Cancelled / deadline-passed Active) entries from the table.
+    ///
+    /// Returns the number of entries removed.
+    pub fn drain_stale(&self) -> usize {
+        let table = self.table.read();
+        let now = std::time::Instant::now();
+        let mut count = 0usize;
+        table.retain(|_, v| {
+            let status = v.status();
+            let stale = status != FlowStatus::Active || v.expires_at() <= now;
+            if stale {
+                v.update_status(FlowStatus::Expired);
+                v.token.cancel();
+                count += 1;
+            }
+            !stale
+        });
+        count
     }
 
     /// Lookup a flow in the table.
     ///
     /// # Panics
     ///
-    /// Panics if this thread already holds the read lock on the table or
-    /// if the table lock is poisoned.
+    /// Panics if this thread already holds the read lock on the table.
     pub fn lookup<Q>(&self, flow_key: &Q) -> Option<Arc<FlowInfo>>
     where
         FlowKey: Borrow<Q>,
-        Q: Hash + Eq + ?Sized + Debug,
+        Q: Hash + Eq + ?Sized + Debug + Display,
     {
-        debug!("lookup: Looking up flow key {:?}", flow_key);
-        let table = self.table.read().unwrap();
+        debug!("lookup: Looking up flow key {flow_key}");
+        let table = self.table.read();
         Some(table.get(flow_key)?.value().clone())
     }
 
@@ -260,19 +293,17 @@ impl FlowTable {
     ///
     /// # Panics
     ///
-    /// Panics if this thread already holds the read lock on the table or
-    /// if the table lock is poisoned.
+    /// Panics if this thread already holds the read lock on the table.
     pub fn remove<Q>(&self, flow_key: &Q) -> Option<(FlowKey, Arc<FlowInfo>)>
     where
         FlowKey: Borrow<Q>,
-        Q: Hash + Eq + ?Sized + Debug,
+        Q: Hash + Eq + ?Sized + Debug + Display,
     {
-        debug!("remove: Removing flow key {:?}", flow_key);
-        let table = self.table.read().unwrap();
+        debug!("remove: Removing flow key {flow_key}");
+        let table = self.table.read();
         let result = table.remove(flow_key);
         if let Some((_key, flow_info)) = result.as_ref() {
             flow_info.update_status(FlowStatus::Detached);
-            #[cfg(not(feature = "shuttle"))]
             flow_info.token.cancel();
         }
         result
@@ -283,7 +314,7 @@ impl FlowTable {
     /// their expiration status.  This is mostly for testing.
     #[must_use]
     pub fn len(&self) -> Option<usize> {
-        let table = self.table.try_read().ok()?;
+        let table = self.table.try_read()?;
         Some(table.len())
     }
 
@@ -291,13 +322,93 @@ impl FlowTable {
     /// This is mostly for testing.
     #[must_use]
     pub fn active_len(&self) -> Option<usize> {
-        let table = self.table.try_read().ok()?;
+        let table = self.table.try_read()?;
         Some(
             table
                 .iter()
                 .filter(|e| e.value().status() == FlowStatus::Active)
                 .count(),
         )
+    }
+
+    /// Execute a function for each flow in the table. This locks the table for reading.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if locking the table for reading fails
+    pub fn for_each_flow<F>(&self, mut func: F) -> FlowTableReadGuard<'_>
+    where
+        F: FnMut(&FlowKey, &FlowInfo),
+    {
+        let guard = self.table.read();
+        for flow in guard.iter() {
+            func(flow.key(), &flow);
+        }
+        FlowTableReadGuard(guard)
+    }
+
+    /// Same as `for_each_flow`, but allowing a filter to iterate only over the flows that match a predicate
+    ///
+    /// # Panics
+    ///
+    /// This function panics if locking the table for reading fails
+    pub fn for_each_flow_filtered<F, P>(&self, filter: P, mut func: F) -> FlowTableReadGuard<'_>
+    where
+        F: FnMut(&FlowKey, &FlowInfo),
+        P: Fn(&FlowKey, &FlowInfo) -> bool,
+    {
+        let guard = self.table.read();
+        for flow in guard.iter().filter(|flow| filter(flow.key(), flow)) {
+            func(flow.key(), &flow);
+        }
+        FlowTableReadGuard(guard)
+    }
+
+    /// Build an iterator of all flows in the table. Depending on how costly the processing of `f` in `for_each_flow`
+    /// is, taking a snapshot first may be faster. This is just possible because flow-info's are stored in 'Arc's.
+    /// There is little to no advantage of returning an iterator here because this method allocates anyway.
+    /// The snapshot can be restricted with the filter.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if locking the table for reading fails
+    pub fn snapshot<P>(&self, filter: P) -> impl Iterator<Item = Arc<FlowInfo>>
+    where
+        P: Fn(&FlowKey, &FlowInfo) -> bool,
+    {
+        let table = self.table.read();
+        let v: Vec<_> = table
+            .iter()
+            .filter(|flow| filter(flow.key(), flow))
+            .map(|f| f.value().clone())
+            .collect();
+
+        v.into_iter()
+    }
+
+    /// FIXME: this does not provide any advantage
+    /// Need to interleave `reads()` with periods where we release lock/guard
+    /// I.e. need to chunk it
+    /// # Panics
+    ///
+    /// This function panics if locking the table for reading fails
+    pub fn for_each_flow_sharded<F>(&self, f: F)
+    where
+        F: Fn(&FlowKey, &FlowInfo),
+    {
+        let table = self.table.read();
+        for shard in table.shards() {
+            let g = shard.read();
+            unsafe {
+                for (flowkey, flow_info) in g
+                    .iter()
+                    .map(|bucket| bucket.as_ref())
+                    .map(|(key, val)| (key, val.get().as_ref()))
+                {
+                    f(flowkey, flow_info);
+                }
+            }
+        }
     }
 }
 
@@ -338,16 +449,22 @@ mod tests {
                 }),
             ));
 
-            let flow_info = FlowInfo::new(five_seconds_from_now);
+            let flow_info = FlowInfo::new(flow_key, five_seconds_from_now);
 
-            flow_table.insert(flow_key, flow_info);
+            flow_table.insert(flow_info).unwrap();
             let result = flow_table.remove(&flow_key).unwrap();
-            assert!(result.0 == flow_key);
+            assert_eq!(result.0, flow_key);
         }
 
-        #[tokio::test]
+        // start_paused so the timer task's sleep_until and the test's sleeps share tokio's
+        // virtual clock; otherwise miri's slow interpretation can drift the wall clock far
+        // enough between Instant::now() and the first sleep that the deadline elapses early.
+        // Anchor `now` on the virtual clock too -- a std::Instant::now() here would be many
+        // real-time seconds past the paused baseline under miri, putting the deadline beyond
+        // any virtual-time advance the test performs.
+        #[tokio::test(start_paused = true)]
         async fn test_flow_table_timeout() {
-            let now = Instant::now();
+            let now = tokio::time::Instant::now().into_std();
             let two_seconds = Duration::from_secs(2);
             let one_second = Duration::from_secs(1);
 
@@ -362,8 +479,8 @@ mod tests {
                 }),
             ));
 
-            let flow_info = FlowInfo::new(now + two_seconds);
-            flow_table.insert(flow_key, flow_info);
+            let flow_info = FlowInfo::new(flow_key, now + two_seconds);
+            flow_table.insert(flow_info).unwrap();
 
             // Wait 1 second — flow not yet expired, lookup should return Some.
             tokio::time::sleep(one_second).await;
@@ -395,12 +512,12 @@ mod tests {
             ));
 
             // Insert first entry.
-            let first_arc = Arc::new(FlowInfo::new(first_expiry_time));
-            flow_table.insert_from_arc(flow_key, &first_arc);
+            let first_arc = Arc::new(FlowInfo::new(flow_key, first_expiry_time));
+            flow_table.insert_from_arc(&first_arc).unwrap();
 
             // The entry stored in the table should be the first arc.
             {
-                let table = flow_table.table.read().unwrap();
+                let table = flow_table.table.read();
                 let entry = table
                     .get(&flow_key)
                     .expect("entry should exist after first insert");
@@ -408,45 +525,58 @@ mod tests {
             }
 
             // Insert a second entry under the same key.
-            let second_arc = Arc::new(FlowInfo::new(second_expiry_time));
-            flow_table.insert_from_arc(flow_key, &second_arc);
+            let second_arc = Arc::new(FlowInfo::new(flow_key, second_expiry_time));
+            flow_table.insert_from_arc(&second_arc).unwrap();
 
             // The table should now point to the second entry.
             {
-                let table = flow_table.table.read().unwrap();
+                let table = flow_table.table.read();
                 let entry = table
                     .get(&flow_key)
                     .expect("entry should exist after second insert");
                 assert_ne!(entry.value().expires_at(), first_expiry_time);
+
                 assert_eq!(entry.value().expires_at(), second_expiry_time);
             }
         }
 
         #[tokio::test]
         async fn test_flow_table_remove_bolero() {
-            let flow_table = FlowTable::default();
             bolero::check!()
                 .with_type::<FlowKey>()
+                .cloned()
                 .for_each(|flow_key| {
+                    let flow_table = FlowTable::default();
                     // Use a future expiry so the flow stays active long enough for remove().
-                    flow_table.insert(
-                        *flow_key,
-                        FlowInfo::new(Instant::now() + Duration::from_secs(60)),
-                    );
-                    let flow_info = flow_table.lookup(flow_key).unwrap();
+                    flow_table
+                        .insert(FlowInfo::new(
+                            flow_key,
+                            Instant::now() + Duration::from_mins(1),
+                        ))
+                        .unwrap();
+                    let flow_info = flow_table.lookup(&flow_key).unwrap();
                     assert!(flow_table.lookup(&flow_key.reverse(None)).is_none());
 
-                    let result = flow_table.remove(flow_key);
+                    let result = flow_table.remove(&flow_key);
                     assert!(result.is_some());
                     let (k, v) = result.unwrap();
-                    assert_eq!(k, *flow_key);
+                    assert_eq!(k, flow_key);
                     assert!(Arc::ptr_eq(&v, &flow_info));
-                    assert!(flow_table.lookup(flow_key).is_none());
+                    assert!(flow_table.lookup(&flow_key).is_none());
                 });
         }
 
         #[tokio::test]
-        #[traced_test]
+        #[cfg_attr(not(emulated), traced_test)]
+        // tokio::time::sleep counts wall-clock seconds, so a 4s sleep under miri's slow
+        // interpreter elapses many real-world seconds and the "extended" flow's std::Instant
+        // deadline gets passed too. Fixing this would require running on tokio's paused
+        // clock, but the per-flow timer task uses tokio::time::Instant::from_std on a
+        // wall-clock std deadline; mixing virtual and real instants is messy. Revisit.
+        #[cfg_attr(
+            miri,
+            ignore = "wall-clock sleep + std::Instant deadlines don't survive miri"
+        )]
         /// Test that invalidating flows causes timer to expire and flows to be removed
         async fn test_flow_table_flow_invalidation() {
             const NUM_FLOWS: u16 = 10;
@@ -465,8 +595,8 @@ mod tests {
                         dst_port: TcpPort::new_checked(2048).unwrap(),
                     }),
                 ));
-                let flow_info = FlowInfo::new(deadline);
-                flow_table.insert(flow_key, flow_info);
+                let flow_info = FlowInfo::new(flow_key, deadline);
+                flow_table.insert(flow_info).unwrap();
                 flow_keys.push(flow_key);
             }
             // all flows in table
@@ -490,7 +620,7 @@ mod tests {
         }
 
         #[tokio::test]
-        #[traced_test]
+        #[cfg_attr(not(emulated), traced_test)]
         /// Test that invalidating flows causes timer to expire and flows to be removed
         async fn test_flow_table_flow_reinsertion() {
             let flow_table = FlowTable::default();
@@ -506,11 +636,11 @@ mod tests {
                     dst_port: TcpPort::new_checked(2048).unwrap(),
                 }),
             ));
-            let flow_info = FlowInfo::new(deadline);
-            flow_table.insert(flow_key, flow_info);
+            let flow_info = FlowInfo::new(flow_key, deadline);
+            flow_table.insert(flow_info).unwrap();
 
-            let flow_info = FlowInfo::new(deadline + Duration::from_secs(2));
-            let old = flow_table.insert(flow_key, flow_info);
+            let flow_info = FlowInfo::new(flow_key, deadline + Duration::from_secs(2));
+            let old = flow_table.insert(flow_info).unwrap();
             assert!(old.is_some());
             assert_eq!(old.unwrap().expires_at(), deadline);
             assert_eq!(flow_table.active_len().unwrap(), 1);
@@ -518,59 +648,61 @@ mod tests {
             let () = tokio::time::sleep(Duration::from_secs(5)).await;
             assert_eq!(flow_table.active_len().unwrap(), 0);
         }
+
+        #[tokio::test]
+        async fn test_flow_table_capacity_exceeded() {
+            let flow_table = FlowTable::default();
+            flow_table.set_capacity(2);
+
+            let src_vpcd = VpcDiscriminant::VNI(Vni::new_checked(100).unwrap());
+            let src_ip: IpAddr = "1.2.3.4".parse().unwrap();
+            let dst_ip: IpAddr = "5.6.7.8".parse().unwrap();
+            let far_future = Instant::now() + Duration::from_hours(1);
+
+            // Insert up to the capacity limit — both should succeed.
+            for i in 1u16..=2 {
+                let src_port = TcpPort::new_checked(1000 + i).unwrap();
+                let dst_port = TcpPort::new_checked(80).unwrap();
+                let flow_key = FlowKey::Unidirectional(FlowKeyData::new(
+                    Some(src_vpcd),
+                    src_ip,
+                    dst_ip,
+                    IpProtoKey::Tcp(TcpProtoKey { src_port, dst_port }),
+                ));
+                flow_table
+                    .insert(FlowInfo::new(flow_key, far_future))
+                    .expect("insert under capacity should succeed");
+            }
+
+            // One more insert must fail with CapacityExceeded.
+            let overflow_key = FlowKey::Unidirectional(FlowKeyData::new(
+                Some(src_vpcd),
+                src_ip,
+                dst_ip,
+                IpProtoKey::Tcp(TcpProtoKey {
+                    src_port: TcpPort::new_checked(9999).unwrap(),
+                    dst_port: TcpPort::new_checked(80).unwrap(),
+                }),
+            ));
+            assert!(matches!(
+                flow_table.insert(FlowInfo::new(overflow_key, far_future)),
+                Err(FlowTableError::CapacityExceeded)
+            ));
+        }
     }
 
-    #[concurrency_mode(shuttle)]
-    mod shuttle_tests {
+    // Shuttle-only: timers are bypassed there, and loom cannot clean up DashMap.
+    #[cfg(feature = "shuttle")]
+    mod concurrency_tests {
         use super::*;
         use crate::flow_table::FlowInfo;
         use concurrency::sync::Arc;
         use concurrency::thread;
         use std::time::Instant;
 
-        #[test]
-        fn test_flow_table_timeout() {
-            shuttle::check_random(
-                move || {
-                    let now = Instant::now();
-                    let two_seconds = Duration::from_secs(2);
-
-                    let flow_table = FlowTable::default();
-                    let flow_key = FlowKey::Unidirectional(FlowKeyData::new(
-                        Some(VpcDiscriminant::VNI(Vni::new_checked(42).unwrap())),
-                        "10.0.0.1".parse::<IpAddr>().unwrap(),
-                        "10.0.0.2".parse::<IpAddr>().unwrap(),
-                        IpProtoKey::Tcp(TcpProtoKey {
-                            src_port: TcpPort::new_checked(1234).unwrap(),
-                            dst_port: TcpPort::new_checked(5678).unwrap(),
-                        }),
-                    ));
-
-                    let flow_info = FlowInfo::new(now + two_seconds);
-                    flow_table.insert(flow_key, flow_info);
-
-                    // Flow is active; lookup should return Some.
-                    assert!(
-                        flow_table.lookup(&flow_key).is_some(),
-                        "Flow key should be present"
-                    );
-
-                    // Simulate timer expiration by marking the flow directly.
-                    if let Some(fi) = flow_table.lookup(&flow_key) {
-                        fi.update_status(FlowStatus::Expired);
-                    }
-
-                    // Lookup: will find it because we don't expire without tokio nor do lazy removals
-                    let found = flow_table.lookup(&flow_key).unwrap();
-                    assert_eq!(found.status(), FlowStatus::Expired);
-                },
-                100,
-            );
-        }
-
         #[allow(clippy::too_many_lines)]
-        #[test]
-        #[tracing_test::traced_test]
+        #[concurrency::test]
+        #[cfg_attr(not(emulated), tracing_test::traced_test)]
         fn test_flow_table_concurrent_insert_remove_lookup_expire() {
             const N: usize = 3;
 
@@ -591,169 +723,154 @@ mod tests {
                 })
                 .collect();
 
-            shuttle::check_random(
-                move || {
-                    let flow_table = Arc::new(FlowTable::default());
+            let flow_table = Arc::new(FlowTable::default());
 
-                    let now = Instant::now();
+            let now = Instant::now();
 
-                    let orig_flow_info = FlowInfo::new(now + two_seconds);
+            // Insert the first flow
+            let orig_flow_info = FlowInfo::new(flow_keys[0], now + two_seconds);
+            flow_table.insert(orig_flow_info).unwrap();
+            let flow_info = flow_table.lookup(&flow_keys[0]).unwrap();
 
-                    // Insert the first flow
-                    flow_table.insert(flow_keys[0], orig_flow_info);
-                    let flow_info = flow_table.lookup(&flow_keys[0]).unwrap();
+            // This holder will retain the Arc until the inserter thread starts
+            let mut flow_info_holder = Some(flow_info);
 
-                    // This holder will retain the Arc until the inserter thread starts
-                    let mut flow_info_holder = Some(flow_info);
+            let mut handles = vec![];
 
-                    let mut handles = vec![];
-
-                    // "expirer" thread — simulates what the tokio timer would do.
-                    handles.push(
-                        thread::Builder::new()
-                            .name("expirer".to_string())
-                            .spawn({
-                                let flow_table = flow_table.clone();
-                                let flow_key = flow_keys[0];
-                                move || {
-                                    for _ in 0..N {
-                                        thread::yield_now();
-                                        if let Some(fi) = flow_table.lookup(&flow_key) {
-                                            fi.update_status(FlowStatus::Expired);
-                                        }
-                                    }
+            // "expirer" thread — simulates what the tokio timer would do.
+            handles.push(
+                thread::Builder::new()
+                    .name("expirer".to_string())
+                    .spawn({
+                        let flow_table = flow_table.clone();
+                        let flow_key = flow_keys[0];
+                        move || {
+                            for _ in 0..N {
+                                thread::yield_now();
+                                if let Some(fi) = flow_table.lookup(&flow_key) {
+                                    fi.update_status(FlowStatus::Expired);
                                 }
-                            })
-                            .unwrap(),
-                    );
-
-                    handles.push(
-                        thread::Builder::new()
-                            .name("inserter".to_string())
-                            .spawn({
-                                let flow_table = flow_table.clone();
-                                let flow_key = flow_keys[1];
-
-                                let flow_info = flow_info_holder.take();
-                                move || {
-                                    for _ in 0..N {
-                                        if let Some(flow_info) = flow_info.as_ref() {
-                                            flow_table.reinsert(flow_key, flow_info);
-                                        }
-                                        thread::yield_now();
-                                    }
-                                }
-                            })
-                            .unwrap(),
-                    );
-
-                    handles.push(
-                        thread::Builder::new()
-                            .name("remover".to_string())
-                            .spawn({
-                                let flow_table = flow_table.clone();
-                                let flow_key = flow_keys[1];
-                                move || {
-                                    for _ in 0..N {
-                                        thread::yield_now();
-                                        flow_table.remove(&flow_key);
-                                    }
-                                }
-                            })
-                            .unwrap(),
-                    );
-
-                    handles.push(
-                        thread::Builder::new()
-                            .name("lookup_and_lock".to_string())
-                            .spawn({
-                                let flow_table = flow_table.clone();
-                                let flow_key = flow_keys[1];
-                                move || {
-                                    for _ in 0..N {
-                                        thread::yield_now();
-                                        if let Some(flow_info) = flow_table.lookup(&flow_key) {
-                                            let _guard = flow_info.locked.write().unwrap();
-                                        }
-                                    }
-                                }
-                            })
-                            .unwrap(),
-                    );
-
-                    for handle in handles {
-                        handle.join().unwrap();
-                    }
-
-                    // After all threads, flow[0] should be expired/gone (expirer thread ran).
-                    // Since timers are not started in shuttle tests, the flow should be there
-                    // but appear as Expired or Detached. Re-inserting a flow makes it active again,
-                    // therefore, the only non-feasible status is Cancellled.
-                    let found = flow_table.lookup(&flow_keys[0]).unwrap();
-                    assert_ne!(found.status(), FlowStatus::Cancelled);
-                },
-                100,
+                            }
+                        }
+                    })
+                    .unwrap(),
             );
+
+            handles.push(
+                thread::Builder::new()
+                    .name("inserter".to_string())
+                    .spawn({
+                        let flow_table = flow_table.clone();
+                        let flow_info = flow_info_holder.take();
+                        move || {
+                            for _ in 0..N {
+                                if let Some(flow_info) = flow_info.as_ref() {
+                                    flow_table.insert_from_arc(flow_info).unwrap();
+                                }
+                                thread::yield_now();
+                            }
+                        }
+                    })
+                    .unwrap(),
+            );
+
+            handles.push(
+                thread::Builder::new()
+                    .name("remover".to_string())
+                    .spawn({
+                        let flow_table = flow_table.clone();
+                        let flow_key = flow_keys[1];
+                        move || {
+                            for _ in 0..N {
+                                thread::yield_now();
+                                flow_table.remove(&flow_key);
+                            }
+                        }
+                    })
+                    .unwrap(),
+            );
+
+            handles.push(
+                thread::Builder::new()
+                    .name("lookup_and_lock".to_string())
+                    .spawn({
+                        let flow_table = flow_table.clone();
+                        let flow_key = flow_keys[1];
+                        move || {
+                            for _ in 0..N {
+                                thread::yield_now();
+                                if let Some(flow_info) = flow_table.lookup(&flow_key) {
+                                    let _guard = flow_info.locked.write();
+                                }
+                            }
+                        }
+                    })
+                    .unwrap(),
+            );
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            // After all threads, flow[0] should be expired/gone (expirer thread ran).
+            // Since timers are not started in shuttle tests, the flow should be there
+            // but appear as Expired or Detached. Re-inserting a flow makes it active again,
+            // therefore, the only non-feasible status is Cancellled.
+            let found = flow_table.lookup(&flow_keys[0]).unwrap();
+            assert_ne!(found.status(), FlowStatus::Cancelled);
         }
 
-        #[test]
+        #[concurrency::test]
         fn test_flow_table_reshard() {
-            shuttle::check_random(
-                move || {
-                    let flow_table = Arc::new(FlowTable::default());
+            let flow_table = Arc::new(FlowTable::default());
 
-                    let five_seconds_from_now = Instant::now() + Duration::from_secs(5);
-                    let flow_key1 = FlowKey::Unidirectional(FlowKeyData::new(
-                        Some(VpcDiscriminant::VNI(Vni::new_checked(1).unwrap())),
-                        "1.2.3.4".parse::<IpAddr>().unwrap(),
-                        "4.5.6.7".parse::<IpAddr>().unwrap(),
-                        IpProtoKey::Tcp(TcpProtoKey {
-                            src_port: TcpPort::new_checked(1025).unwrap(),
-                            dst_port: TcpPort::new_checked(2048).unwrap(),
-                        }),
-                    ));
+            let five_seconds_from_now = Instant::now() + Duration::from_secs(5);
+            let flow_key1 = FlowKey::Unidirectional(FlowKeyData::new(
+                Some(VpcDiscriminant::VNI(Vni::new_checked(1).unwrap())),
+                "1.2.3.4".parse::<IpAddr>().unwrap(),
+                "4.5.6.7".parse::<IpAddr>().unwrap(),
+                IpProtoKey::Tcp(TcpProtoKey {
+                    src_port: TcpPort::new_checked(1025).unwrap(),
+                    dst_port: TcpPort::new_checked(2048).unwrap(),
+                }),
+            ));
 
-                    let flow_key2 = FlowKey::Unidirectional(FlowKeyData::new(
-                        Some(VpcDiscriminant::VNI(Vni::new_checked(10).unwrap())),
-                        "10.2.3.4".parse::<IpAddr>().unwrap(),
-                        "40.5.6.7".parse::<IpAddr>().unwrap(),
-                        IpProtoKey::Tcp(TcpProtoKey {
-                            src_port: TcpPort::new_checked(1025).unwrap(),
-                            dst_port: TcpPort::new_checked(2048).unwrap(),
-                        }),
-                    ));
+            let flow_key2 = FlowKey::Unidirectional(FlowKeyData::new(
+                Some(VpcDiscriminant::VNI(Vni::new_checked(10).unwrap())),
+                "10.2.3.4".parse::<IpAddr>().unwrap(),
+                "40.5.6.7".parse::<IpAddr>().unwrap(),
+                IpProtoKey::Tcp(TcpProtoKey {
+                    src_port: TcpPort::new_checked(1025).unwrap(),
+                    dst_port: TcpPort::new_checked(2048).unwrap(),
+                }),
+            ));
 
-                    let flow_table_clone1 = flow_table.clone();
-                    let flow_table_clone2 = flow_table.clone();
-                    let flow_table_clone3 = flow_table.clone();
+            let flow_table_clone1 = flow_table.clone();
+            let flow_table_clone2 = flow_table.clone();
+            let flow_table_clone3 = flow_table.clone();
 
-                    let mut handles = vec![];
+            let mut handles = vec![];
 
-                    handles.push(thread::spawn(move || {
-                        let flow_info = FlowInfo::new(five_seconds_from_now);
-                        flow_table_clone1.insert(flow_key1, flow_info);
-                        let result = flow_table_clone1.remove(&flow_key1).unwrap();
-                        assert!(result.0 == flow_key1);
-                    }));
+            handles.push(thread::spawn(move || {
+                let flow_info = FlowInfo::new(flow_key1, five_seconds_from_now);
+                flow_table_clone1.insert(flow_info).unwrap();
+                let result = flow_table_clone1.remove(&flow_key1).unwrap();
+                assert!(result.0 == flow_key1);
+            }));
 
-                    handles.push(thread::spawn(move || {
-                        let flow_info = FlowInfo::new(five_seconds_from_now);
-                        flow_table_clone2.insert(flow_key2, flow_info);
-                        let result = flow_table.remove(&flow_key2).unwrap();
-                        assert!(result.0 == flow_key2);
-                    }));
+            handles.push(thread::spawn(move || {
+                let flow_info = FlowInfo::new(flow_key2, five_seconds_from_now);
+                flow_table_clone2.insert(flow_info).unwrap();
+                let result = flow_table.remove(&flow_key2).unwrap();
+                assert!(result.0 == flow_key2);
+            }));
 
-                    handles.push(thread::spawn(move || {
-                        flow_table_clone3.reshard(128).unwrap();
-                    }));
+            handles.push(thread::spawn(move || flow_table_clone3.reshard(128)));
 
-                    let _results: Vec<()> = handles
-                        .into_iter()
-                        .map(|handle| handle.join().unwrap())
-                        .collect();
-                },
-                100,
-            );
+            let _results: Vec<()> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
         }
     }
 }

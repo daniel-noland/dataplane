@@ -106,10 +106,10 @@ impl<T: Identity<K>, K: PartialEq> ReadHandleEntry<T, K> {
         if self.rhandle.was_dropped() {
             return false;
         }
-        if *key == self.identity {
-            return true;
+        if self.version != provider.get_version() {
+            return false;
         }
-        if self.version == provider.get_version() {
+        if *key == self.identity {
             return true;
         }
         let Some(identity) = provider.get_identity(key) else {
@@ -340,9 +340,10 @@ mod tests {
     #![allow(clippy::collapsible_if)]
 
     use super::*;
+    use concurrency::sync::Mutex;
     use left_right::{Absorb, ReadHandleFactory, WriteHandle};
+    #[cfg(not(miri))]
     use serial_test::serial;
-    use std::sync::Mutex;
     // Our left-right protected struct
     #[derive(Debug, Clone)]
     struct TestStruct {
@@ -438,7 +439,7 @@ mod tests {
             if let Some(object) = self.data.get_mut(&key) {
                 if let Some(writer_lock) = &mut object.writer {
                     #[allow(clippy::mut_mutex_lock)] // lock exists just to make provider Sync
-                    let mut writer = writer_lock.lock().unwrap();
+                    let mut writer = writer_lock.lock();
                     writer.append(TestStructChange::Update(data.to_owned()));
                     writer.publish();
                 }
@@ -486,7 +487,7 @@ mod tests {
         }
     }
 
-    #[serial]
+    #[cfg_attr(not(miri), serial)]
     #[test]
     fn test_readhandle_cache_basic() {
         // start fresh
@@ -598,7 +599,7 @@ mod tests {
         });
     }
 
-    #[serial]
+    #[cfg_attr(not(miri), serial)]
     #[test]
     fn test_readhandle_cache_multi_invalidation() {
         // start fresh
@@ -647,14 +648,17 @@ mod tests {
         assert!(h.is_err_and(|e| e == ReadHandleCacheError::NotAccessible(alias)));
     }
 
-    #[serial]
+    #[cfg_attr(not(miri), serial)]
     #[test]
     fn test_readhandle_cache() {
         // start fresh
         ReadHandleCache::purge(&TEST_CACHE);
 
         // build provider and populate it
-        const NUM_HANDLES: u64 = 1000;
+        const NUM_HANDLES: u64 = cfg_select! {
+            emulated => 10,
+            _ => 1000,
+        };
         let mut provider = TestProvider::new();
         for id in 0..=NUM_HANDLES {
             provider.add_object(id, id);
@@ -712,7 +716,7 @@ mod tests {
         TEST_CACHE.with(|cache| assert!(cache.handles.borrow().is_empty()));
     }
 
-    #[serial]
+    #[cfg_attr(not(miri), serial)]
     #[test]
     fn test_readhandle_cache_iter() {
         // start fresh

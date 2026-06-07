@@ -10,6 +10,7 @@
   default-features ? "true",
   kernel ? "linux",
   tag ? "dev",
+  nightly ? "false",
 }:
 let
   sources = import ./npins;
@@ -21,6 +22,7 @@ let
     else
       builtins.filter (elm: builtins.isString elm) (builtins.split split-on string);
   lib = (import sources.nixpkgs { }).lib;
+  host-arch = (import sources.nixpkgs { }).stdenv.hostPlatform.parsed.cpu.name;
   platform' = import ./nix/platforms.nix {
     inherit
       lib
@@ -32,8 +34,28 @@ let
   sanitizers = split-str ",+" sanitize;
   cargo-features = split-str ",+" features;
   profile' = import ./nix/profiles.nix {
-    inherit sanitizers instrumentation profile;
+    inherit
+      sanitizers
+      instrumentation
+      profile
+      cargo-features
+      host-arch
+      ;
     inherit (platform') arch;
+  };
+  # Test archives run on the host (e.g. `cargo nextest run --archive-file`)
+  # rather than in the nix build sandbox, so panics in fixtures must
+  # unwind for cleanup (netns / caps) to run.  See `test-utils/src/lib.rs`.
+  profile-tests' = import ./nix/profiles.nix {
+    inherit
+      sanitizers
+      instrumentation
+      profile
+      cargo-features
+      host-arch
+      ;
+    inherit (platform') arch;
+    for-tests = true;
   };
   cargo-profile =
     {
@@ -44,8 +66,10 @@ let
     .${profile};
   overlays = import ./nix/overlays {
     inherit
-      sources
+      libc
+      nightly
       sanitizers
+      sources
       ;
     profile = profile';
     platform = platform';
@@ -109,20 +133,27 @@ let
     executable = false;
     destination = "/.clangd";
   };
-  crane = import sources.crane { };
+  crane = import sources.crane { inherit pkgs; };
   craneLib = crane.craneLib.overrideToolchain pkgs.rust-toolchain;
   devroot = pkgs.symlinkJoin {
     name = "dataplane-dev-shell";
     paths = [
       clangd-config
     ]
-    ++ (with pkgs.pkgsBuildHost.llvmPackages'; [
+    # pkgsBuildBuild (not pkgsBuildHost): dev-shell tools run on, and target,
+    # the build host.  pkgsBuildHost is "runs on build, targets host", which
+    # under a cross pkgs (e.g. libc=musl, platform=bluefield3) installs only
+    # target-prefixed binaries (e.g. x86_64-unknown-linux-musl-pkg-config) --
+    # cargo build scripts that invoke `pkg-config`/`clang` unprefixed then fail
+    # to find them in PATH.
+    ++ (with pkgs.pkgsBuildBuild.llvmPackages'; [
       bintools
       clang
       libclang.lib
       lld
     ])
-    ++ (with pkgs.pkgsBuildHost; [
+    ++ (with pkgs.pkgsBuildBuild; [
+      actionlint
       bash
       cargo-bolero
       cargo-deny
@@ -132,17 +163,116 @@ let
       cargo-nextest
       direnv
       gateway-crd
+      gettext
+      jq
       just
       kopium
       llvmPackages'.clang # you need the host compiler in order to link proc macros
       llvmPackages'.llvm # needed for coverage
       npins
+      opengrep
+      openssl
       oras
       pkg-config
+      python3Packages.pyflakes
+      qemu-user
       rust-toolchain
+      shellcheck
       skopeo
+      wasmtime
+      wget
       yq
     ]);
+  };
+  # Whether the guest architecture (= the test binary's target arch, i.e.
+  # the nix host platform) differs from the build machine's arch.  When it
+  # does, the test VM is software-emulated (TCG) rather than KVM-accelerated.
+  is-cross-guest = platform'.arch != host-arch;
+
+  # The bootable kernel image filename for the guest architecture.
+  # x86_64 produces a `bzImage`; aarch64 produces a raw `Image`.  These
+  # match the paths in `n_vm::Arch::kernel_image_path`.
+  kernel-image-name = if platform'.arch == "aarch64" then "Image" else "bzImage";
+
+  # Minimal derivation containing only the bootable kernel image.
+  #
+  # The full linux-fancy output includes modules, headers, etc. that are
+  # not needed inside the test container — we extract just the bootable
+  # image so that symlinkJoin produces a top-level image entry in testroot
+  # without pulling in the rest of the kernel tree.
+  #
+  # IMPORTANT: this is `pkgs.linux-fancy` (the *host*-platform kernel), not
+  # `pkgs.pkgsBuildHost.linux-fancy` (the *build*-platform kernel).  The
+  # guest kernel must match the guest (= test binary) architecture.  For a
+  # native build the two package sets coincide, so this is a no-op for
+  # x86_64; for a cross build it selects the aarch64 kernel.
+  kernel-image = pkgs.runCommand "kernel-image" { } ''
+    mkdir -p $out
+    cp ${pkgs.linux-fancy}/${kernel-image-name} $out/${kernel-image-name}
+  '';
+
+  # The QEMU system emulator for the test VM, always a build-native (host
+  # CI arch) binary that runs in the Docker container.
+  #
+  # The test VMs always run headless (`-nographic`), so QEMU's GUI display
+  # backends (gtk/sdl/vnc/spice/...) are dead weight.  Left enabled they
+  # drag gtk4/gtk3/cairo/pango/vte/libepoxy/SDL into every test/dev root.
+  # `nixosTestRunner = true` is nixpkgs' headless "boot a VM" profile: it
+  # disables exactly those backends and its only other effect is a 9p
+  # uid0 patch we never exercise (we mount via vhost-user-fs, not -virtfs).
+  #
+  # - Native guest: `qemu_test` (= `qemu_kvm` + `nixosTestRunner`): the
+  #   prebuilt, cache-hit, host-cpu-only emulator (`qemu-system-<host>`
+  #   with KVM).  Headless, so no gtk in the common (native) devroot.
+  # - Cross guest: the base `qemu`, headless and restricted to just the
+  #   targets we need: the guest `*-softmmu` we actually emulate under TCG
+  #   (e.g. `aarch64-softmmu`) plus the build-host `*-softmmu` (so QEMU's
+  #   `qemu-kvm` compat symlink -> `qemu-system-<host>` resolves; omitting
+  #   it trips the `noBrokenSymlinks` install check).  A genuine-cross
+  #   `pkgsBuildHost` qemu is not in the binary cache regardless (Hydra
+  #   never builds that derivation), so trimming targets + dropping the GUI
+  #   keeps that unavoidable build small.
+  #
+  # Both provide `bin/qemu-system-<arch>`, matching
+  # `n_vm::Arch::qemu_system_binary`.
+  qemu-system =
+    if is-cross-guest then
+      pkgs.pkgsBuildHost.qemu.override {
+        nixosTestRunner = true;
+        hostCpuTargets = [
+          "${host-arch}-softmmu"
+          "${platform'.arch}-softmmu"
+        ];
+      }
+    else
+      pkgs.pkgsBuildHost.qemu_test;
+
+  # Container-tier tools for the scratch-container test infrastructure.
+  #
+  # This derivation provides the binaries needed inside the Docker
+  # container that launches the test VM: the hypervisor(s), virtiofsd,
+  # and a Linux kernel image (bzImage built from config fragments by
+  # the linux-fancy derivation in nix/overlays/dataplane-dev.nix).
+  #
+  # When used with a scratch container, subdirectories of this derivation
+  # (e.g. bin/, lib/) are volume-mounted at their standard container
+  # paths, and top-level files (e.g. bzImage) are bind-mounted at the
+  # container root.  The container also mounts /nix/store from the host
+  # so that the symlinks created by symlinkJoin resolve to the actual
+  # binaries and their transitive library dependencies.
+  #
+  # See development/ideam.md for the design rationale.
+  # NOTE: cloud-hypervisor and virtiofsd stay on `pkgsBuildHost` (they run
+  # on the x86 container host).  Only the kernel is host-arch; the qemu
+  # choice is arch-aware (see `qemu-system`).
+  testroot = pkgs.symlinkJoin {
+    name = "dataplane-test-root";
+    paths = [
+      pkgs.pkgsBuildHost.cloud-hypervisor
+      pkgs.pkgsBuildHost.virtiofsd
+      qemu-system
+      kernel-image
+    ];
   };
   devenv = pkgs.mkShell {
     name = "dataplane-dev-shell";
@@ -156,6 +286,16 @@ let
       PKG_CONFIG_PATH = "${sysroot}/lib/pkgconfig";
       LIBCLANG_PATH = "${devroot}/lib";
       GW_CRD_PATH = "${pkgs.pkgsBuildHost.gateway-crd}/src/fabric/config/crd/bases";
+      # Pin native cargo invocations (cargo build/clippy/test --doc) to the
+      # same target the dev sysroot is built for.  Without this, cargo defaults
+      # to the build-host triple while LIBRARY_PATH/PKG_CONFIG_PATH point at
+      # cross-target libs, and the link picks up a libc that doesn't match the
+      # rust-std it's compiling against (e.g. glibc rust-std + musl libc =
+      # undefined `open64`/`fstat64`/...).
+      CARGO_BUILD_TARGET = rustc-target;
+      # Rust's pkg-config crate refuses cross-target builds by default; opt in
+      # since our PKG_CONFIG_PATH already points at the matching cross sysroot.
+      PKG_CONFIG_ALLOW_CROSS = "1";
     };
   };
   justfileFilter = p: _type: builtins.match ".*\.justfile$" p != null;
@@ -195,7 +335,7 @@ let
       "wasm32-wasip1"
     else
       pkgs.stdenv'.targetPlatform.rust.rustcTarget;
-  is-cross-compile = pkgs.stdenv'.hostPlatform.rust.rustcTarget != ctarget;
+  is-cross-compile = pkgs.stdenv'.buildPlatform.rust.rustcTarget != ctarget;
   cxx = if is-cross-compile then "${ctarget}-clang++" else "clang++";
   strip = if is-cross-compile then "${ctarget}-strip" else "strip";
   objcopy = if is-cross-compile then "${ctarget}-objcopy" else "objcopy";
@@ -206,27 +346,55 @@ let
           TOMLQ = "${pkgs.pkgsBuildHost.yq}/bin/tomlq";
           JQ = "${pkgs.pkgsBuildHost.jq}/bin/jq";
         }
-        ''
-          $TOMLQ -r '.workspace.members | sort[]' ${src}/Cargo.toml | while read -r p; do
-            $TOMLQ --arg p "$p" -r '{ ($p): .package.name }' ${src}/$p/Cargo.toml
-          done | $JQ --sort-keys --slurp 'add' > $out
-        ''
+        (
+          if platform == "wasm32-wasip1" then
+            ''
+              $TOMLQ -r '.workspace as $ws | [$ws.members[] | select($ws.metadata.package[.].wasm != false) as $p | { ($p): $ws.dependencies[$p].package }] | add' ${src}/Cargo.toml > $out
+            ''
+          else
+            ''
+              $TOMLQ -r '.workspace.members | sort[]' ${src}/Cargo.toml | while read -r p; do
+                  $TOMLQ --arg p "$p" -r '{ ($p): .package.name }' ${src}/$p/Cargo.toml
+              done | $JQ --sort-keys --slurp 'add' > $out
+            ''
+        )
     )
   );
   version = (craneLib.crateNameFromCargoToml { inherit src; }).version;
-  cargo-cmd-prefix = [
-    "-Zunstable-options"
-    "-Zbuild-std=compiler_builtins,core,alloc,std,panic_unwind,panic_abort,sysroot,unwind"
-    "-Zbuild-std-features=backtrace,panic-unwind,mem,compiler-builtins-mem"
-    "--target=${rustc-target}"
-  ]
-  ++ (if default-features == "false" then [ "--no-default-features" ] else [ ])
-  ++ (
-    if cargo-features != [ ] then
-      [ "--features=${builtins.concatStringsSep "," cargo-features}" ]
-    else
-      [ ]
-  );
+  # The `loom` and `shuttle` features require `panic = "unwind"` (see
+  # nix/profiles.nix), as do test builds.  The sysroot needs the matching
+  # panic runtime and std feature, so we build two cargo command prefixes:
+  # `cargo-cmd-prefix` for production code and `cargo-cmd-prefix-tests`
+  # for the nextest archives.
+  mk-needs-unwind =
+    for-tests:
+    for-tests || builtins.elem "loom" cargo-features || builtins.elem "shuttle" cargo-features;
+  needs-unwind = mk-needs-unwind false;
+  needs-unwind-tests = mk-needs-unwind true;
+  mk-cargo-cmd-prefix =
+    unwind:
+    [
+      "-Zunstable-options"
+      "-Zbuild-std=std,${if unwind then "panic_unwind" else "panic_abort"}"
+      # note: retention of libunwind on non-glibc is correct in spite of the panic=abort; `backtrace` needs a stack
+      # walker even when panic=abort.  In the case of glibc, libgcc_s.so fills that role.  You can't escape libgcc_s.so
+      # regardless: it is linked to glibc's libc.so anyway.
+      (
+        "-Zbuild-std-features=backtrace"
+        + (if unwind then ",panic-unwind" else "")
+        + (if libc != "gnu" then ",system-llvm-libunwind" else "")
+      )
+      "--target=${rustc-target}"
+    ]
+    ++ (if default-features == "false" then [ "--no-default-features" ] else [ ])
+    ++ (
+      if cargo-features != [ ] then
+        [ "--features=${builtins.concatStringsSep "," cargo-features}" ]
+      else
+        [ ]
+    );
+  cargo-cmd-prefix = mk-cargo-cmd-prefix needs-unwind;
+  cargo-cmd-prefix-tests = mk-cargo-cmd-prefix needs-unwind-tests;
   invoke =
     {
       builder,
@@ -234,6 +402,7 @@ let
         pname = null;
         cargoArtifacts = null;
       },
+      profile,
       cargo-nextest,
       hwloc,
       llvmPackages',
@@ -279,7 +448,7 @@ let
           RUSTFLAGS =
             if rustc-target != "wasm32-wasip1" then
               builtins.concatStringsSep " " (
-                profile'.RUSTFLAGS
+                profile.RUSTFLAGS
                 ++ [
                   "-Clinker=${pkgs.pkgsBuildHost.llvmPackages'.clang}/bin/${cxx}"
                   "-Clink-arg=--ld-path=${pkgs.pkgsBuildHost.llvmPackages'.lld}/bin/ld.lld"
@@ -349,6 +518,7 @@ let
     }:
     pkgs.callPackage invoke {
       builder = craneLib.buildPackage;
+      profile = profile';
       args = {
         inherit pname cargoArtifacts;
         buildPhaseCargoCommand = builtins.concatStringsSep " " (
@@ -374,6 +544,125 @@ let
     }
   ) package-list;
 
+  # VM guest root filesystem for the scratch-container test infrastructure.
+  #
+  # This derivation is shared into the VM via virtiofsd and becomes the
+  # guest's root filesystem (mounted as virtiofs with tag "root").
+  #
+  # It contains:
+  # - The n-it init system binary (runs as PID 1 in the VM).
+  # - glibc and libgcc shared libraries (so dynamically linked test
+  #   binaries can run inside the VM).
+  #
+  # The test binary directory is bind-mounted by container.rs at
+  # /vm.root/test-bin (see VM_TEST_BIN_DIR in n-vm-protocol), so it
+  # appears at /test-bin in the VM guest.  The /test-bin directory is
+  # pre-created here so Docker can create the bind mount without needing
+  # to mkdir on the read-only nix store path.
+  #
+  # See development/ideam.md for the design rationale.
+  vmroot = pkgs.runCommand "dataplane-vm-root" { } ''
+    mkdir -p $out/bin $out/lib $out/test-bin
+
+    # Essential guest directories.
+    #
+    # The VM root filesystem is mounted read-only via virtiofs, so the
+    # kernel cannot create directories on demand.  These empty mount
+    # points must exist so that:
+    #
+    #   /dev   — kernel auto-mounts devtmpfs (provides /dev/console,
+    #            /dev/null, etc. needed by init and test processes)
+    #   /proc  — n-it mounts procfs (needed for /proc/cmdline parsing
+    #            and general process introspection)
+    #   /sys   — n-it mounts sysfs
+    #   /tmp   — n-it mounts tmpfs (writable scratch space)
+    #   /run   — n-it mounts tmpfs (runtime state)
+    #   /etc   — some libc/nss functions expect this to exist
+    #
+    # Without /dev in particular, the kernel logs
+    # "devtmpfs: error mounting -2" and init may fail with ENOEXEC (-8)
+    # because /dev/console cannot be opened.
+    mkdir -p $out/dev $out/proc $out/sys $out/tmp $out/run $out/etc $out/var
+
+    # /var/run → /run symlink.
+    #
+    # Many daemons (including DPDK) default to writing runtime state
+    # under /var/run.  On a conventional Linux system /var/run is
+    # either a symlink to /run or a tmpfs in its own right.  Since our
+    # root filesystem is read-only via virtiofs, we bake the symlink
+    # into the image so that /var/run/dpdk (and friends) resolve to
+    # the writable /run tmpfs mounted by n-it.
+    #
+    # This mirrors what the dataplane container image already does
+    # (see the `dataplane.tar` buildPhase above).
+    ln -s /run $out/var/run
+
+    # n-it init system binary.
+    # The cargo package is "dataplane-n-it" but the VM expects the
+    # binary at /bin/n-it (see INIT_BINARY_PATH in n-vm-protocol).
+    ln -s ${workspace."n-it"}/bin/dataplane-n-it $out/bin/n-it
+
+    # glibc runtime libraries -- needed by dynamically linked test
+    # binaries running inside the VM.
+    for f in ${pkgs.pkgsHostHost.libc.out}/lib/*.so*; do
+      [ -e "$f" ] || continue
+      ln -s "$f" "$out/lib/$(basename "$f")"
+    done
+
+    # libgcc runtime libraries (libgcc_s.so, etc.)
+    for f in ${pkgs.pkgsHostHost.glibc.libgcc}/lib/*.so*; do
+      [ -e "$f" ] || continue
+      ln -s "$f" "$out/lib/$(basename "$f")"
+    done
+
+    # Create a real /nix/store directory (empty mount point).
+    #
+    # The container tier bind-mounts the host's /nix/store here so that
+    # virtiofsd serves it as a real directory to the VM guest.  This
+    # replaces the previous /nix -> /nix absolute symlink, which caused
+    # ELOOP (error -40) inside the guest: the FUSE protocol returns
+    # symlinks to the guest kernel for resolution, and /nix -> /nix is
+    # self-referential from the guest's VFS perspective.
+    #
+    # Nix-built test binaries have rpaths like
+    # /nix/store/{hash}-glibc-X.Y/lib; with /nix/store bind-mounted
+    # through virtiofsd, those paths resolve correctly inside the VM.
+    mkdir -p $out/nix/store
+  '';
+
+  workspace-check =
+    {
+      pname ? null,
+      cargoArtifacts ? null,
+    }:
+    pkgs.callPackage invoke {
+      builder = craneLib.buildPackage;
+      profile = profile';
+      args = {
+        inherit pname cargoArtifacts;
+        buildPhaseCargoCommand = builtins.concatStringsSep " " (
+          [
+            "cargoBuildLog=$(mktemp cargoBuildLogXXXX.json);"
+            "cargo"
+            "check"
+            "--package=${pname}"
+            "--profile=${cargo-profile}"
+          ]
+          ++ cargo-cmd-prefix
+          ++ [
+            "--message-format json-render-diagnostics > $cargoBuildLog"
+          ]
+        );
+      };
+    };
+
+  check = builtins.mapAttrs (
+    dir: pname:
+    workspace-check {
+      inherit pname;
+    }
+  ) package-list;
+
   test-builder =
     {
       package ? null,
@@ -384,6 +673,7 @@ let
     in
     pkgs.callPackage invoke {
       builder = craneLib.mkCargoDerivation;
+      profile = profile-tests';
       args = {
         inherit pname cargoArtifacts;
         buildPhaseCargoCommand = builtins.concatStringsSep " " (
@@ -397,7 +687,7 @@ let
             "--cargo-profile=${cargo-profile}"
           ]
           ++ (if package != null then [ "--package=${pname}" ] else [ ])
-          ++ cargo-cmd-prefix
+          ++ cargo-cmd-prefix-tests
         );
       };
     };
@@ -412,12 +702,51 @@ let
     ) package-list;
   };
 
+  # Build criterion bench binaries without running them.
+  bench-builder =
+    {
+      package ? null,
+      cargoArtifacts ? null,
+    }:
+    let
+      pname = if package != null then package else "all";
+    in
+    pkgs.callPackage invoke {
+      builder = craneLib.mkCargoDerivation;
+      profile = profile-tests';
+      args = {
+        inherit pname cargoArtifacts;
+        buildPhaseCargoCommand =
+          (builtins.concatStringsSep " " (
+            [
+              "mkdir -p $out/bin;"
+              "cargoBenchLog=$(mktemp cargoBenchLogXXXX.json);"
+              "cargo"
+              "bench"
+              "--no-run"
+              "--profile=${cargo-profile}"
+            ]
+            ++ (if package != null then [ "--package=${pname}" ] else [ ])
+            ++ cargo-cmd-prefix-tests
+            ++ [ "--message-format=json-render-diagnostics > $cargoBenchLog;" ]
+          ))
+          + ''
+            for exe in $(grep -E '"kind":\["bench"\]' "$cargoBenchLog" | grep -oE '"executable":"[^"]+"' | sed -E 's/"executable":"//; s/"$//'); do
+              cp "$exe" "$out/bin/$(basename "$exe" | sed -E 's/-[0-9a-f]{16}$//')"
+            done
+          '';
+      };
+    };
+
+  benches = bench-builder { };
+
   clippy-builder =
     {
       pname ? null,
     }:
     pkgs.callPackage invoke {
       builder = craneLib.mkCargoDerivation;
+      profile = profile';
       args = {
         inherit pname;
         cargoArtifacts = null;
@@ -453,6 +782,7 @@ let
     in
     pkgs.callPackage invoke {
       builder = craneLib.mkCargoDerivation;
+      profile = profile';
       args = {
         inherit pname;
         cargoArtifacts = null;
@@ -490,7 +820,32 @@ let
     dontPatchElf = true;
     buildPhase =
       let
-        libc = pkgs.pkgsHostHost.libc;
+        # `libc-pkg` and not `libc` so the outer function-arg `libc` (the
+        # string "gnu" / "musl" / "none") stays visible inside this scope
+        # for the conditional below.
+        libc-pkg = pkgs.pkgsHostHost.libc;
+        # libgcc_s.so.1 is consumed by glibc-dynamic Rust binaries for
+        # unwinding.  musl Rust targets static-link musl + Rust's
+        # compiler-builtins, so libgcc has no consumer; bundling it would
+        # waste closure space and pull in glibc-targeted build outputs that
+        # are wrong for a musl container.
+        #
+        # IMPORTANT: must be the path baked into the matching ld-linux's
+        # compiled-in search list, which is `pkgs.pkgsHostHost.glibc.libgcc`
+        # (the `xgcc-...-libgcc` / cross `libgcc-<triple>-...` derivation).
+        # `pkgs.stdenv.cc.cc.lib` ships the same `libgcc_s.so.1` content but
+        # at a different store path that ld-linux doesn't search, so the
+        # binary can't find it at runtime even though the file exists in
+        # the tar.
+        libgcc-tar-input = if libc == "gnu" then "${pkgs.pkgsHostHost.glibc.libgcc}" else "";
+        # libc.out is needed by anything dynamically linked in the tar,
+        # regardless of libc choice.  The Rust binaries on musl are
+        # statically linked and don't need it, but busybox (bundled below
+        # for `/bin/*` shell utilities) is dynamically linked against
+        # whichever libc its pkgset uses.  Omitting libc.out on musl leaves
+        # busybox applets referencing a `ld-musl-*.so.1` / `libc.so` that
+        # isn't present in the image.
+        libc-tar-input = "${libc-pkg.out}";
       in
       ''
         tmp="$(mktemp -d)"
@@ -533,10 +888,10 @@ let
           --no-selinux \
           \
           `# we already copied this stuff in to /etc directly, no need to copy it into the store again.` \
-          --exclude '${libc}/etc' \
+          --exclude '${libc-pkg}/etc' \
           \
           `# There are a few components of glibc which have absolutely nothing to do with our goals and present` \
-          `# material and trivially avoided hazzards just by their presence.  Thus, we filter them out here.` \
+          `# material and trivially avoided hazards just by their presence.  Thus, we filter them out here.` \
           `# None of this applies to musl (if we ever decide to ship with musl).  That said, these filters will` \
           `# just not do anything in that case. ` \
            \
@@ -547,7 +902,7 @@ let
           `# Go check out this one, it is a classic: ` \
           `# https://www.exploit-db.com/exploits/18105 ` \
           \
-          --exclude '${libc}/lib/audit*' \
+          --exclude '${libc-pkg}/lib/audit*' \
           \
           `# The glibc character set conversion code is not only useless to us, is is an increasingly common attack ` \
           `# vector (see CVE-2024-2961 for example).  We are 100% unicode only, so all of these legacy character ` \
@@ -556,20 +911,20 @@ let
           `# and it wouldn't be respected by rust's core/std libs anyway. ` \
           `# This is also how fedora packages glibc, and for the same basic reasons.` \
           `# See https://fedoraproject.org/wiki/Changes/Gconv_package_split_in_glibc` \
-          --exclude '${libc}/lib/gconv*' \
-          --exclude '${libc}/share/i18n*' \
-          --exclude '${libc}/share/locale*' \
+          --exclude '${libc-pkg}/lib/gconv*' \
+          --exclude '${libc-pkg}/share/i18n*' \
+          --exclude '${libc-pkg}/share/locale*' \
           \
           `# getconf isn't even shipped in the container so this is useless.  You couldn't change limits in the ` \
           `# container like this anyway.  Even if we needed to and could, we wouldn't use setconf et al.` \
-          --exclude '${libc}/libexec*' \
+          --exclude '${libc-pkg}/libexec*' \
           \
           --verbose \
           --file "$out" \
           \
           . \
-          ${libc.out} \
-          ${pkgs.pkgsHostHost.glibc.libgcc} \
+          ${libc-tar-input} \
+          ${libgcc-tar-input} \
           ${workspace.dataplane} \
           ${workspace.init} \
           ${workspace.cli} \
@@ -628,48 +983,52 @@ let
     };
   };
 
-  debug-tools = pkgs: [
-    ## Packages which might be helpful for debugging but aren't enabled by default.
-    ## Uncomment them as needed, but be mindful of container size please.
-    # pkgs.dmidecode
-    # pkgs.emacs
-    # pkgs.gdb # TODO: consider a way to let the user pick gdb' from dev-pkgs (works better in vm)
-    # pkgs.neovim
-    # pkgs.rr
-    # pkgs.valgrind
-    # pkgs.wireshark-cli
+  debug-tools =
+    pkgs:
+    [
+      ## Packages which might be helpful for debugging but aren't enabled by default.
+      ## Uncomment them as needed, but be mindful of container size please.
+      # pkgs.dmidecode
+      # pkgs.emacs
+      # pkgs.gdb # TODO: consider a way to let the user pick gdb' from dev-pkgs (works better in vm)
+      # pkgs.neovim
+      # pkgs.rr
+      # pkgs.valgrind
+      # pkgs.wireshark-cli
 
-    pkgs.bashInteractive
-    pkgs.coreutils
-    pkgs.curl
-    pkgs.debianutils
-    pkgs.dockerTools.usrBinEnv
-    pkgs.ethtool
-    pkgs.findutils
-    pkgs.gawk
-    pkgs.gnugrep
-    pkgs.gnused
-    pkgs.gnutar
-    pkgs.gzip
-    pkgs.htop
-    pkgs.iproute2
-    pkgs.iptables
-    pkgs.iputils
-    pkgs.jq
-    pkgs.less
-    pkgs.libc.bin
-    pkgs.libc.out
-    pkgs.libgcc.libgcc
-    pkgs.man
-    pkgs.nano
-    pkgs.procps
-    pkgs.tcpdump
-    pkgs.util-linux
-    pkgs.vim
-    pkgs.wget
-    pkgs.yq
-    pkgs.zstd
-  ];
+      pkgs.bashInteractive
+      pkgs.coreutils
+      pkgs.curl
+      pkgs.debianutils
+      pkgs.dockerTools.usrBinEnv
+      pkgs.ethtool
+      pkgs.findutils
+      pkgs.gawk
+      pkgs.gnugrep
+      pkgs.gnused
+      pkgs.gnutar
+      pkgs.gzip
+      pkgs.htop
+      pkgs.iproute2
+      pkgs.iptables
+      pkgs.iputils
+      pkgs.jq
+      pkgs.less
+      pkgs.libc.bin
+      pkgs.libc.out
+      pkgs.man
+      pkgs.nano
+      pkgs.procps
+      pkgs.tcpdump
+      pkgs.util-linux
+      pkgs.vim
+      pkgs.wget
+      pkgs.yq
+      pkgs.zstd
+    ]
+    ++ lib.optionals (libc == "gnu") [
+      pkgs.pkgsHostHost.glibc.libgcc
+    ];
 
   containers.debug-tools = pkgs.dockerTools.buildLayeredImage {
     name = "debug-tools";
@@ -709,7 +1068,15 @@ let
     inherit tag;
     contents = pkgs.buildEnv {
       name = "dataplane-frr-env";
-      pathsToLink = [ "/" ];
+      pathsToLink = [
+        "/bin"
+        "/etc"
+        "/lib"
+        "/libexec"
+        "/share"
+        "/usr"
+        "/var"
+      ];
       paths = with pkgs; [
         bash
         coreutils
@@ -738,6 +1105,9 @@ let
       mkdir -p /var
       ln -s /run /var/run
       chown -R frr:frr /var/run/frr
+      rm /etc/passwd /etc/group
+      cp ${pkgs.fancy.frr-config}/etc/passwd /etc/passwd
+      cp ${pkgs.fancy.frr-config}/etc/group /etc/group
     '';
 
     enableFakechroot = true;
@@ -755,7 +1125,13 @@ let
     contents = pkgs.buildEnv {
       name = "dataplane-frr-host-env";
       pathsToLink = [
-        "/"
+        "/bin"
+        "/etc"
+        "/lib"
+        "/libexec"
+        "/share"
+        "/usr"
+        "/var"
       ];
       paths = with pkgs; [
         bash
@@ -784,6 +1160,9 @@ let
       mkdir -p /var
       ln -s /run /var/run
       chown -R frr:frr /var/run/frr
+      rm /etc/passwd /etc/group
+      cp ${pkgs.fancy.frr-config}/etc/passwd /etc/passwd
+      cp ${pkgs.fancy.frr-config}/etc/group /etc/group
     '';
 
     enableFakechroot = true;
@@ -798,17 +1177,21 @@ let
 in
 {
   inherit
+    benches
+    check
     clippy
     containers
+    dataplane
     devenv
     devroot
     docs
-    dataplane
     package-list
     pkgs
     sources
     sysroot
+    testroot
     tests
+    vmroot
     workspace
     ;
   profile = profile';

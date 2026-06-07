@@ -5,9 +5,9 @@
 
 use left_right::{Absorb, ReadGuard, ReadHandle, ReadHandleFactory, WriteHandle};
 use left_right_tlcache::Identity;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::rc::Rc;
-use std::{hash::Hash, sync::atomic::AtomicBool};
 
 use lpm::prefix::{Ipv4Prefix, Ipv6Prefix, Prefix};
 use lpm::trie::{PrefixMapTrie, TrieMap, TrieMapFactory};
@@ -57,7 +57,7 @@ pub struct Fib {
     routesv6: PrefixMapTrie<Ipv6Prefix, FibRoute>,
     groupstore: FibGroupStore,
     vtep: Vtep,
-    valid: AtomicBool,
+    valid: bool,
 }
 impl Hash for Fib {
     // We implement explicitly `std::hash::Hash` for `Fib` instead of deriving it because:
@@ -81,7 +81,7 @@ impl Default for Fib {
             routesv6: PrefixMapTrie::create(),
             groupstore: FibGroupStore::new(),
             vtep: Vtep::new(),
-            valid: AtomicBool::new(true),
+            valid: true,
         };
         // default route
         let route = FibRoute::with_fibgroup(fib.groupstore.get_drop_fibgroup_ref());
@@ -91,8 +91,8 @@ impl Default for Fib {
     }
 }
 
-pub type FibRouteV4Filter = Box<dyn Fn(&(&Ipv4Prefix, &FibRoute)) -> bool>;
-pub type FibRouteV6Filter = Box<dyn Fn(&(&Ipv6Prefix, &FibRoute)) -> bool>;
+pub type FibRouteV4Filter = Box<dyn Fn(&(Ipv4Prefix, &FibRoute)) -> bool>;
+pub type FibRouteV6Filter = Box<dyn Fn(&(Ipv6Prefix, &FibRoute)) -> bool>;
 
 impl Fib {
     /// Set the id for this [`Fib`]
@@ -208,12 +208,12 @@ impl Fib {
     }
 
     /// Iterate over IPv4 routes/entries
-    pub fn iter_v4(&self) -> impl Iterator<Item = (&Ipv4Prefix, &FibRoute)> {
+    pub fn iter_v4(&self) -> impl Iterator<Item = (Ipv4Prefix, &FibRoute)> {
         self.routesv4.iter()
     }
 
     /// Iterate over IPv6 routes/entries
-    pub fn iter_v6(&self) -> impl Iterator<Item = (&Ipv6Prefix, &FibRoute)> {
+    pub fn iter_v6(&self) -> impl Iterator<Item = (Ipv6Prefix, &FibRoute)> {
         self.routesv6.iter()
     }
 
@@ -240,11 +240,11 @@ impl Fib {
         match target {
             IpAddr::V4(a) => {
                 let (prefix, route) = self.routesv4.lookup(*a).unwrap_or_else(|| unreachable!());
-                (Prefix::IPV4(*prefix), route)
+                (Prefix::IPV4(prefix), route)
             }
             IpAddr::V6(a) => {
                 let (prefix, route) = self.routesv6.lookup(*a).unwrap_or_else(|| unreachable!());
-                (Prefix::IPV6(*prefix), route)
+                (Prefix::IPV6(prefix), route)
             }
         }
     }
@@ -310,13 +310,11 @@ impl Absorb<FibChange> for Fib {
             FibChange::AddFibRoute((prefix, keys)) => self.build_add_fibroute(*prefix, keys),
             FibChange::DelFibRoute(prefix) => self.del_fibroute(*prefix),
             FibChange::SetVtep(vtep) => self.set_vtep(vtep),
-            FibChange::Invalidate => {
-                self.valid.store(false, std::sync::atomic::Ordering::SeqCst);
-            }
+            FibChange::Invalidate => self.valid = false,
         }
     }
     fn sync_with(&mut self, first: &Self) {
-        assert!(self.id != FibKey::Unset);
+        assert_ne!(self.id, FibKey::Unset);
         assert_eq!(self.id, first.id);
         debug!("Internal LR state for fib {} is now synced", self.id);
     }
@@ -375,9 +373,8 @@ impl FibWriter {
         self.0.append(FibChange::SetVtep(vtep));
         self.0.publish();
     }
-    pub fn get_vtep(&self) -> Vtep {
-        let fib = self.enter().unwrap_or_else(|| unreachable!());
-        fib.vtep.clone()
+    pub fn get_vtep(&self) -> Option<Vtep> {
+        self.enter().map(|fib| fib.vtep.clone())
     }
     pub fn publish(&mut self) {
         self.0.publish();
@@ -388,9 +385,9 @@ impl FibWriter {
     }
     pub fn destroy(mut self) {
         self.0.append(FibChange::Invalidate);
-        self.publish();
-        // this is sanity and should not be needed
-        while self.as_fibreader().enter().is_some() {}
+        self.0.publish();
+        let taken_fib = self.0.take();
+        assert!(!taken_fib.valid);
     }
 }
 
@@ -406,18 +403,14 @@ impl FibReader {
     #[inline]
     pub fn is_valid(&self) -> bool {
         match self.0.enter() {
-            Some(fib) => fib.valid.load(std::sync::atomic::Ordering::Acquire),
+            Some(fib) => fib.valid,
             None => false,
         }
     }
     pub fn enter(&self) -> Option<ReadGuard<'_, Fib>> {
-        self.0.enter().map(|fib| {
-            if fib.valid.load(std::sync::atomic::Ordering::Acquire) {
-                Some(fib)
-            } else {
-                None
-            }
-        })?
+        self.0
+            .enter()
+            .map(|fib| if fib.valid { Some(fib) } else { None })?
     }
 
     /// Convert `Rc<ReadHandle<Fib>>` -> `FibReader`

@@ -6,10 +6,12 @@ publish.workspace = true
 version.workspace = true
 
 [features]
+loom = ["concurrency/loom"]
 shuttle = ["concurrency/shuttle", "dep:shuttle"]
+shuttle_dfs = ["concurrency/shuttle_dfs", "shuttle"]
 
 [dependencies]
-ahash = { workspace = true }
+ahash = { workspace = true, features = ["std"] }
 arc-swap = { workspace = true }
 bnum = { workspace = true }
 common = { workspace = true }
@@ -24,13 +26,17 @@ net = { workspace = true }
 pipeline = { workspace = true }
 rand = { workspace = true, features = ["thread_rng"] }
 roaring = { workspace = true }
-shuttle = { workspace = true, optional = true }
+strum = { workspace = true }
 thiserror = { workspace = true }
 tracectl = { workspace = true }
 tracing = { workspace = true }
 
+[target.'cfg(not(miri))'.dependencies]
+shuttle = { workspace = true, optional = true }
+
 [dev-dependencies]
 # internal
+config = { workspace = true, features = ["testing"] }
 fixin = { workspace = true }
 flow-filter = { workspace = true }
 test-utils = { workspace = true }
@@ -42,5 +48,7 @@ tracectl = { workspace = true }
 # external
 bolero = { workspace = true, default-features = false, features = ["alloc"] }
 etherparse = { workspace = true }
-shuttle = { workspace = true, features = [] }
 tracing-test = { workspace = true, features = [] }
+
+[target.'cfg(not(miri))'.dev-dependencies]
+shuttle = { workspace = true, features = [] }

@@ -7,11 +7,12 @@ use crate::packet::VpcDiscriminant;
 use concurrency::sync::Arc;
 use concurrency::sync::RwLock;
 use concurrency::sync::Weak;
+use concurrency::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::fmt::{Debug, Display};
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 use super::{AtomicInstant, FlowInfoItem};
 use crate::FlowKey;
@@ -39,7 +40,8 @@ pub enum FlowStatus {
     Cancelled = 1,
     // the flow is invalid because it timed out and will be removed from the flow table
     Expired = 2,
-    // the flow is no longer in the flow table. It may still exist and be referenced, though
+    // the flow is not in the flow table. It may have not been yet inserted or have been
+    // expelled from the flow table. It may still exist and be referenced, though
     Detached = 3,
 }
 
@@ -78,7 +80,7 @@ pub struct AtomicFlowStatus(AtomicU8);
 
 impl Debug for AtomicFlowStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.load(std::sync::atomic::Ordering::Relaxed))
+        write!(f, "{:?}", self.load(Ordering::Relaxed))
     }
 }
 
@@ -95,8 +97,10 @@ impl AtomicFlowStatus {
         FlowStatus::try_from(value).expect("Invalid enum state")
     }
 
-    pub fn store(&self, state: FlowStatus, ordering: Ordering) {
-        self.0.store(u8::from(state), ordering);
+    /// Replace the status with a new `state`, returning the previous value.
+    pub fn store(&self, state: FlowStatus, ordering: Ordering) -> FlowStatus {
+        let old = self.0.swap(u8::from(state), ordering);
+        FlowStatus::try_from(old).unwrap_or_else(|_| unreachable!()) // would only fail on mem corruption ?
     }
 
     /// Atomic compare and exchange of the flow status.
@@ -139,7 +143,7 @@ pub struct FlowInfoLocked {
     // VpcDiscriminant
     pub dst_vpcd: Option<VpcDiscriminant>,
 
-    // State information for stateful NAT, (see NatFlowState)
+    // State information for stateful NAT, (see MasqueradeState)
     pub nat_state: Option<Box<dyn FlowInfoItem>>,
 
     // State information for port forwarding
@@ -156,7 +160,7 @@ pub struct FlowInfoLocked {
 #[derive(Debug)]
 pub struct FlowInfo {
     expires_at: AtomicInstant,
-    flowkey: Option<FlowKey>,
+    flowkey: FlowKey,
     genid: AtomicI64,
     status: AtomicFlowStatus,
     pub locked: RwLock<FlowInfoLocked>,
@@ -169,25 +173,27 @@ pub struct FlowInfo {
 // meta data extension method.
 impl FlowInfo {
     #[must_use]
-    pub fn new(expires_at: Instant) -> Self {
+    pub fn new(flowkey: FlowKey, expires_at: Instant) -> Self {
         Self {
             expires_at: AtomicInstant::new(expires_at),
-            flowkey: None,
+            flowkey,
             genid: AtomicI64::new(0),
-            status: AtomicFlowStatus::from(FlowStatus::Active),
+            status: AtomicFlowStatus::from(FlowStatus::Detached),
             locked: RwLock::new(FlowInfoLocked::default()),
             related: None,
             token: CancellationToken::new(),
         }
     }
 
-    pub fn set_flowkey(&mut self, key: FlowKey) {
-        self.flowkey = Some(key);
+    /// Set a related flow
+    fn set_related(mut self, related: Weak<FlowInfo>) -> Self {
+        self.related = Some(related);
+        self
     }
 
     #[must_use]
-    pub fn flowkey(&self) -> Option<&FlowKey> {
-        self.flowkey.as_ref()
+    pub fn flowkey(&self) -> &FlowKey {
+        &self.flowkey
     }
 
     #[must_use]
@@ -196,10 +202,7 @@ impl FlowInfo {
     ///
     /// This method panics if the inner lock is poisoned
     pub fn get_dst_vpcd(&self) -> Option<VpcDiscriminant> {
-        self.locked
-            .read()
-            .expect("Failure locking flow-info for reading")
-            .dst_vpcd
+        self.locked.read().dst_vpcd
     }
 
     /// Set the generation Id of a flow
@@ -271,31 +274,15 @@ impl FlowInfo {
             let one_weak = Weak::from_raw(Weak::into_raw(one_weak) as *const Self);
             let two_weak = Weak::from_raw(Weak::into_raw(two_weak) as *const Self);
             // overwrite the memory locations with the FlowInfo's
-            one_p.write(Self {
-                expires_at: AtomicInstant::new(expires_at),
-                flowkey: Some(key1),
-                genid: AtomicI64::new(0),
-                status: AtomicFlowStatus::from(FlowStatus::Active),
-                locked: RwLock::new(FlowInfoLocked::default()),
-                related: Some(two_weak),
-                token: CancellationToken::new(),
-            });
-            two_p.write(Self {
-                expires_at: AtomicInstant::new(expires_at),
-                flowkey: Some(key2),
-                genid: AtomicI64::new(0),
-                status: AtomicFlowStatus::from(FlowStatus::Active),
-                locked: RwLock::new(FlowInfoLocked::default()),
-                related: Some(one_weak),
-                token: CancellationToken::new(),
-            });
+            one_p.write(FlowInfo::new(key1, expires_at).set_related(two_weak));
+            two_p.write(FlowInfo::new(key2, expires_at).set_related(one_weak));
             // turn back into Arc's
             (one.assume_init(), two.assume_init())
         }
     }
 
     pub fn expires_at(&self) -> Instant {
-        self.expires_at.load(std::sync::atomic::Ordering::Relaxed)
+        self.expires_at.load(Ordering::Relaxed)
     }
 
     /// Extend the expiry of the flow if it is not expired.
@@ -305,7 +292,7 @@ impl FlowInfo {
     /// Returns `FlowInfoError::FlowExpired` if the flow is expired with the expiry `Instant`
     ///
     pub fn extend_expiry(&self, duration: Duration) -> Result<(), FlowInfoError> {
-        if self.status.load(std::sync::atomic::Ordering::Relaxed) == FlowStatus::Expired {
+        if self.status.load(Ordering::Relaxed) == FlowStatus::Expired {
             return Err(FlowInfoError::FlowExpired(self.expires_at()));
         }
         self.extend_expiry_unchecked(duration);
@@ -319,8 +306,7 @@ impl FlowInfo {
     /// This method is thread-safe.
     ///
     pub fn extend_expiry_unchecked(&self, duration: Duration) {
-        self.expires_at
-            .fetch_add(duration, std::sync::atomic::Ordering::Relaxed);
+        self.expires_at.fetch_add(duration, Ordering::Relaxed);
     }
 
     /// Reset the expiry of the flow if it is not expired.
@@ -335,7 +321,7 @@ impl FlowInfo {
     /// Returns `FlowInfoError::TimeoutUnchanged` if the new timeout is smaller than the current.
     /// Returns `FlowInfoError::FlowCancelled` if the flow had been cancelled
     pub fn reset_expiry(&self, duration: Duration) -> Result<(), FlowInfoError> {
-        match self.status.load(std::sync::atomic::Ordering::Relaxed) {
+        match self.status.load(Ordering::Relaxed) {
             FlowStatus::Active => self.reset_expiry_unchecked(duration),
             FlowStatus::Cancelled => Err(FlowInfoError::FlowCancelled),
             FlowStatus::Detached => Err(FlowInfoError::FlowDetached),
@@ -359,8 +345,7 @@ impl FlowInfo {
         if new < current {
             return Err(FlowInfoError::TimeoutUnchanged);
         }
-        self.expires_at
-            .store(new, std::sync::atomic::Ordering::Relaxed);
+        self.expires_at.store(new, Ordering::Relaxed);
         Ok(())
     }
 
@@ -370,17 +355,17 @@ impl FlowInfo {
     ///
     /// This method is thread-safe.
     pub fn status(&self) -> FlowStatus {
-        self.status.load(std::sync::atomic::Ordering::Relaxed)
+        self.status.load(Ordering::Relaxed)
     }
 
-    /// Tell if a `FlowInfo` is valid for processing the packets that match it.
+    /// Tell if a `FlowInfo` is active, i.e. eligible for processing packets that match it.
     /// Only `FlowInfo`s with status `FlowStatus::Active` are. This method is mostly useful for NFs
     /// which don't care about the actual states that a flow may have.
     ///
     /// # Thread Safety
     ///
     /// This method is thread-safe.
-    pub fn is_valid(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         self.status() == FlowStatus::Active
     }
 
@@ -391,8 +376,12 @@ impl FlowInfo {
     ///
     /// This method is thread-safe.
     pub fn invalidate(&self) {
-        self.update_status(FlowStatus::Cancelled);
-        self.token.cancel();
+        let status = self.update_status(FlowStatus::Cancelled);
+        if status == FlowStatus::Active {
+            debug!("Invalidating flow {}...", self.logfmt());
+            self.update_status(FlowStatus::Cancelled);
+            self.token.cancel();
+        }
     }
 
     /// Invalidate a flow and also its related flow if any.
@@ -408,13 +397,12 @@ impl FlowInfo {
             .inspect(|related| related.invalidate());
     }
 
-    /// Update the flow status.
+    /// Update the flow status. Returns the previous `FlowStatus`
     ///
     /// # Thread Safety
     ///
     /// This method is thread-safe.
-    pub fn update_status(&self, status: FlowStatus) {
-        self.status
-            .store(status, std::sync::atomic::Ordering::Relaxed);
+    pub fn update_status(&self, status: FlowStatus) -> FlowStatus {
+        self.status.store(status, Ordering::Relaxed)
     }
 }

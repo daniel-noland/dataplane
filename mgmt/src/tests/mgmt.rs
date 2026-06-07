@@ -9,6 +9,7 @@ pub mod test {
     use config::external::gwgroup::GwGroupMember;
     use config::external::gwgroup::GwGroupTable;
 
+    use flow_entry::flow_table::FlowTable;
     use lpm::prefix::Prefix;
     use net::eth::mac::Mac;
     use net::interface::Mtu;
@@ -387,112 +388,126 @@ pub mod test {
             .expect("Should succeed")
     }
 
-    #[traced_test]
+    #[cfg_attr(not(emulated), traced_test)]
     #[test]
     fn check_frr_config() {
         /* Not really a test but a tool to check generated FRR configs given a gateway config */
         let external = sample_external_config();
-        let mut config = GwConfig::new(external);
-        config.validate().expect("Config validation failed");
+        let config = GwConfig::new(external);
+        let validated_config = config.validate().expect("Config validation failed");
         if false {
-            let vpc_table = &config.external.overlay.vpc_table;
-            let peering_table = &config.external.overlay.peering_table;
+            let vpc_table = validated_config.external().overlay().vpc_table();
+            let peering_table = validated_config.external().overlay().peering_table();
             println!("\n{}\n{peering_table}", vpc_table.as_summary());
         }
         let bmp_config = None;
-        let internal = build_internal_config(&config, bmp_config).expect("Should succeed");
-        let rendered = internal.render(&config.genid());
+        let internal =
+            build_internal_config(&validated_config, bmp_config).expect("Should succeed");
+        let rendered = internal.render(&validated_config.genid());
         println!("{rendered}");
     }
 
-    #[ignore = "temporarily disabled during vm test runner refactor"]
     #[n_vm::in_vm]
-    #[tokio::test]
-    async fn test_sample_config() {
-        get_trace_ctl()
-            .setup_from_string("cpi=debug,mgmt=debug,routing=debug")
-            .unwrap();
-
-        /* build sample external config */
-        let external = sample_external_config();
-        println!("External config is:\n{external:#?}");
-
-        /* build a gw config from a sample external config */
-        let config = GwConfig::new(external);
-
-        let dp_status_r: Arc<RwLock<DataplaneStatus>> =
-            Arc::new(RwLock::new(DataplaneStatus::new()));
-
-        /* build router config */
-        let router_params = RouterParamsBuilder::default()
-            .cpi_sock_path("/tmp/cpi.sock")
-            .cli_sock_path("/tmp/cli.sock")
-            .frr_agent_path("/tmp/frr-agent.sock")
-            .dp_status(dp_status_r.clone())
+    #[test]
+    fn test_sample_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
-            .expect("Should succeed due to defaults");
+            .expect("failed to build tokio runtime for test_sample_config");
+        rt.block_on(async {
+            get_trace_ctl()
+                .setup_from_string("cpi=debug,mgmt=debug,routing=debug")
+                .unwrap();
 
-        /* start router */
-        let router = Router::new(router_params, None);
-        if let Err(e) = &router {
-            error!("New router failed: {e}");
-            panic!();
-        }
-        let mut router = router.unwrap();
+            /* build sample external config */
+            let external = sample_external_config();
+            println!("External config is:\n{external:#?}");
 
-        /* router control */
-        let router_ctl = router.get_ctl_tx();
+            /* build a gw config from a sample external config */
+            let config = GwConfig::new(external);
 
-        /* vpcmappings for vpc name resolution for vpc stats */
-        let vpcmapw = VpcMapWriter::<VpcMapName>::new();
+            let dp_status_r: Arc<RwLock<DataplaneStatus>> =
+                Arc::new(RwLock::new(DataplaneStatus::new()));
 
-        /* create NatTables for stateless nat */
-        let nattablesw = NatTablesWriter::new();
+            /* build router config */
+            let router_params = RouterParamsBuilder::default()
+                .cpi_sock_path("/tmp/cpi.sock")
+                .cli_sock_path("/tmp/cli.sock")
+                .frr_agent_path("/tmp/frr-agent.sock")
+                .dp_status(dp_status_r.clone())
+                .build()
+                .expect("Should succeed due to defaults");
 
-        /* create NatAllocator for stateful nat */
-        let natallocatorw = NatAllocatorWriter::new();
-
-        /* create FlowFilterTable for flow filtering */
-        let flowfilterw = FlowFilterTableWriter::new();
-
-        /* create port forwarding table */
-        let portfw_w = PortFwTableWriter::new();
-
-        /* create VPC stats store (Arc) */
-        let vpc_stats_store = VpcStatsStore::new();
-
-        /* pipeline data */
-        let pipeline_data = Arc::from(PipelineData::default());
-
-        /* build configuration of mgmt config processor */
-        let processor_config = ConfigProcessorParams {
-            router_ctl,
-            pipeline_data,
-            vpcmapw,
-            nattablesw,
-            natallocatorw,
-            flowfilterw,
-            portfw_w,
-            vpc_stats_store,
-            dp_status_r,
-            bmp_options: None,
-        };
-
-        /* start config processor to test the processing of a config. The processor embeds the
-        config database . In this test, we don't use any channel to communicate the config. */
-        let (mut processor, _) = ConfigProcessor::new(processor_config);
-
-        /* let the processor process the config */
-        match processor.process_incoming_config(config).await {
-            Ok(()) => {}
-            Err(e) => {
-                error!("{e}");
-                panic!("{e}");
+            /* start router */
+            let test_mgmt = lifecycle::Subsystem::new("mgmt", lifecycle::CancellationToken::new());
+            let test_router =
+                lifecycle::Subsystem::new("router", lifecycle::CancellationToken::new());
+            let handle = tokio::runtime::Handle::current();
+            let router = Router::new(&test_mgmt, &handle, &test_router, router_params, None);
+            if let Err(e) = &router {
+                error!("New router failed: {e}");
+                panic!();
             }
-        }
+            let mut router = router.unwrap();
 
-        /* stop the router */
-        debug!("Stopping the router...");
-        router.stop();
+            /* router control */
+            let router_ctl = router.get_ctl_tx();
+
+            /* vpcmappings for vpc name resolution for vpc stats */
+            let vpcmapw = VpcMapWriter::<VpcMapName>::new();
+
+            /* create NatTables for stateless nat */
+            let nattablesw = NatTablesWriter::new();
+
+            /* create NatAllocator for stateful nat */
+            let natallocatorw = NatAllocatorWriter::new();
+
+            /* create FlowFilterTable for flow filtering */
+            let flowfilterw = FlowFilterTableWriter::new();
+
+            /* create port forwarding table */
+            let portfw_w = PortFwTableWriter::new();
+
+            /* create VPC stats store (Arc) */
+            let vpc_stats_store = VpcStatsStore::new();
+
+            /* pipeline data */
+            let pipeline_data = Arc::from(PipelineData::default());
+
+            /* flow table */
+            let flow_table = Arc::from(FlowTable::new(16));
+
+            /* build configuration of mgmt config processor */
+            let processor_config = ConfigProcessorParams {
+                router_ctl,
+                pipeline_data,
+                flow_table,
+                vpcmapw,
+                nattablesw,
+                natallocatorw,
+                flowfilterw,
+                portfw_w,
+                vpc_stats_store,
+                dp_status_r,
+                bmp_options: None,
+            };
+
+            /* start config processor to test the processing of a config. The processor embeds the
+            config database . In this test, we don't use any channel to communicate the config. */
+            let (mut processor, _) = ConfigProcessor::new(processor_config);
+
+            /* let the processor process the config */
+            match processor.process_incoming_config(config).await {
+                Ok(()) => {}
+                Err(e) => {
+                    error!("{e}");
+                    panic!("{e}");
+                }
+            }
+
+            /* stop the router */
+            debug!("Stopping the router...");
+            router.stop();
+        }); // rt.block_on
     }
 }

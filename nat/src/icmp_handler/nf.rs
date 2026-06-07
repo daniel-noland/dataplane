@@ -1,26 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Open Network Fabric Authors
 
-//! A network function to process icmp error packets
+//! A network function to process icmp error packets in the overlay
+//! if those correspond to port-forwarding or masquerading
 
 use flow_entry::flow_table::FlowTable;
 use net::buffer::PacketBufferMut;
 use net::checksum::Checksum;
-use net::headers::{
-    EmbeddedTransport, TryEmbeddedHeaders, TryEmbeddedTransport, TryIcmpAny, TryInnerIp,
-    TryInnerIpv4, TryIp,
-};
-use net::icmp_any::{IcmpAnyChecksumPayload, TruncatedIcmpAny};
-use net::ip::NextHeader;
+use net::flow_key::flowkey_embedded_in_icmp_error;
+use net::headers::{TryEmbeddedHeaders, TryIcmpAny, TryInnerIpv4, TryIp};
+use net::icmp_any::{IcmpAny, IcmpAnyChecksumPayload};
+use net::icmp4::{Icmp4DestUnreachable, Icmp4Type};
+use net::icmp6::Icmp6Type;
 use net::packet::{DoneReason, Packet};
-use net::{FlowKey, IcmpProtoKey, IpProtoKey, TcpProtoKey, UdpProtoKey};
 
+use concurrency::sync::Arc;
 use pipeline::NetworkFunction;
-use std::sync::Arc;
+use strum::EnumMessage;
+use tracectl::trace_target;
 use tracing::{debug, warn};
 
-use tracectl::trace_target;
-
+use crate::common::NatFlowStatus;
 use crate::portfw::icmp_handling::handle_icmp_error_port_forwarding;
 use crate::stateful::icmp_handling::handle_icmp_error_masquerading;
 
@@ -84,73 +84,39 @@ fn icmp_checksums_ok<Buf: PacketBufferMut>(packet: &mut Packet<Buf>) -> bool {
     true
 }
 
-/// Build a `FlowKey` for the embedded "offending" packet within an ICMP error packet
-fn get_icmp_inner_pkt_flowkey<Buf: PacketBufferMut>(packet: &mut Packet<Buf>) -> Option<FlowKey> {
-    // get the data for the embedded, offending packet
-    let Some(inner) = packet.embedded_headers() else {
-        debug!("ICMP error message does not contain inner packet");
-        return None;
+/// Tell if the given ICMP error packet is "unrecoverable" in the sense that any flow related to it *may*
+/// be removed because the source may no longer send packets after receiving the error message.
+fn is_icmp_unrecoverable<Buf: PacketBufferMut>(packet: &mut Packet<Buf>) -> (bool, Option<&str>) {
+    let Some(icmp) = packet.try_icmp_any() else {
+        return (false, None);
     };
-
-    let net = inner.try_inner_ip()?;
-    let src_ip = net.src_addr();
-    let dst_ip = net.dst_addr();
-    let proto = net.next_header();
-
-    let embedded_transport = inner.try_embedded_transport()?;
-
-    // FIXME(fredi): see if we should do a TryFrom<EmbeddedTransport> for IpProtoKey
-    // as suggested by Quentin
-    let proto_key = match embedded_transport {
-        EmbeddedTransport::Tcp(tcp) => {
-            debug_assert_eq!(proto, NextHeader::TCP);
-            IpProtoKey::Tcp(TcpProtoKey::from((tcp.source(), tcp.destination())))
+    debug_assert!(icmp.is_error_message());
+    match icmp {
+        IcmpAny::V4(icmp4) if let Icmp4Type::DestUnreachable(unreach) = icmp4.icmp_type() => {
+            let unrec = !matches!(unreach, Icmp4DestUnreachable::FragmentationNeeded { .. });
+            (unrec, unreach.get_message())
         }
-        EmbeddedTransport::Udp(udp) => {
-            debug_assert_eq!(proto, NextHeader::UDP);
-            IpProtoKey::Udp(UdpProtoKey::from((udp.source(), udp.destination())))
+        IcmpAny::V6(icmp6) if let Icmp6Type::DestUnreachable(unreach) = icmp6.icmp_type() => {
+            (true, unreach.get_message())
         }
-        EmbeddedTransport::Icmp4(icmp) => {
-            debug_assert_eq!(proto, NextHeader::ICMP);
-            // Icmp errors are not sent for icmp errors
-            let icmp_id = icmp.identifier()?;
-            IpProtoKey::Icmp(IcmpProtoKey::QueryMsgData(icmp_id))
+        IcmpAny::V6(icmp6) if let Icmp6Type::PacketTooBig(_) = icmp6.icmp_type() => {
+            (false, Some("Packet too big"))
         }
-        EmbeddedTransport::Icmp6(icmp6) => {
-            debug_assert_eq!(proto, NextHeader::ICMP6);
-            // Icmp errors are not sent for icmp errors
-            let icmp_id = icmp6.identifier()?;
-            IpProtoKey::Icmp(IcmpProtoKey::QueryMsgData(icmp_id))
-        }
-    };
-    if proto == NextHeader::TCP || proto == NextHeader::UDP {
-        let src_port = embedded_transport.source()?;
-        let dst_port = embedded_transport.destination()?;
-        debug!("ICMP offending packet: ({proto}) src:{src_ip}:{src_port} dst:{dst_ip}:{dst_port}");
-    } else if proto == NextHeader::ICMP || proto == NextHeader::ICMP6 {
-        let id = embedded_transport.icmp_identifier()?;
-        debug!("ICMP offending packet: ({proto}) src:{src_ip} dst:{dst_ip} id: {id}");
+        _ => (false, None),
     }
-    let flow_key = FlowKey::uni(None, src_ip, dst_ip, proto_key);
-    Some(flow_key)
 }
 
 impl IcmpErrorHandler {
-    /// Handle an ICMP error packet. This processing follows requirements REQ-4 and REQ-5
-    /// of RFC 5508, "NAT Behavioral Requirements for ICMP".
     fn handle_icmp_error_msg<Buf: PacketBufferMut>(&self, packet: &mut Packet<Buf>) {
-        // where does this ICMP come from?
-        let Some(icmp_src_vpcd) = packet.meta().src_vpcd else {
-            debug!("Got ICMP packet without src vpc discriminant. Will drop");
+        // check origin of icmp error packet
+        let Some(src_vpcd) = packet.meta().src_vpcd else {
+            debug!("Dropping ICMP error packet: no src vpc discriminant");
             packet.done(DoneReason::Unroutable);
             return;
         };
-        debug!("Got ICMP error packet from {icmp_src_vpcd}");
+        debug!("Processing ICMP error packet from {src_vpcd}");
 
-        // drop packet if icmp checksums are not okay. We compute the checksum before we actually
-        // know if we'll be able to process the packet. This is wasteful if we will drop it. OTH,
-        // if the packet has been altered, our lookup in the flow table may provide either no flow or,
-        // worse, a wrong flow. So, we do it here, with the hope that this will later be HW offloaded.
+        // drop packet if icmp checksums are not correct
         if !icmp_checksums_ok(packet) {
             return;
         }
@@ -161,46 +127,83 @@ impl IcmpErrorHandler {
         // ports which we may have translated, and which differ from the original packet we mangled.
         // Now, given that we (presumably) sent the offending packet, we can't expect to find a flow
         // for it (because we modified it), but we should have a flow in the reverse direction to tell
-        // us how to handle the "reply" we would get had the offending packet made it successfully to
-        // its recipient. So, here, we:
+        // us how to handle the "reply" we would get had the offending packet made it to its recipient.
+        // So, here, we:
         //    1) build a flow key for the offending packet and REVERSE it
         //    2) look up the flow table for a flow in the reverse path of the offending packet.
 
-        let Some(flow_key) = get_icmp_inner_pkt_flowkey(packet) else {
-            debug!("Could not build flow key for ICMP-error embedded packet");
-            packet.done(DoneReason::IcmpErrorIncomplete);
+        let flow_key = match flowkey_embedded_in_icmp_error(packet) {
+            Ok(flow_key) => flow_key,
+            Err(e) => {
+                debug!("Could not build flow key for ICMP-error inner packet: {e}");
+                packet.done(DoneReason::IcmpErrorIncomplete);
+                return;
+            }
+        };
+        // reverse the flow key and set src vpc
+        let rev_flow_key = flow_key.reverse(Some(src_vpcd));
+
+        // look up a flow in the flow table for such a key
+        let Some(flow) = self.flow_table.lookup(&rev_flow_key) else {
+            debug!("Found no flow for key={rev_flow_key}. Letting packet through...");
+            // There is no flow for the provided flow key. This is not necessarily an error since the
+            // ICMP error packet could correspond to a flow that uses static NAT or no NAT at all. It
+            // could correspond to a masqueraded / port-forwarded flow that was just expired (unlikely).
+            // In either case, leave the packet through so that the flow filter deals with it.
             return;
         };
+        debug!("Found flow, {}", flow.logfmt());
 
-        // reverse the flow key and look up for a flow in the flow table.
-        let rev_flow_key = flow_key.reverse(Some(icmp_src_vpcd));
-        let Some(flow) = self.flow_table.lookup(&rev_flow_key) else {
-            debug!("Found no flow for key={rev_flow_key}");
+        // if the inner packet matched a flow, but it is not active, drop the ICMP error packet.
+        // This should very seldom happen as flows stay very little in the flow table once no longer valid.
+        if !flow.is_active() {
+            debug!("Matched flow is not active. Dropping ICMP error packet");
             packet.done(DoneReason::Filtered);
             return;
-        };
-        debug!("Found flow for key={rev_flow_key}");
-        let flow_info_locked = flow.locked.read().unwrap();
+        }
+
+        let flow_info_locked = flow.locked.read();
         let Some(dst_vpcd) = flow_info_locked.dst_vpcd else {
-            warn!("Flow-info for {rev_flow_key} has no dst VPC discriminant. This is a bug");
+            warn!("Flow for {rev_flow_key} has no dst VPC discriminant set. This is a bug");
             packet.done(DoneReason::InternalFailure);
             return;
         };
 
-        // burn the dst vpcd in the packet. This NF offloads the flow-filter from doing that
+        // set the dst vpcd in the packet for the flow filter to ignore the packet
         packet.meta_mut().dst_vpcd = Some(dst_vpcd);
 
-        // process the packet depending on the state of the flow
-        if flow_info_locked.nat_state.is_some() {
-            handle_icmp_error_masquerading(packet, flow.as_ref());
+        // process the packet depending on the flow info
+        let result = if flow_info_locked.nat_state.is_some() {
+            debug!("Icmp error is for vpc {dst_vpcd}. Will process with masquerade state");
+            handle_icmp_error_masquerading(packet, flow.as_ref())
         } else if flow_info_locked.port_fw_state.is_some() {
-            handle_icmp_error_port_forwarding(packet, flow.as_ref());
+            debug!("Icmp error is for vpc {dst_vpcd}. Will process with port-forwarding state");
+            handle_icmp_error_port_forwarding(packet, flow.as_ref())
         } else {
-            debug!("Found no specific NAT state to process ICMP error message. Dropping...");
-            // This can't happen atm since the only NFs that create flows are stateful NAT
-            // and port-forwarding. If we hit a flow that does not have either of those set
-            // that's, atm, a bug in either of them.
-            packet.done(DoneReason::InternalFailure);
+            warn!("Found no NAT state to process ICMP error message. Dropping...");
+            Err(DoneReason::Filtered)
+        };
+
+        // drop packet if could not translate it
+        let status = match result {
+            Ok(status) => status,
+            Err(reason) => {
+                packet.done(reason);
+                return;
+            }
+        };
+
+        // If processing the ICMP error succeeded, drop the flows associated to the offending packet
+        // if the problem is hardly recoverable. This expedites removing those flows, which would probably
+        // be never hit again and, in case of masquerading, releases the allocated ports sooner.
+        // This optimization is only applied if the `NatFlowStatus` is one-way.
+        let (unrecoverable, reason) = is_icmp_unrecoverable(packet);
+        let reason = reason.unwrap_or("unspecified");
+        if unrecoverable && status == NatFlowStatus::OneWay {
+            debug!("Invalidating flows due to ICMP error (reason={reason} flow-status={status})");
+            flow.invalidate_pair();
+        } else {
+            debug!("Will not invalidate flows (reason={reason} flow-status={status})");
         }
     }
 }
@@ -212,18 +215,7 @@ impl<Buf: PacketBufferMut> NetworkFunction<Buf> for IcmpErrorHandler {
     ) -> impl Iterator<Item = Packet<Buf>> + 'a {
         input.filter_map(move |mut packet| {
             if !packet.is_done() && packet.meta().is_overlay() && packet.is_icmp_error() {
-                if packet.meta().requires_stateless_nat() {
-                    // don't process icmp errors for stateless NAT or if we have
-                    debug!("ICMP error will be handled by static NAT NF:\n{packet}");
-                } else if packet.meta().dst_vpcd.is_some() {
-                    // NOTE: this assumes that the flow-filter will NOT mark icmp errors
-                    // for port-forwarding or masquerading
-                    debug!("Dst-vpcd for ICMP error packet is known.",);
-                } else {
-                    // last chance. If packet was triggered by a masqueraded or port forwarded
-                    // packet, we should be able to process it here.
-                    self.handle_icmp_error_msg(&mut packet);
-                }
+                self.handle_icmp_error_msg(&mut packet);
             }
             packet.enforce()
         })

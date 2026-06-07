@@ -33,6 +33,7 @@
 extern crate alloc;
 extern crate core;
 
+pub mod acl;
 pub mod dev;
 pub mod eal;
 pub mod flow;
@@ -41,3 +42,9 @@ pub mod mem;
 pub mod queue;
 pub mod ring;
 pub mod socket;
+
+#[cfg(any(test, feature = "test"))]
+pub mod test_support;
+
+#[cfg(feature = "test")]
+pub use dpdk_test_macros::with_eal;
