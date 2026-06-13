@@ -269,7 +269,7 @@ fn translate_inner_tcp_udp_dst(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use net::buffer::TestBuffer;
+    use net::buffer::{TestBuffer, TryAsMut};
     use net::eth::ethtype::EthType;
     use net::headers::{HeadersBuilder, Net, Transport};
     use net::icmp4::Icmp4;
@@ -288,7 +288,7 @@ mod tests {
         headers.eth(Some(make_default_for_eth(EthType::IPV4)));
         let headers = headers.build().unwrap();
         let mut buffer = TestBuffer::new();
-        headers.deparse(buffer.as_mut()).unwrap();
+        headers.deparse(buffer.try_as_mut().unwrap()).unwrap();
         let packet = Packet::new(buffer).unwrap();
 
         let result = validate_checksums_icmp(&packet);
@@ -307,7 +307,7 @@ mod tests {
 
         let headers = headers.build().unwrap();
         let mut buffer = TestBuffer::new();
-        headers.deparse(buffer.as_mut()).unwrap();
+        headers.deparse(buffer.try_as_mut().unwrap()).unwrap();
         let packet = Packet::new(buffer).unwrap();
 
         let result = validate_checksums_icmp(&packet);
@@ -334,7 +334,7 @@ mod tests {
 
         let headers = headers.build().unwrap();
         let mut buffer = TestBuffer::new();
-        headers.deparse(buffer.as_mut()).unwrap();
+        headers.deparse(buffer.try_as_mut().unwrap()).unwrap();
         let packet = Packet::new(buffer).unwrap();
 
         let result = validate_checksums_icmp(&packet);
@@ -358,7 +358,7 @@ mod tests {
 
         let headers = headers.build().unwrap();
         let mut buffer = TestBuffer::new();
-        headers.deparse(buffer.as_mut()).unwrap();
+        headers.deparse(buffer.try_as_mut().unwrap()).unwrap();
         let packet = Packet::new(buffer).unwrap();
 
         let result = validate_checksums_icmp(&packet);
@@ -397,7 +397,7 @@ mod tests {
         let data = vec![0u8; headers.size().get() as usize];
         let mut buffer = TestBuffer::from_raw_data(&data);
 
-        headers.deparse(buffer.as_mut()).unwrap();
+        headers.deparse(buffer.try_as_mut().unwrap()).unwrap();
         let packet = Packet::new(buffer).unwrap();
 
         let result = validate_checksums_icmp(&packet);
