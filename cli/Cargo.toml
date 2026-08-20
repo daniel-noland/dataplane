@@ -10,6 +10,11 @@ autobins = false
 name = "cli"
 path = "bin/main.rs"
 
+[features]
+# Declared as a no-op: the image build passes --features to every package it builds, so a
+# feature only some of them know about fails the build outright.
+widen-handback-window = []
+
 [dependencies]
 clap = { workspace = true, features = ["derive", "std", "usage"] }
 concurrency = { workspace = true }

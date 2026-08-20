@@ -867,6 +867,16 @@ vlab-patch-dataplane:
     {{ _just_debuggable_ }}
     just pyroscope_url="{{ pyroscope_url }}" dataplane_proxy_url="{{ dataplane_proxy_url }}" dataplane_env="{{ dataplane_env }}" features="{{ features }}" oci_insecure=true oci_repo="{{ vlab_oci_repo }}" push-container dataplane
     VERSION="{{ version }}" just platform=wasm32-wasip1 oci_insecure=true oci_repo="{{ vlab_oci_repo }}" push-container validator
+    # Patching the fabric to a tag the registry does not have takes the dataplane down with
+    # ImagePullBackOff, and the resulting silence looks like a dataplane that is running and
+    # simply has nothing to say. Confirm both images are actually there before pointing the
+    # fabric at them.
+    for image in "{{ oci_image_dataplane }}" "{{ oci_image_dataplane_validator }}"; do
+        if ! skopeo inspect --tls-verify=false "docker://${image}" >/dev/null 2>&1; then
+            >&2 echo "vlab-patch-dataplane: ${image} is not in the registry; refusing to patch"
+            exit 1
+        fi
+    done
     pushd ./scripts/vlab
     ./control.sh kubectl -n fab patch fab/default --type=merge -p '{"spec":{"overrides":{"versions":{"gateway":{"dataplane":"{{version}}"}}}}}'
     popd
