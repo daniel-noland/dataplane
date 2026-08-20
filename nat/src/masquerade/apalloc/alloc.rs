@@ -319,8 +319,37 @@ impl<I: NatIpWithBitmap> AllocatedIp<I> {
     }
 }
 
+/// Hold an address in the state where it belongs to neither the bitmap nor the in-use list.
+///
+/// Between the strong count reaching zero and this `Drop` reaching the pool's write lock, an
+/// address is reachable through neither path, and an allocation landing in the gap is told the
+/// pool is empty. The gap is real on every release, but it is normally about as wide as an
+/// uncontended lock acquisition, which makes it something you catch rather than something you
+/// show. Widening it on purpose turns the question "can this happen" into "watch it happen".
+///
+/// Compiled out entirely without the feature, and zero unless the environment names a delay: a
+/// sleep on the packet path should not be reachable by accident.
+#[cfg(feature = "widen-handback-window")]
+fn widen_handback_window() {
+    static DELAY: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    let delay = *DELAY.get_or_init(|| {
+        std::env::var("DATAPLANE_HANDBACK_DELAY_US")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .map_or(Duration::ZERO, Duration::from_micros)
+    });
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+}
+
+#[cfg(not(feature = "widen-handback-window"))]
+#[inline(always)]
+fn widen_handback_window() {}
+
 impl<I: NatIpWithBitmap> Drop for AllocatedIp<I> {
     fn drop(&mut self) {
+        widen_handback_window();
         self.ip_allocator.deallocate_ip(self.ip);
     }
 }

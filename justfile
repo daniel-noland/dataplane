@@ -53,6 +53,10 @@ default_features := "true"
 # pyroscope server the dataplane image should push profiles to (empty = profiling off)
 pyroscope_url := ""
 
+# Extra KEY=VALUE pairs baked into the dataplane image, space separated. For turning on things a
+# controller-owned argv cannot reach -- experiment knobs, mostly.
+dataplane_env := ""
+
 # HTTP proxy baked into the dataplane image. Gateway nodes have no route off the fabric, so
 # anything the dataplane pushes outward -- profiles today -- has to go through the control proxy.
 # Alloy gets the equivalent injected into its config by fabricator; the dataplane has no such
@@ -293,6 +297,9 @@ build-container target="dataplane" *args: (build (if target == "dataplane" { "da
             if [ -n "{{ pyroscope_url }}" ]; then
                 import_changes+=(--change 'ENV DATAPLANE_PYROSCOPE_URL={{ pyroscope_url }}')
             fi
+            for kv in {{ dataplane_env }}; do
+                import_changes+=(--change "ENV ${kv}")
+            done
             if [ -n "{{ dataplane_proxy_url }}" ]; then
                 # Both spellings: reqwest reads the lowercase one, most other clients the upper.
                 import_changes+=(--change 'ENV HTTP_PROXY={{ dataplane_proxy_url }}')
@@ -858,7 +865,7 @@ telemetry-purge: telemetry-down
 [script]
 vlab-patch-dataplane:
     {{ _just_debuggable_ }}
-    just pyroscope_url="{{ pyroscope_url }}" dataplane_proxy_url="{{ dataplane_proxy_url }}" oci_insecure=true oci_repo="{{ vlab_oci_repo }}" push-container dataplane
+    just pyroscope_url="{{ pyroscope_url }}" dataplane_proxy_url="{{ dataplane_proxy_url }}" dataplane_env="{{ dataplane_env }}" features="{{ features }}" oci_insecure=true oci_repo="{{ vlab_oci_repo }}" push-container dataplane
     VERSION="{{ version }}" just platform=wasm32-wasip1 oci_insecure=true oci_repo="{{ vlab_oci_repo }}" push-container validator
     pushd ./scripts/vlab
     ./control.sh kubectl -n fab patch fab/default --type=merge -p '{"spec":{"overrides":{"versions":{"gateway":{"dataplane":"{{version}}"}}}}}'

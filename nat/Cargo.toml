@@ -7,6 +7,10 @@ version.workspace = true
 
 [features]
 loom = ["concurrency/loom"]
+# Deliberately widens the address hand-back window so the race there can be demonstrated on a
+# running system rather than only under a model checker. Never enable in a shipping build: it
+# sleeps on the packet path.
+widen-handback-window = []
 shuttle = ["concurrency/shuttle", "dep:shuttle"]
 shuttle_dfs = ["concurrency/shuttle_dfs", "shuttle"]
 
