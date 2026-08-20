@@ -20,3 +20,4 @@ result*/**
 /bin
 sysroot
 devroot
+creds.json
