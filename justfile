@@ -871,7 +871,10 @@ vlab-patch-dataplane:
     # ImagePullBackOff, and the resulting silence looks like a dataplane that is running and
     # simply has nothing to say. Confirm both images are actually there before pointing the
     # fabric at them.
-    for image in "{{ oci_image_dataplane }}" "{{ oci_image_dataplane_validator }}"; do
+    # Built from vlab_oci_repo, not the oci_image_* variables: those are derived from the default
+    # oci_repo, while the pushes above target the vlab registry. Checking the wrong registry makes
+    # the guard refuse a patch that would have been fine.
+    for image in "{{ vlab_oci_repo }}/{{ oci_name }}:{{ version }}" "{{ vlab_oci_repo }}/{{ oci_name }}/validator:{{ version }}"; do
         if ! skopeo inspect --tls-verify=false "docker://${image}" >/dev/null 2>&1; then
             >&2 echo "vlab-patch-dataplane: ${image} is not in the registry; refusing to patch"
             exit 1
