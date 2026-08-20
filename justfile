@@ -865,8 +865,15 @@ telemetry-purge: telemetry-down
 [script]
 vlab-patch-dataplane:
     {{ _just_debuggable_ }}
-    just pyroscope_url="{{ pyroscope_url }}" dataplane_proxy_url="{{ dataplane_proxy_url }}" dataplane_env="{{ dataplane_env }}" features="{{ features }}" oci_insecure=true oci_repo="{{ vlab_oci_repo }}" push-container dataplane
-    VERSION="{{ version }}" just platform=wasm32-wasip1 oci_insecure=true oci_repo="{{ vlab_oci_repo }}" push-container validator
+    # Forward every variable that shapes the build or the version string. `version` is built from
+    # platform, profile, sanitize and features, so a nested invocation missing any of them pushes
+    # an image under a tag the outer recipe will not look for -- and, worse, quietly builds
+    # something other than what was asked for.
+    just profile="{{ profile }}" platform="{{ platform }}" libc="{{ libc }}" sanitize="{{ sanitize }}" \
+        features="{{ features }}" pyroscope_url="{{ pyroscope_url }}" \
+        dataplane_proxy_url="{{ dataplane_proxy_url }}" dataplane_env="{{ dataplane_env }}" \
+        oci_insecure=true oci_repo="{{ vlab_oci_repo }}" push-container dataplane
+    VERSION="{{ version }}" just platform=wasm32-wasip1 profile="{{ profile }}" oci_insecure=true oci_repo="{{ vlab_oci_repo }}" push-container validator
     # Patching the fabric to a tag the registry does not have takes the dataplane down with
     # ImagePullBackOff, and the resulting silence looks like a dataplane that is running and
     # simply has nothing to say. Confirm both images are actually there before pointing the
