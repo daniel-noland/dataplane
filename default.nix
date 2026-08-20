@@ -11,9 +11,6 @@
   kernel ? "linux",
   tag ? "dev",
   nightly ? "false",
-  # Baked into the dataplane image as DATAPLANE_PYROSCOPE_URL when set. Empty by default: the
-  # address of a profiling server is a property of a deployment, not of the software.
-  pyroscopeUrl ? "",
 }:
 let
   sources = import ./npins;
@@ -809,7 +806,6 @@ let
       ];
     };
     config.Entrypoint = [ "/bin/dataplane" ];
-    config.Env = lib.optional (pyroscopeUrl != "") "DATAPLANE_PYROSCOPE_URL=${pyroscopeUrl}";
   };
 
   containers.dataplane-debugger = pkgs.dockerTools.buildLayeredImage {
