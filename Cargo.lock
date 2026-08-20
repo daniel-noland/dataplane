@@ -1826,6 +1826,7 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "small-map",
+ "strum 0.28.0",
  "thiserror",
  "tokio",
  "tracing",
