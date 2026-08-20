@@ -881,9 +881,20 @@ vlab-patch-dataplane:
     # Built from vlab_oci_repo, not the oci_image_* variables: those are derived from the default
     # oci_repo, while the pushes above target the vlab registry. Checking the wrong registry makes
     # the guard refuse a patch that would have been fine.
-    for image in "{{ vlab_oci_repo }}/{{ oci_name }}:{{ version }}" "{{ vlab_oci_repo }}/{{ oci_name }}/validator:{{ version }}"; do
-        if ! skopeo inspect --tls-verify=false "docker://${image}" >/dev/null 2>&1; then
-            >&2 echo "vlab-patch-dataplane: ${image} is not in the registry; refusing to patch"
+    # Ask the registry directly rather than via skopeo: the validator is an oras artifact, not a
+    # container image, and skopeo cannot inspect it -- so a skopeo-based check reports the
+    # validator missing even when it is sitting right there.
+    for ref in "{{ oci_name }}:{{ version }}" "{{ oci_name }}/validator:{{ version }}"; do
+        declare name="${ref%:*}"
+        declare tag="${ref##*:}"
+        declare code
+        code="$(curl -sk -o /dev/null -w '%{http_code}' \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            "https://{{ vlab_oci_repo }}/v2/${name}/manifests/${tag}")"
+        if [ "${code}" != "200" ]; then
+            >&2 echo "vlab-patch-dataplane: {{ vlab_oci_repo }}/${ref} not in registry (HTTP ${code}); refusing to patch"
             exit 1
         fi
     done
